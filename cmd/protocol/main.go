@@ -75,6 +75,7 @@ func main() {
 	api := router.PathPrefix("/api").Subrouter()
 	api.HandleFunc("/health", service.HealthHandler).Methods("GET")
 	api.HandleFunc("/games", service.CreateGameHandler).Methods("POST")
+	api.HandleFunc("/games/{id:.*}", service.GetGameHandler).Methods("GET")
 	api.HandleFunc("/games/{id:.*}/moves", service.MakeMoveHandler).Methods("POST")
 	api.HandleFunc("/challenges", service.CreateChallengeHandler).Methods("POST")
 	
@@ -150,6 +151,7 @@ CONFIGURATION:
 API ENDPOINTS:
     GET  /api/health              - Service health check
     POST /api/games               - Create a new chess game
+    GET  /api/games/{id}          - Get game state by ID
     POST /api/games/{id}/moves    - Submit a move to a game
     POST /api/challenges          - Create a game challenge
 

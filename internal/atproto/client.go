@@ -256,6 +256,59 @@ func (c *Client) GetDID() string {
 	return c.did
 }
 
+func (c *Client) GetGame(ctx context.Context, gameURI string) (*chess.Game, error) {
+	// Parse the AT Protocol URI to extract repo and rkey
+	// Example URI: at://did:plc:example/app.atchess.game/3k2uv5...
+	// We need to call com.atproto.repo.getRecord
+	
+	// For now, we'll use a simplified approach and call the repo.getRecord directly
+	// In a full implementation, you'd properly parse the URI
+	
+	req, err := http.NewRequest("GET", fmt.Sprintf("%s/xrpc/com.atproto.repo.getRecord?repo=%s&collection=app.atchess.game&rkey=%s", 
+		c.pdsURL, c.did, gameURI), nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	
+	req.Header.Set("Authorization", "Bearer "+c.accessJWT)
+	
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get game record: %w", err)
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("failed to get game record: HTTP %d", resp.StatusCode)
+	}
+	
+	var getResp struct {
+		Value struct {
+			Type      string `json:"$type"`
+			CreatedAt string `json:"createdAt"`
+			White     string `json:"white"`
+			Black     string `json:"black"`
+			Status    string `json:"status"`
+			FEN       string `json:"fen"`
+			PGN       string `json:"pgn"`
+		} `json:"value"`
+	}
+	
+	if err := json.NewDecoder(resp.Body).Decode(&getResp); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+	
+	return &chess.Game{
+		ID:        gameURI,
+		White:     getResp.Value.White,
+		Black:     getResp.Value.Black,
+		Status:    chess.GameStatus(getResp.Value.Status),
+		FEN:       getResp.Value.FEN,
+		PGN:       getResp.Value.PGN,
+		CreatedAt: getResp.Value.CreatedAt,
+	}, nil
+}
+
 func (c *Client) GetHandle() string {
 	return c.handle
 }

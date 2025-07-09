@@ -136,6 +136,7 @@
         <div class="controls">
             <button id="newGameBtn">New Game</button>
             <button id="resetBtn">Reset Board</button>
+            <button id="shareGameBtn" style="display: none;">Share Game</button>
         </div>
         
         <div class="game-info">
@@ -177,6 +178,7 @@
                 this.initializeBoard();
                 this.setupEventListeners();
                 this.updateBoardFromFEN();
+                this.loadGameFromUrl();
             }
             
             initializeBoard() {
@@ -323,6 +325,7 @@
                 document.getElementById('newGameBtn').addEventListener('click', () => this.newGame());
                 document.getElementById('resetBtn').addEventListener('click', () => this.resetBoard());
                 document.getElementById('createGameBtn').addEventListener('click', () => this.createGame());
+                document.getElementById('shareGameBtn').addEventListener('click', () => this.shareGame());
             }
             
             newGame() {
@@ -367,9 +370,108 @@
                     this.gameId = game.id;
                     this.updateStatus(`Game created! ID: ${game.id}`);
                     
+                    // Update URL to game permalink
+                    const gameSlug = this.encodeGameId(game.id);
+                    const newUrl = window.location.origin + window.location.pathname + '?game=' + gameSlug;
+                    window.history.pushState({gameId: game.id}, `ATChess - Game ${gameSlug}`, newUrl);
+                    
+                    // Show share button
+                    document.getElementById('shareGameBtn').style.display = 'inline-block';
+                    
                 } catch (error) {
                     this.updateStatus(`Error: ${error.message}`, 'error');
                 }
+            }
+            
+            encodeGameId(gameId) {
+                // Convert AT Protocol URI to URL-safe slug
+                return btoa(gameId).replace(/[+/=]/g, c => ({'+': '-', '/': '_', '=': ''})[c]);
+            }
+            
+            decodeGameId(gameSlug) {
+                // Convert URL-safe slug back to AT Protocol URI
+                const base64 = gameSlug.replace(/[-_]/g, c => ({'-': '+', '_': '/'})[c]);
+                const padded = base64 + '='.repeat((4 - base64.length % 4) % 4);
+                return atob(padded);
+            }
+            
+            async loadGameFromUrl() {
+                const urlParams = new URLSearchParams(window.location.search);
+                const gameSlug = urlParams.get('game');
+                
+                if (gameSlug) {
+                    try {
+                        const gameId = this.decodeGameId(gameSlug);
+                        this.gameId = gameId;
+                        
+                        // Update page title
+                        document.title = `ATChess - Game ${gameSlug}`;
+                        
+                        // Show share button
+                        document.getElementById('shareGameBtn').style.display = 'inline-block';
+                        
+                        // Fetch game state from the API
+                        const response = await fetch(`http://localhost:8080/api/games/${encodeURIComponent(gameId)}`);
+                        if (response.ok) {
+                            const game = await response.json();
+                            
+                            // Update game state
+                            this.currentFEN = game.fen;
+                            this.updateBoardFromFEN();
+                            
+                            // Determine current player from FEN
+                            const fenParts = this.currentFEN.split(' ');
+                            this.currentPlayer = fenParts[1] === 'w' ? 'white' : 'black';
+                            document.getElementById('currentPlayer').textContent = 
+                                this.currentPlayer.charAt(0).toUpperCase() + this.currentPlayer.slice(1);
+                            
+                            this.updateStatus(`Loaded game: ${gameSlug}`);
+                        } else {
+                            this.updateStatus(`Game not found: ${gameSlug}`, 'error');
+                        }
+                        
+                    } catch (error) {
+                        this.updateStatus(`Error loading game from URL: ${error.message}`, 'error');
+                    }
+                }
+            }
+            
+            shareGame() {
+                if (this.gameId) {
+                    const gameSlug = this.encodeGameId(this.gameId);
+                    const gameUrl = window.location.origin + window.location.pathname + '?game=' + gameSlug;
+                    
+                    // Try to use the Clipboard API
+                    if (navigator.clipboard && navigator.clipboard.writeText) {
+                        navigator.clipboard.writeText(gameUrl).then(() => {
+                            this.updateStatus('Game URL copied to clipboard!');
+                        }).catch(() => {
+                            this.fallbackCopyToClipboard(gameUrl);
+                        });
+                    } else {
+                        this.fallbackCopyToClipboard(gameUrl);
+                    }
+                } else {
+                    this.updateStatus('No game to share', 'error');
+                }
+            }
+            
+            fallbackCopyToClipboard(text) {
+                // Fallback method for older browsers
+                const textArea = document.createElement('textarea');
+                textArea.value = text;
+                textArea.style.position = 'fixed';
+                textArea.style.opacity = '0';
+                document.body.appendChild(textArea);
+                textArea.focus();
+                textArea.select();
+                try {
+                    document.execCommand('copy');
+                    this.updateStatus('Game URL copied to clipboard!');
+                } catch (err) {
+                    this.updateStatus(`Share this URL: ${text}`, 'info');
+                }
+                document.body.removeChild(textArea);
             }
         }
         

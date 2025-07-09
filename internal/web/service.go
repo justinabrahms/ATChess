@@ -128,6 +128,33 @@ type CreateChallengeRequest struct {
 	Message     string `json:"message,omitempty"`
 }
 
+func (s *Service) GetGameHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	encodedGameID := vars["id"]
+	
+	// URL decode the game ID
+	gameID, err := url.QueryUnescape(encodedGameID)
+	if err != nil {
+		log.Error().Err(err).Str("encodedGameID", encodedGameID).Msg("Failed to decode game ID")
+		http.Error(w, "Invalid game ID", http.StatusBadRequest)
+		return
+	}
+	
+	// Log for debugging
+	log.Info().Str("gameID", gameID).Str("encodedGameID", encodedGameID).Str("path", r.URL.Path).Msg("GetGameHandler called")
+	
+	// Fetch game from AT Protocol
+	game, err := s.client.GetGame(context.Background(), gameID)
+	if err != nil {
+		log.Error().Err(err).Msg("Failed to fetch game")
+		http.Error(w, "Game not found", http.StatusNotFound)
+		return
+	}
+	
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(game)
+}
+
 func (s *Service) CreateChallengeHandler(w http.ResponseWriter, r *http.Request) {
 	var req CreateChallengeRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
