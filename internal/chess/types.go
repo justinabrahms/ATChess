@@ -23,14 +23,14 @@ type MoveResult struct {
 }
 
 type Game struct {
-	ID          string
-	White       string // DID
-	Black       string // DID
-	Status      GameStatus
-	FEN         string
-	PGN         string
-	TimeControl *TimeControl
-	CreatedAt   string
+	ID          string      `json:"id"`
+	White       string      `json:"white"` // DID
+	Black       string      `json:"black"` // DID
+	Status      GameStatus  `json:"status"`
+	FEN         string      `json:"fen"`
+	PGN         string      `json:"pgn"`
+	TimeControl *TimeControl `json:"timeControl"`
+	CreatedAt   string      `json:"createdAt"`
 }
 
 type TimeControl struct {
