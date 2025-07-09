@@ -230,6 +230,14 @@
             
             async makeMove(from, to) {
                 try {
+                    console.log('Making move:', { from, to, gameId: this.gameId, currentFEN: this.currentFEN });
+                    
+                    // If no game ID, create a game first (auto-create for local games)
+                    if (!this.gameId) {
+                        console.log('No game ID found, creating a new game automatically');
+                        await this.createAutoGame();
+                    }
+                    
                     const response = await fetch(`http://localhost:8080/api/moves`, {
                         method: 'POST',
                         headers: {
@@ -263,6 +271,14 @@
                     this.currentPlayer = this.currentPlayer === 'white' ? 'black' : 'white';
                     document.getElementById('currentPlayer').textContent = 
                         this.currentPlayer.charAt(0).toUpperCase() + this.currentPlayer.slice(1);
+                    
+                    // Update URL to persist game state after moves
+                    if (this.gameId) {
+                        const gameSlug = this.encodeGameId(this.gameId);
+                        const newUrl = window.location.origin + window.location.pathname + '?game=' + gameSlug;
+                        window.history.replaceState({gameId: this.gameId}, `ATChess - Game ${gameSlug}`, newUrl);
+                        console.log('Updated URL to persist game state:', newUrl);
+                    }
                     
                     if (result.checkmate) {
                         this.updateStatus('Checkmate!', 'error');
@@ -402,6 +418,44 @@
                     
                 } catch (error) {
                     this.updateStatus(`Error: ${error.message}`, 'error');
+                }
+            }
+            
+            async createAutoGame() {
+                // Create a game automatically with a default opponent for local games
+                const defaultOpponent = 'did:plc:yguha7jixn3rlblla2pzbmwl'; // Player 2 from the note
+                
+                try {
+                    const response = await fetch('http://localhost:8080/api/games', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                        },
+                        body: JSON.stringify({
+                            opponent_did: defaultOpponent,
+                            color: 'white'
+                        })
+                    });
+                    
+                    if (!response.ok) {
+                        throw new Error('Failed to auto-create game');
+                    }
+                    
+                    const game = await response.json();
+                    this.gameId = game.id;
+                    this.updateStatus(`Game auto-created and moves will be saved! ID: ${game.id}`);
+                    
+                    // Update URL to game permalink
+                    const gameSlug = this.encodeGameId(game.id);
+                    const newUrl = window.location.origin + window.location.pathname + '?game=' + gameSlug;
+                    window.history.pushState({gameId: game.id}, `ATChess - Game ${gameSlug}`, newUrl);
+                    
+                    // Show share button
+                    document.getElementById('shareGameBtn').style.display = 'inline-block';
+                    
+                } catch (error) {
+                    this.updateStatus(`Error auto-creating game: ${error.message}`, 'error');
+                    throw error; // Re-throw to prevent the move from being made
                 }
             }
             
