@@ -2,12 +2,12 @@
 
 set -e  # Exit on any error
 
-PDS_URL="http://localhost:3000"
+PDS_URL="https://localhost:3000"
 
 echo "🔍 Checking PDS availability..."
 
-# Check if PDS is running
-if ! curl -f -s "$PDS_URL/_health" >/dev/null 2>&1; then
+# Check if PDS is running (using -k to ignore self-signed certificate)
+if ! curl -k -f -s "$PDS_URL/_health" >/dev/null 2>&1; then
     echo "❌ PDS is not running or not accessible at $PDS_URL"
     echo "   Please start the PDS first with: docker-compose up -d"
     echo "   Wait for it to be ready, then try again."
@@ -27,7 +27,7 @@ create_account() {
     
     echo "📝 Creating $account_name ($handle)..."
     
-    response=$(curl -s -w "%{http_code}" -X POST "$PDS_URL/xrpc/com.atproto.server.createAccount" \
+    response=$(curl -k -s -w "%{http_code}" -X POST "$PDS_URL/xrpc/com.atproto.server.createAccount" \
         -H "Content-Type: application/json" \
         -d "{
             \"email\": \"$email\",

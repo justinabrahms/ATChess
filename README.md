@@ -78,6 +78,8 @@ make run-web        # Runs on port 8081
 3. Make moves on the interactive chessboard
 4. Games are automatically stored in the AT Protocol
 
+**Note:** The PDS runs on HTTPS (https://localhost:3000) with self-signed certificates for security compliance. Your browser may show security warnings - this is expected for local development.
+
 ## AT Protocol Integration
 
 ATChess uses custom lexicons for storing chess data:

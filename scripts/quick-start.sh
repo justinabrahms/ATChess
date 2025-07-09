@@ -33,6 +33,14 @@ fi
 
 echo "✅ All prerequisites found!"
 
+# Generate SSL certificates for PDS
+echo "🔐 Generating SSL certificates for PDS..."
+if [ ! -f certs/localhost.crt ] || [ ! -f certs/localhost.key ]; then
+    ./scripts/generate-ssl-certs.sh
+else
+    echo "✅ SSL certificates already exist"
+fi
+
 # Build the project
 echo "🔨 Building ATChess..."
 make build

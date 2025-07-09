@@ -6,6 +6,9 @@ keys.env
 *.key
 *.pem
 
+# SSL certificates
+certs/
+
 # OS files
 .DS_Store
 Thumbs.db

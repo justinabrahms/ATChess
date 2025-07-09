@@ -3,7 +3,7 @@ server:
   port: 8080
   
 atproto:
-  pds_url: http://localhost:3000
+  pds_url: https://localhost:3000
   handle: "atchess.localhost"
   password: "atchess-service-password"
   
