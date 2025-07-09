@@ -5,7 +5,6 @@ services:
       - "3000:3000"
     environment:
       - PDS_HOSTNAME=localhost
-      - PDS_SCHEME=https
       - PDS_PORT=3000
       - PDS_JWT_SECRET=atchess-dev-jwt-secret-change-in-production
       - PDS_ADMIN_PASSWORD=admin
@@ -25,6 +24,9 @@ services:
       # SSL/TLS configuration for local development
       - PDS_TLS_CERT_PATH=/app/certs/localhost.crt
       - PDS_TLS_KEY_PATH=/app/certs/localhost.key
+      # Explicit HTTPS configuration
+      - PDS_SERVICE_DID=did:web:localhost%3A3000
+      - PDS_PUBLIC_URL=https://localhost:3000
       # Disable strict SSL for local development
       - NODE_TLS_REJECT_UNAUTHORIZED=0
     volumes:
