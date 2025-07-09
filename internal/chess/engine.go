@@ -121,11 +121,6 @@ func (e *Engine) ValidateFEN(fen string) error {
 	return nil
 }
 
-func (e *Engine) isInCheck() bool {
-	// For now, we'll rely on the SAN notation to indicate check
-	// This method is not currently used in the main logic
-	return false
-}
 
 func parseSquare(sq string) chess.Square {
 	if len(sq) != 2 {
@@ -135,7 +130,7 @@ func parseSquare(sq string) chess.Square {
 	file := sq[0] - 'a'
 	rank := sq[1] - '1'
 	
-	if file < 0 || file > 7 || rank < 0 || rank > 7 {
+	if file > 7 || rank > 7 {
 		return chess.NoSquare
 	}
 	

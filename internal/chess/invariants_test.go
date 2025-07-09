@@ -2,7 +2,11 @@ package chess
 
 import (
 	"encoding/json"
+	"fmt"
+	"strings"
 	"testing"
+	
+	"github.com/notnil/chess"
 )
 
 // TestMoveResultJSONSerializationAlwaysIncludesRequiredFields ensures that
@@ -152,12 +156,6 @@ func TestFENValidationRejectsInvalidInput(t *testing.T) {
 // TestMoveValidationEnforcesChessRules ensures that the chess engine
 // properly validates moves according to chess rules
 func TestMoveValidationEnforcesChessRules(t *testing.T) {
-	// Test with starting position
-	engine, err := NewEngineFromFEN("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
-	if err != nil {
-		t.Fatalf("Failed to create engine: %v", err)
-	}
-	
 	testCases := []struct {
 		name     string
 		from     string
@@ -198,7 +196,13 @@ func TestMoveValidationEnforcesChessRules(t *testing.T) {
 	
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := engine.MakeMove(tc.from, tc.to, "")
+			// Create fresh engine for each test case
+			engine, err := NewEngineFromFEN("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
+			if err != nil {
+				t.Fatalf("Failed to create engine: %v", err)
+			}
+			
+			_, err = engine.MakeMove(tc.from, tc.to, chess.NoPieceType)
 			
 			if tc.expected && err != nil {
 				t.Errorf("Expected valid move, got error: %v", err)
@@ -208,4 +212,153 @@ func TestMoveValidationEnforcesChessRules(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestInvalidMoveSubmissionAlwaysRejectsIllegalMoves ensures that the chess engine
+// comprehensively rejects all types of invalid moves that users might attempt
+func TestInvalidMoveSubmissionAlwaysRejectsIllegalMoves(t *testing.T) {
+	engine := NewEngine()
+	
+	invalidMoves := []struct {
+		name string
+		from string
+		to   string
+	}{
+		{"Move to same square", "e2", "e2"},
+		{"Move to invalid square", "e2", "z9"},
+		{"Move from invalid square", "z9", "e4"},
+		{"Move piece that doesn't exist", "e3", "e4"},
+		{"Move opponent's piece", "e7", "e5"},
+		{"Move through other pieces", "a1", "a8"},
+		{"Move bishop diagonally through pieces", "c1", "f4"},
+		{"Move knight illegally", "b1", "e4"},
+		{"Move king more than one square", "e1", "e3"},
+		{"Move rook diagonally", "a1", "b2"},
+		{"Move pawn backwards", "e2", "e1"},
+		{"Move pawn sideways", "e2", "d2"},
+		{"Move pawn three squares", "e2", "e5"},
+		{"Capture own piece", "e2", "d1"},
+		{"Move from empty square", "e4", "e5"},
+		{"Castle when king has moved", "e1", "g1"}, // after moving king
+		{"Castle when rook has moved", "e1", "c1"}, // after moving rook
+		{"Castle through check", "e1", "g1"}, // in specific positions
+		{"Castle when in check", "e1", "g1"}, // when king is in check
+		{"En passant when not available", "e5", "d6"}, // without proper setup
+		{"Promote to invalid piece", "e7", "e8"}, // would need promotion parameter
+	}
+	
+	for _, move := range invalidMoves {
+		t.Run(move.name, func(t *testing.T) {
+			_, err := engine.MakeMove(move.from, move.to, chess.NoPieceType)
+			if err == nil {
+				t.Errorf("Expected invalid move %s->%s to be rejected, but it was accepted", move.from, move.to)
+			}
+		})
+	}
+}
+
+// TestPGNConsistencyAcrossMovesPreservesGameHistory ensures that the PGN
+// accurately reflects all moves made and maintains consistency with board state
+func TestPGNConsistencyAcrossMovesPreservesGameHistory(t *testing.T) {
+	engine := NewEngine()
+	
+	// Define a sequence of moves that creates a known game
+	moves := []struct {
+		from string
+		to   string
+		san  string // expected standard algebraic notation
+	}{
+		{"e2", "e4", "e4"},
+		{"e7", "e5", "e5"},
+		{"g1", "f3", "Nf3"},
+		{"b8", "c6", "Nc6"},
+		{"f1", "b5", "Bb5"},
+		{"a7", "a6", "a6"},
+		{"b5", "a4", "Ba4"},
+		{"g8", "f6", "Nf6"},
+		{"e1", "g1", "O-O"}, // kingside castling
+		{"f8", "e7", "Be7"},
+	}
+	
+	var expectedPGN []string
+	
+	for i, move := range moves {
+		t.Run(fmt.Sprintf("Move %d: %s", i+1, move.san), func(t *testing.T) {
+			// Get PGN before move
+			pgnBefore := engine.GetPGN()
+			
+			// Make the move
+			result, err := engine.MakeMove(move.from, move.to, chess.NoPieceType)
+			if err != nil {
+				t.Fatalf("Failed to make move %s->%s: %v", move.from, move.to, err)
+			}
+			
+			// Verify the SAN matches expected
+			if result.SAN != move.san {
+				t.Errorf("Expected SAN %s, got %s", move.san, result.SAN)
+			}
+			
+			// Get PGN after move
+			pgnAfter := engine.GetPGN()
+			
+			// Verify PGN has changed (unless it's the first move and PGN was empty)
+			if i == 0 && pgnBefore == "" {
+				if pgnAfter == "" {
+					t.Error("Expected PGN to contain moves after first move")
+				}
+			} else if pgnAfter == pgnBefore {
+				t.Error("Expected PGN to change after move")
+			}
+			
+			// Verify PGN contains the expected move
+			if !strings.Contains(pgnAfter, move.san) {
+				t.Errorf("Expected PGN to contain move %s, got: %s", move.san, pgnAfter)
+			}
+			
+			// Add to expected PGN sequence
+			expectedPGN = append(expectedPGN, move.san)
+			
+			// Verify all previous moves are still in PGN
+			for j := 0; j < i; j++ {
+				if !strings.Contains(pgnAfter, expectedPGN[j]) {
+					t.Errorf("Expected PGN to contain previous move %s, got: %s", expectedPGN[j], pgnAfter)
+				}
+			}
+		})
+	}
+	
+	// Test that PGN can be used to reconstruct the same position
+	t.Run("PGN reconstruction", func(t *testing.T) {
+		finalPGN := engine.GetPGN()
+		finalFEN := engine.GetFEN()
+		
+		// Create a new engine and verify we can parse the PGN
+		// Note: We can't easily test PGN parsing without additional libraries,
+		// but we can verify that the PGN is non-empty and contains expected moves
+		if finalPGN == "" {
+			t.Error("Final PGN should not be empty after sequence of moves")
+		}
+		
+		// Verify the FEN has changed from initial position
+		initialFEN := "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"
+		if finalFEN == initialFEN {
+			t.Error("FEN should have changed after sequence of moves")
+		}
+		
+		// Verify PGN format looks reasonable (contains move numbers and moves)
+		if !strings.Contains(finalPGN, "1.") {
+			t.Error("PGN should contain move numbers")
+		}
+		
+		// Count moves in PGN - should have 10 moves (5 pairs)
+		moveCount := 0
+		for _, expectedMove := range expectedPGN {
+			if strings.Contains(finalPGN, expectedMove) {
+				moveCount++
+			}
+		}
+		if moveCount != len(expectedPGN) {
+			t.Errorf("Expected PGN to contain all %d moves, found %d", len(expectedPGN), moveCount)
+		}
+	})
 }

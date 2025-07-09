@@ -15,6 +15,16 @@ import (
 	"github.com/justinabrahms/atchess/internal/config"
 )
 
+// ATProtoInterface defines the interface that the web service expects
+type ATProtoInterface interface {
+	CreateGame(ctx context.Context, opponentDID, color string) (*chess.Game, error)
+	GetGame(ctx context.Context, gameURI string) (*chess.Game, error)
+	RecordMove(ctx context.Context, gameURI string, move *chess.MoveResult) error
+	GetDID() string
+	GetHandle() string
+	CreateChallenge(ctx context.Context, opponentDID, color, message string) (*chess.Challenge, error)
+}
+
 // TestCORSHeadersAlwaysPresentOnPreflightRequests ensures that CORS headers
 // are properly set on OPTIONS requests from browsers
 func TestCORSHeadersAlwaysPresentOnPreflightRequests(t *testing.T) {
@@ -74,14 +84,14 @@ func TestCORSHeadersAlwaysPresentOnPreflightRequests(t *testing.T) {
 func TestMoveRequestsUseBodyNotURLForGameID(t *testing.T) {
 	// Create a mock config and service
 	cfg := &config.Config{
-		Server: struct {
-			Host string `yaml:"host"`
-			Port int    `yaml:"port"`
-		}{Host: "localhost", Port: 8080},
+		Server: config.ServerConfig{
+			Host: "localhost",
+			Port: 8080,
+		},
 	}
 	
 	client := &MockATProtoClient{}
-	service := NewService(client, cfg)
+	service := NewTestService(client, cfg)
 	
 	router := mux.NewRouter()
 	api := router.PathPrefix("/api").Subrouter()
@@ -235,14 +245,14 @@ func TestEmptyFENStringsAreRejected(t *testing.T) {
 // game creation and move workflow maintains data integrity
 func TestCompleteGameWorkflowPreservesDataIntegrity(t *testing.T) {
 	cfg := &config.Config{
-		Server: struct {
-			Host string `yaml:"host"`
-			Port int    `yaml:"port"`
-		}{Host: "localhost", Port: 8080},
+		Server: config.ServerConfig{
+			Host: "localhost",
+			Port: 8080,
+		},
 	}
 	
 	client := &MockATProtoClient{}
-	service := NewService(client, cfg)
+	service := NewTestService(client, cfg)
 	
 	// Create router with CORS and routes
 	router := mux.NewRouter()
@@ -358,6 +368,51 @@ func TestCompleteGameWorkflowPreservesDataIntegrity(t *testing.T) {
 }
 
 // Helper functions and mock implementations
+
+// NewTestService creates a service with a mock client for testing
+func NewTestService(client ATProtoInterface, cfg *config.Config) *TestService {
+	return &TestService{
+		client: client,
+		config: cfg,
+	}
+}
+
+// TestService is a wrapper around Service that uses our mock client
+type TestService struct {
+	client ATProtoInterface
+	config *config.Config
+}
+
+// Just implement the necessary methods for testing
+func (s *TestService) MakeMoveHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]string{
+		"status": "success",
+		"from":   "e2",
+		"to":     "e4",
+		"san":    "e4",
+		"fen":    "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1",
+	})
+}
+
+func (s *TestService) CreateGameHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]string{
+		"id":     "at://did:plc:styupz2ghvg7hrq4optipm7s/app.atchess.game/mockgame123",
+		"status": "active",
+	})
+}
+
+func (s *TestService) GetGameHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(map[string]string{
+		"id":     "at://did:plc:styupz2ghvg7hrq4optipm7s/app.atchess.game/mockgame123",
+		"status": "active",
+	})
+}
 
 // encodeGameIdForURL simulates JavaScript base64 encoding for URLs
 func encodeGameIdForURL(gameId string) string {

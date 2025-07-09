@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"net/url"
 	"strings"
 
 	"github.com/gorilla/mux"
@@ -44,7 +43,7 @@ func (s *Service) decodeGameID(encodedGameID string) (string, error) {
 
 func (s *Service) HealthHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{
+	_ = json.NewEncoder(w).Encode(map[string]string{
 		"status": "ok",
 		"did":    s.client.GetDID(),
 		"handle": s.client.GetHandle(),
@@ -71,7 +70,7 @@ func (s *Service) CreateGameHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(game)
+	_ = json.NewEncoder(w).Encode(game)
 }
 
 type MakeMoveRequest struct {
@@ -131,7 +130,7 @@ func (s *Service) MakeMoveHandler(w http.ResponseWriter, r *http.Request) {
 	log.Info().Str("gameID", gameID).Msg("Move recorded in AT Protocol successfully")
 	
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(moveResult)
+	_ = json.NewEncoder(w).Encode(moveResult)
 }
 
 type CreateChallengeRequest struct {
@@ -166,7 +165,7 @@ func (s *Service) GetGameHandler(w http.ResponseWriter, r *http.Request) {
 	log.Info().Str("gameID", gameID).Str("fen", game.FEN).Str("status", string(game.Status)).Msg("Game fetched successfully")
 	
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(game)
+	_ = json.NewEncoder(w).Encode(game)
 }
 
 func (s *Service) CreateChallengeHandler(w http.ResponseWriter, r *http.Request) {
@@ -184,5 +183,5 @@ func (s *Service) CreateChallengeHandler(w http.ResponseWriter, r *http.Request)
 	}
 	
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(challenge)
+	_ = json.NewEncoder(w).Encode(challenge)
 }
