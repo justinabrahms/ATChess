@@ -53,6 +53,11 @@ make build
 ./scripts/quick-start.sh
 ```
 
+**If you encounter Docker issues:**
+```bash
+./scripts/troubleshoot-docker.sh
+```
+
 **Option B: Manual setup**
 ```bash
 # Start local AT Protocol server

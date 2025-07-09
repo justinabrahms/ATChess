@@ -148,17 +148,114 @@ curl http://localhost:3000/xrpc/com.atproto.sync.listRepos
 
 ## Troubleshooting
 
-### PDS won't start
-- Check ports aren't already in use: `lsof -i :3000`
-- Check Docker logs: `docker-compose logs pds`
+### Docker Image Pull Issues
 
-### Can't create accounts
-- Ensure `PDS_INVITE_REQUIRED=false` is set
-- Check the PDS is fully started (health check passing)
+If you see errors like "failed to resolve reference" or "cannot allocate memory":
 
-### Connection errors
-- Verify PDS URL in config.yaml matches Docker setup
-- Check firewall isn't blocking port 3000
+```bash
+# Clean up Docker system
+docker system prune -af
+
+# Restart Docker daemon
+# On macOS: Restart Docker Desktop
+# On Linux: sudo systemctl restart docker
+
+# Try pulling the image manually
+docker pull ghcr.io/bluesky-social/pds:latest
+
+# If still failing, try with a specific version
+docker pull ghcr.io/bluesky-social/pds:0.4
+```
+
+### Memory Issues
+
+If Docker runs out of memory:
+
+```bash
+# Check Docker memory limits
+docker system df
+
+# Increase Docker Desktop memory allocation (macOS/Windows):
+# Docker Desktop → Settings → Resources → Memory → Increase to 4GB+
+
+# On Linux, ensure sufficient swap space:
+sudo swapon --show
+```
+
+### Alternative Image Pull Methods
+
+If the main registry is unavailable:
+
+```bash
+# Try pulling without cache
+docker pull --no-cache ghcr.io/bluesky-social/pds:latest
+
+# Or specify a different registry mirror if available
+docker pull docker.io/bluesky/pds:latest
+```
+
+### PDS Container Issues
+
+```bash
+# Check if PDS container is running
+docker-compose ps
+
+# View detailed logs
+docker-compose logs -f pds
+
+# Restart the PDS
+docker-compose restart pds
+
+# Complete reset (removes all data)
+docker-compose down -v
+docker-compose up -d
+```
+
+### Network Connectivity
+
+```bash
+# Test if PDS is accessible
+curl http://localhost:3000/_health
+
+# Check which process is using port 3000
+lsof -i :3000
+
+# Test DNS resolution
+nslookup ghcr.io
+```
+
+### Account Creation Issues
+
+```bash
+# Ensure PDS is fully ready before creating accounts
+docker-compose logs pds | grep "server listening"
+
+# Check invite requirements
+curl http://localhost:3000/xrpc/com.atproto.server.describeServer
+
+# Manually create an account
+curl -X POST http://localhost:3000/xrpc/com.atproto.server.createAccount \
+  -H "Content-Type: application/json" \
+  -d '{"email": "test@test.com", "handle": "test.localhost", "password": "testpass"}'
+```
+
+### Complete Reset
+
+If all else fails, reset everything:
+
+```bash
+# Stop and remove all containers and volumes
+docker-compose down -v
+
+# Remove all images and system cache
+docker system prune -af
+
+# Start fresh
+docker-compose up -d
+
+# Wait for PDS to be ready
+./scripts/create-test-accounts.sh
+```
 
 ## Next Steps
 

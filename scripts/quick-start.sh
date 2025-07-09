@@ -37,9 +37,35 @@ echo "✅ All prerequisites found!"
 echo "🔨 Building ATChess..."
 make build
 
+# Try to pull PDS image first
+echo "📥 Pulling AT Protocol server image..."
+if ! docker pull ghcr.io/bluesky-social/pds:latest; then
+    echo "⚠️  Failed to pull latest image, trying alternative..."
+    if ! docker pull ghcr.io/bluesky-social/pds:0.4; then
+        echo "❌ Failed to pull PDS image. Troubleshooting steps:"
+        echo "   1. Check internet connectivity"
+        echo "   2. Restart Docker: 'sudo systemctl restart docker' (Linux) or restart Docker Desktop"
+        echo "   3. Clean Docker system: 'docker system prune -af'"
+        echo "   4. Increase Docker memory allocation in Docker Desktop settings"
+        echo ""
+        echo "📖 See docs/local-pds-setup.md for detailed troubleshooting"
+        exit 1
+    else
+        echo "✅ Using PDS version 0.4"
+        # Update docker-compose to use version 0.4
+        sed -i.bak 's/pds:latest/pds:0.4/g' docker-compose.yml
+    fi
+fi
+
 # Start PDS
 echo "🐳 Starting local AT Protocol server..."
-docker-compose up -d
+if ! docker-compose up -d; then
+    echo "❌ Failed to start PDS. Common fixes:"
+    echo "   1. Ensure Docker is running"
+    echo "   2. Check if port 3000 is available: 'lsof -i :3000'"
+    echo "   3. Try: 'docker-compose down -v && docker-compose up -d'"
+    exit 1
+fi
 
 # Wait for PDS to be ready
 echo "⏳ Waiting for PDS to be ready..."
