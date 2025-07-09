@@ -87,7 +87,19 @@ fi
 
 # Create test accounts
 echo "👥 Creating test accounts..."
-./scripts/create-test-accounts.sh
+if ! ./scripts/create-test-accounts.sh; then
+    echo "❌ Failed to create test accounts"
+    echo "   PDS might not be ready yet. You can try again later with:"
+    echo "   ./scripts/create-test-accounts.sh"
+    echo ""
+    echo "   Or continue without test accounts and create them manually."
+    read -p "Continue anyway? (y/N): " -n 1 -r
+    echo
+    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+        echo "Exiting. Fix the PDS issue and try again."
+        exit 1
+    fi
+fi
 
 # Start ATChess services
 echo "🎯 Starting ATChess services..."
