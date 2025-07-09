@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -190,7 +191,89 @@ func (c *Client) RecordMove(ctx context.Context, gameURI string, move *chess.Mov
 	}
 	
 	// Update game record with new FEN
-	// This would need proper implementation to fetch and update the game record
+	// Parse the game URI to get repo and rkey
+	parts := strings.Split(gameURI, "/")
+	if len(parts) < 5 || !strings.HasPrefix(gameURI, "at://") {
+		return fmt.Errorf("invalid game URI format: %s", gameURI)
+	}
+	
+	repo := parts[2] // The DID
+	rkey := parts[4] // The record key
+	
+	// First, fetch the current game record to get the CID
+	getReq, err := http.NewRequest("GET", fmt.Sprintf("%s/xrpc/com.atproto.repo.getRecord?repo=%s&collection=app.atchess.game&rkey=%s", 
+		c.pdsURL, repo, rkey), nil)
+	if err != nil {
+		return fmt.Errorf("failed to create get request: %w", err)
+	}
+	
+	getReq.Header.Set("Authorization", "Bearer "+c.accessJWT)
+	
+	getResp, err := c.httpClient.Do(getReq)
+	if err != nil {
+		return fmt.Errorf("failed to get game record: %w", err)
+	}
+	defer getResp.Body.Close()
+	
+	if getResp.StatusCode != http.StatusOK {
+		return fmt.Errorf("failed to get game record: HTTP %d", getResp.StatusCode)
+	}
+	
+	var recordResp struct {
+		URI    string                 `json:"uri"`
+		CID    string                 `json:"cid"`
+		Value  map[string]interface{} `json:"value"`
+	}
+	
+	if err := json.NewDecoder(getResp.Body).Decode(&recordResp); err != nil {
+		return fmt.Errorf("failed to decode game record: %w", err)
+	}
+	
+	// Update the game record with new FEN and status
+	recordResp.Value["fen"] = move.FEN
+	if move.Checkmate || move.Draw {
+		if move.Checkmate {
+			// Determine winner based on whose turn it was
+			fenParts := strings.Split(move.FEN, " ")
+			if len(fenParts) > 1 && fenParts[1] == "w" {
+				recordResp.Value["status"] = "black_won"
+			} else {
+				recordResp.Value["status"] = "white_won"
+			}
+		} else if move.Draw {
+			recordResp.Value["status"] = "draw"
+		}
+	}
+	recordResp.Value["updatedAt"] = time.Now().Format(time.RFC3339)
+	
+	// Use com.atproto.repo.putRecord to update the game
+	putReq := map[string]interface{}{
+		"repo":       repo,
+		"collection": "app.atchess.game",
+		"rkey":       rkey,
+		"record":     recordResp.Value,
+		"swapCid":    recordResp.CID, // Optimistic concurrency control
+	}
+	
+	putReqBody, _ := json.Marshal(putReq)
+	putReqHTTP, err := http.NewRequest("POST", c.pdsURL+"/xrpc/com.atproto.repo.putRecord", bytes.NewBuffer(putReqBody))
+	if err != nil {
+		return fmt.Errorf("failed to create put request: %w", err)
+	}
+	
+	putReqHTTP.Header.Set("Content-Type", "application/json")
+	putReqHTTP.Header.Set("Authorization", "Bearer "+c.accessJWT)
+	
+	putResp, err := c.httpClient.Do(putReqHTTP)
+	if err != nil {
+		return fmt.Errorf("failed to update game record: %w", err)
+	}
+	defer putResp.Body.Close()
+	
+	if putResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(putResp.Body)
+		return fmt.Errorf("failed to update game record: HTTP %d, body: %s", putResp.StatusCode, string(body))
+	}
 	
 	return nil
 }
