@@ -30,6 +30,7 @@ make test          # Run all tests
 make test-protocol # Test protocol service and chess logic
 make test-web      # Test web application
 make test-e2e      # Run end-to-end tests
+make test-bugs     # Run bug regression tests
 
 # Code quality
 make lint          # Run golangci-lint

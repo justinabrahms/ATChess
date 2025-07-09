@@ -49,6 +49,9 @@ test-integration:
 test-e2e:
 	./scripts/run-e2e-tests.sh
 
+test-bugs:
+	./scripts/run-bug-tests.sh
+
 # Code quality
 lint:
 	golangci-lint run
