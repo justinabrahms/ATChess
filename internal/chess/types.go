@@ -11,15 +11,15 @@ const (
 )
 
 type MoveResult struct {
-	From      string
-	To        string
-	SAN       string
-	FEN       string
-	Check     bool
-	Checkmate bool
-	Draw      bool
-	GameOver  bool
-	Result    string
+	From      string `json:"from"`
+	To        string `json:"to"`
+	SAN       string `json:"san"`
+	FEN       string `json:"fen"`
+	Check     bool   `json:"check"`
+	Checkmate bool   `json:"checkmate"`
+	Draw      bool   `json:"draw"`
+	GameOver  bool   `json:"gameOver"`
+	Result    string `json:"result"`
 }
 
 type Game struct {

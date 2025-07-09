@@ -81,12 +81,12 @@ func (s *Service) MakeMoveHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	
 	// Log for debugging
-	log.Info().Str("gameID", gameID).Str("path", r.URL.Path).Msg("MakeMoveHandler called")
+	log.Info().Str("gameID", gameID).Str("from", req.From).Str("to", req.To).Str("fen", req.FEN).Str("path", r.URL.Path).Msg("MakeMoveHandler called")
 	
 	// Create chess engine from current position
 	engine, err := chess.NewEngineFromFEN(req.FEN)
 	if err != nil {
-		log.Error().Err(err).Msg("Invalid FEN")
+		log.Error().Err(err).Str("fen", req.FEN).Msg("Invalid FEN")
 		http.Error(w, "Invalid FEN", http.StatusBadRequest)
 		return
 	}
@@ -97,17 +97,22 @@ func (s *Service) MakeMoveHandler(w http.ResponseWriter, r *http.Request) {
 	// Make move
 	moveResult, err := engine.MakeMove(req.From, req.To, promotion)
 	if err != nil {
-		log.Error().Err(err).Msg("Invalid move")
+		log.Error().Err(err).Str("from", req.From).Str("to", req.To).Msg("Invalid move")
 		http.Error(w, fmt.Sprintf("Invalid move: %s", err.Error()), http.StatusBadRequest)
 		return
 	}
 	
+	// Log move result
+	log.Info().Str("gameID", gameID).Str("san", moveResult.SAN).Str("resultFEN", moveResult.FEN).Bool("check", moveResult.Check).Bool("checkmate", moveResult.Checkmate).Msg("Move executed successfully")
+	
 	// Record move in AT Protocol
 	if err := s.client.RecordMove(context.Background(), gameID, moveResult); err != nil {
-		log.Error().Err(err).Msg("Failed to record move")
+		log.Error().Err(err).Str("gameID", gameID).Msg("Failed to record move")
 		http.Error(w, "Failed to record move", http.StatusInternalServerError)
 		return
 	}
+	
+	log.Info().Str("gameID", gameID).Msg("Move recorded in AT Protocol successfully")
 	
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(moveResult)

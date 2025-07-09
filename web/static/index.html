@@ -249,9 +249,15 @@
                     }
                     
                     const result = await response.json();
+                    console.log('Move result:', result);
+                    
+                    if (!result.fen) {
+                        throw new Error('No FEN in response: ' + JSON.stringify(result));
+                    }
+                    
                     this.currentFEN = result.fen;
                     this.updateBoardFromFEN();
-                    this.updateStatus(`Move: ${result.san}`);
+                    this.updateStatus(`Move: ${result.san || 'Unknown'}`);
                     
                     // Update current player
                     this.currentPlayer = this.currentPlayer === 'white' ? 'black' : 'white';
@@ -285,9 +291,25 @@
             }
             
             parseFEN(fen) {
+                if (!fen || typeof fen !== 'string') {
+                    console.error('Invalid FEN provided to parseFEN:', fen);
+                    return {};
+                }
+                
                 const pieces = {};
-                const [boardStr] = fen.split(' ');
+                const fenParts = fen.split(' ');
+                if (fenParts.length < 1) {
+                    console.error('Invalid FEN format:', fen);
+                    return {};
+                }
+                
+                const [boardStr] = fenParts;
                 const ranks = boardStr.split('/');
+                
+                if (ranks.length !== 8) {
+                    console.error('Invalid FEN board format:', boardStr);
+                    return {};
+                }
                 
                 for (let rankIndex = 0; rankIndex < 8; rankIndex++) {
                     const rank = 8 - rankIndex;
