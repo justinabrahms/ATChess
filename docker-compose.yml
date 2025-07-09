@@ -4,7 +4,7 @@ services:
     ports:
       - "3000:3000"
     environment:
-      - PDS_HOSTNAME=localhost:3000
+      - PDS_HOSTNAME=localhost
       - PDS_JWT_SECRET=atchess-dev-jwt-secret-change-in-production
       - PDS_ADMIN_PASSWORD=admin
       - PDS_INVITE_REQUIRED=false
@@ -17,12 +17,13 @@ services:
       - PDS_BSKY_APP_VIEW_DID=did:web:api.bsky.app
       - PDS_CRAWLERS=https://bsky.network
       - LOG_ENABLED=true
-      # Required PLC rotation key for development
+      # Required security keys
       - PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX=1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef
-      # Required service signing key
-      - PDS_SERVICE_SIGNING_KEY=atchess-dev-service-signing-key-change-in-production
-      # Development mode settings
-      - PDS_DEV_MODE=true
+      - PDS_REPO_SIGNING_KEY_K256_PRIVATE_KEY_HEX=abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890
+      # Fix OAuth validation for local development
+      - PDS_ENTRYWAY_DID=did:web:localhost%3A3000
+      - PDS_ENTRYWAY_URL=http://localhost:3000
+      - PDS_ENTRYWAY_JWT_VERIFY_KEY_K256_PUBLIC_KEY_HEX=04b678a0d8c7f3e9a1b2c4d5e6f789012345678901234567890123456789abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef
     volumes:
       - pds-data:/pds
     healthcheck:
