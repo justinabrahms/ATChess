@@ -1,4 +1,4 @@
-.PHONY: build protocol web run-protocol run-web dev test test-protocol test-web test-integration test-e2e lint fmt clean
+.PHONY: build protocol web run-protocol run-web dev-protocol dev-web dev test test-protocol test-web test-integration test-e2e lint fmt clean
 
 # Build commands
 build: protocol web
@@ -16,10 +16,21 @@ run-protocol: protocol
 run-web: web
 	./bin/atchess-web
 
+# Development with auto-reload
+dev-protocol:
+	@echo "Starting protocol service with auto-reload..."
+	@command -v air >/dev/null 2>&1 || { echo "Installing air for auto-reload..."; go install github.com/air-verse/air@latest; }
+	@air -c .air-protocol.toml
+
+dev-web:
+	@echo "Starting web service with auto-reload..."
+	@command -v air >/dev/null 2>&1 || { echo "Installing air for auto-reload..."; go install github.com/air-verse/air@latest; }
+	@air -c .air-web.toml
+
 dev:
-	@echo "Starting both services in development mode..."
-	@make run-protocol &
-	@make run-web &
+	@echo "Starting both services in development mode with auto-reload..."
+	@make dev-protocol &
+	@make dev-web &
 	@wait
 
 # Testing
@@ -47,4 +58,4 @@ fmt:
 
 # Cleanup
 clean:
-	rm -rf bin/
+	rm -rf bin/ tmp/

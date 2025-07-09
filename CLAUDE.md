@@ -10,29 +10,31 @@ ATChess is a decentralized chess platform built on the AT Protocol. It consists 
 
 ## Development Commands
 
-The following commands are available for development:
-
 ```bash
 # Build commands
 make build          # Build both protocol and web binaries
 make protocol       # Build only the protocol service
 make web           # Build only the web application
 
-# Development
+# Development (production builds)
 make run-protocol   # Run the protocol service locally (port 8080)
 make run-web       # Run the web server locally (port 8081)
-make dev           # Run both services in development mode
+
+# Development with auto-reload
+make dev-protocol   # Run protocol service with auto-reload on file changes
+make dev-web       # Run web server with auto-reload on file changes
+make dev           # Run both services with auto-reload
 
 # Testing
 make test          # Run all tests
 make test-protocol # Test protocol service and chess logic
 make test-web      # Test web application
-make test-integration # Run integration tests
+make test-e2e      # Run end-to-end tests
 
 # Code quality
 make lint          # Run golangci-lint
 make fmt           # Format code with gofmt
-make clean         # Remove build artifacts
+make clean         # Clean build artifacts and temp files
 ```
 
 ## Architecture

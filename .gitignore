@@ -1,5 +1,6 @@
 # Binaries
 bin/
+tmp/
 
 # Keys and secrets
 keys.env
@@ -22,6 +23,7 @@ Thumbs.db
 
 # Logs
 *.log
+build-errors.log
 
 # Temporary files
 *.tmp
