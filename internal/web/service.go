@@ -142,10 +142,12 @@ func (s *Service) GetGameHandler(w http.ResponseWriter, r *http.Request) {
 	// Fetch game from AT Protocol
 	game, err := s.client.GetGame(context.Background(), gameID)
 	if err != nil {
-		log.Error().Err(err).Msg("Failed to fetch game")
+		log.Error().Err(err).Str("gameID", gameID).Msg("Failed to fetch game")
 		http.Error(w, "Game not found", http.StatusNotFound)
 		return
 	}
+	
+	log.Info().Str("gameID", gameID).Str("fen", game.FEN).Str("status", string(game.Status)).Msg("Game fetched successfully")
 	
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(game)

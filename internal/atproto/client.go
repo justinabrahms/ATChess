@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/justinabrahms/atchess/internal/chess"
@@ -261,11 +262,18 @@ func (c *Client) GetGame(ctx context.Context, gameURI string) (*chess.Game, erro
 	// Example URI: at://did:plc:example/app.atchess.game/3k2uv5...
 	// We need to call com.atproto.repo.getRecord
 	
-	// For now, we'll use a simplified approach and call the repo.getRecord directly
-	// In a full implementation, you'd properly parse the URI
+	// Parse the URI to extract components
+	// Format: at://did:plc:USER/app.atchess.game/RKEY
+	parts := strings.Split(gameURI, "/")
+	if len(parts) < 4 || !strings.HasPrefix(gameURI, "at://") {
+		return nil, fmt.Errorf("invalid AT Protocol URI format: %s", gameURI)
+	}
+	
+	repo := parts[2] // The DID
+	rkey := parts[4] // The record key
 	
 	req, err := http.NewRequest("GET", fmt.Sprintf("%s/xrpc/com.atproto.repo.getRecord?repo=%s&collection=app.atchess.game&rkey=%s", 
-		c.pdsURL, c.did, gameURI), nil)
+		c.pdsURL, repo, rkey), nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
