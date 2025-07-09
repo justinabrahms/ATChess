@@ -1,198 +1,222 @@
-# ATChess: Chess on AT Protocol
+# ATChess
 
-ATChess is a decentralized chess platform built on the AT Protocol. It enables players to engage in chess matches across the AT Protocol network while maintaining ownership of their game data.
+A decentralized chess platform built on the AT Protocol. Play chess games that are stored in your personal data repository and federated across the network.
 
 ## Features
 
-- **Play chess games** with anyone in the AT Protocol network
-- **Store game data** in your personal data repository
-- **View active games** from your profile and network
-- **Explore game history** with full PGN notation support
-- **Analyze matches** with integrated board visualization
-- **Challenge friends** through AT Protocol social graph
-- **Follow games** from players in your network
+- **Decentralized Game Storage**: Games stored in players' AT Protocol repositories
+- **Real Chess Validation**: Server-side move validation using professional chess engine
+- **Interactive Web Interface**: Visual chessboard with drag-and-drop moves
+- **Federation Ready**: Games work across different AT Protocol servers
+- **Open Source**: Fully open implementation of chess on AT Protocol
 
 ## Architecture
 
-ATChess consists of two main components:
+ATChess consists of two main services:
 
-### 1. Protocol Service (`atchess-protocol`)
+### Protocol Service (`atchess-protocol`)
 
-This service handles all AT Protocol interactions:
+Handles AT Protocol interactions and chess game logic:
+- Move validation using `notnil/chess` library
+- Game state management with FEN/PGN notation
+- AT Protocol record creation and storage
+- REST API for game operations
 
-- Custom lexicons for chess game data
-- Game state management and validation
-- Player matchmaking and challenges
-- Game record creation and updates
-- Federation with other AT Protocol instances
+### Web Service (`atchess-web`)
 
-### 2. Web Application (`atchess-web`)
+Serves the interactive chess interface:
+- Visual chessboard with piece movement
+- Real-time game state updates
+- Game creation and move submission
+- Static file serving for web assets
 
-A web interface for playing and viewing games:
-
-- Interactive chess board UI
-- Game listing and filtering
-- Move validation and submission
-- Game history exploration
-- User profile and stats
-- Network activity feed
-
-## Getting Started
+## Quick Start
 
 ### Prerequisites
 
-- Go 1.21+
-- AT Protocol Personal Data Server (PDS) access
-- Valid AT Protocol account/DID
+- Docker and Docker Compose
+- Go 1.21 or higher
+- Make
 
-### Installation
+### 1. Clone and Build
 
 ```bash
-# Clone the repository
-git clone https://github.com/yourusername/atchess.git
+git clone <repository-url>
 cd atchess
-
-# Build both binaries
 make build
 ```
 
-### Configuration
+### 2. Start Local Development Environment
 
-Create a config file at `~/.config/atchess/config.yaml`:
-
-```yaml
-protocol:
-  pds_host: "https://your-pds.example.com"
-  did: "did:plc:youridentifier"
-  
-web:
-  listen_addr: "127.0.0.1:8080"
-  static_dir: "./static"
-```
-
-### Running
-
+**Option A: One-command setup**
 ```bash
-# Start the protocol service
-./bin/atchess-protocol
-
-# In another terminal, start the web server
-./bin/atchess-web
+./scripts/quick-start.sh
 ```
 
-Then open http://localhost:8080 in your browser.
+**Option B: Manual setup**
+```bash
+# Start local AT Protocol server
+docker-compose up -d
 
-## AT Protocol Data Model
+# Create test accounts
+./scripts/create-test-accounts.sh
 
-ATChess uses the following collections:
-
-### `app.chess.game`
-
-Stores game metadata and current state:
-
-```json
-{
-  "id": "game_12345",
-  "white": "did:plc:player1",
-  "black": "did:plc:player2",
-  "status": "active",
-  "currentFen": "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1",
-  "pgn": "1. e4",
-  "createdAt": "2025-07-08T12:34:56Z",
-  "lastMoveAt": "2025-07-08T12:35:42Z",
-  "timeControl": {
-    "type": "fischer",
-    "baseTimeSeconds": 600,
-    "incrementSeconds": 5
-  }
-}
+# Start ATChess services
+make run-protocol &  # Runs on port 8080
+make run-web        # Runs on port 8081
 ```
 
-### `app.chess.move`
+### 3. Play Chess
 
-Individual moves within a game:
+1. Open http://localhost:8081 in your browser
+2. Create a new game with another player's DID
+3. Make moves on the interactive chessboard
+4. Games are automatically stored in the AT Protocol
 
-```json
-{
-  "gameId": "game_12345",
-  "moveNumber": 1,
-  "playerDid": "did:plc:player1",
-  "san": "e4",
-  "fen": "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1",
-  "timestamp": "2025-07-08T12:35:42Z",
-  "comment": "Opening with the King's pawn"
-}
-```
+## AT Protocol Integration
 
-### `app.chess.challenge`
+ATChess uses custom lexicons for storing chess data:
 
-Game invitations:
+### `app.atchess.game` - Game Records
+- Player DIDs (white/black)
+- Game status and result
+- Current FEN position
+- PGN notation
+- Time control settings
 
-```json
-{
-  "id": "challenge_67890",
-  "challenger": "did:plc:player1",
-  "recipient": "did:plc:player2",
-  "status": "pending",
-  "timeControl": {
-    "type": "fischer",
-    "baseTimeSeconds": 600,
-    "incrementSeconds": 5
-  },
-  "createdAt": "2025-07-08T12:30:00Z"
-}
-```
+### `app.atchess.move` - Move Records  
+- Reference to parent game
+- Move notation (SAN/UCI)
+- FEN position after move
+- Check/checkmate flags
+- Move timestamps
+
+### `app.atchess.challenge` - Game Invitations
+- Challenger and challenged DIDs
+- Color preferences
+- Time control proposals
+- Challenge status and expiration
 
 ## Development
+
+### Available Commands
+
+```bash
+# Building
+make build          # Build both services
+make protocol       # Build protocol service only
+make web           # Build web service only
+
+# Running
+make run-protocol   # Start protocol service
+make run-web       # Start web interface
+make dev           # Start both services
+
+# Testing
+make test          # Run all tests
+make test-integration # Run integration tests
+make clean         # Remove build artifacts
+```
 
 ### Project Structure
 
 ```
-├── cmd/
-│   ├── protocol/       # Protocol service entry point
-│   └── web/            # Web application entry point
-├── internal/
-│   ├── atproto/        # AT Protocol interaction logic
-│   ├── chess/          # Chess game logic
-│   ├── config/         # Configuration handling
-│   ├── lexicon/        # AT Protocol lexicon definitions
-│   ├── repository/     # Data access layer
-│   └── web/            # Web server and UI components
-├── static/             # Static web assets
-├── Makefile            # Build automation
-└── README.md           # This file
+atchess/
+├── cmd/                    # Application entry points
+│   ├── protocol/          # AT Protocol service
+│   └── web/               # Web interface service
+├── internal/              # Internal packages
+│   ├── atproto/           # AT Protocol client
+│   ├── chess/             # Chess engine and logic
+│   ├── config/            # Configuration management
+│   └── web/               # Web handlers
+├── lexicons/              # AT Protocol lexicon definitions
+├── web/static/            # Static web assets
+├── docs/                  # Documentation
+├── test/                  # Test files
+└── scripts/               # Development scripts
 ```
 
-### Building from Source
+### Testing
 
 ```bash
-# Build everything
-make
+# Unit tests
+go test ./internal/chess/...
 
-# Build just the protocol service
-make protocol
+# Integration tests  
+make test-integration
 
-# Build just the web application
-make web
-
-# Run tests
-make test
+# Manual testing with two players
+# See docs/testing-guide.md for detailed instructions
 ```
 
-## License
+## API Endpoints
 
-MIT License - See LICENSE file for details.
+### Protocol Service (localhost:8080)
+
+- `GET /api/health` - Service health check
+- `POST /api/games` - Create a new game
+- `POST /api/games/{id}/moves` - Submit a move
+- `POST /api/challenges` - Create a game challenge
+
+### Example Usage
+
+```bash
+# Create a game
+curl -X POST http://localhost:8080/api/games \
+  -H "Content-Type: application/json" \
+  -d '{"opponent_did": "did:plc:...", "color": "white"}'
+
+# Make a move
+curl -X POST http://localhost:8080/api/games/GAME_ID/moves \
+  -H "Content-Type: application/json" \
+  -d '{"from": "e2", "to": "e4", "fen": "..."}'
+```
+
+## Documentation
+
+- **[Local PDS Setup](docs/local-pds-setup.md)** - Setting up AT Protocol server for development
+- **[Testing Guide](docs/testing-guide.md)** - Comprehensive testing instructions
+- **[CLAUDE.md](CLAUDE.md)** - Development guidelines and architecture notes
+
+## Dependencies
+
+- **Chess Logic**: `github.com/notnil/chess` - Professional chess move validation
+- **Web Framework**: `github.com/gorilla/mux` - HTTP routing
+- **Configuration**: `github.com/spf13/viper` - Configuration management  
+- **Logging**: `github.com/rs/zerolog` - Structured logging
+- **AT Protocol**: Direct HTTP implementation, no external dependencies
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request.
-
 1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add some amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
+2. Create a feature branch (`git checkout -b feature/amazing-feature`)
+3. Make your changes following the patterns in `CLAUDE.md`
+4. Add tests for new functionality
+5. Ensure all tests pass (`make test`)
+6. Commit your changes (`git commit -m 'Add amazing feature'`)
+7. Push to the branch (`git push origin feature/amazing-feature`)
+8. Open a Pull Request
+
+### Development Guidelines
+
+- Follow Go best practices and conventions
+- Add tests for all new functionality
+- Use the existing chess engine patterns for game logic
+- Update documentation for new features
+- Ensure AT Protocol compliance for new lexicons
+
+## License
+
+[Add your license here]
+
+## Acknowledgments
+
+- Built on the [AT Protocol](https://atproto.com/)
+- Chess engine powered by [notnil/chess](https://github.com/notnil/chess)
+- Inspired by the decentralized web movement
 
 ---
 
-**Note:** ATChess is under active development. The AT Protocol is still evolving, so expect changes as the protocol matures.
+For detailed development instructions, see [CLAUDE.md](CLAUDE.md).
+For testing with multiple players, see [docs/testing-guide.md](docs/testing-guide.md).
