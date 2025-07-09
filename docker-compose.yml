@@ -21,17 +21,18 @@ services:
       # Required security keys for PDS operation
       - PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX=1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef
       - PDS_REPO_SIGNING_KEY_K256_PRIVATE_KEY_HEX=abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890
-      # SSL/TLS configuration for local development
-      - PDS_TLS_CERT_PATH=/app/certs/localhost.crt
-      - PDS_TLS_KEY_PATH=/app/certs/localhost.key
-      # Explicit HTTPS configuration
+      # Service DID for local development
       - PDS_SERVICE_DID=did:web:localhost%3A3000
-      - PDS_PUBLIC_URL=https://localhost:3000
-      # Disable strict SSL for local development
+      # Development mode and SSL configuration
+      - PDS_DEV_MODE=true
+      - PDS_HTTPS_ENABLED=true
+      - PDS_SSL_CERT_PATH=/certs/localhost.crt
+      - PDS_SSL_KEY_PATH=/certs/localhost.key
+      # Allow self-signed certificates for local development
       - NODE_TLS_REJECT_UNAUTHORIZED=0
     volumes:
       - pds-data:/pds
-      - ./certs:/app/certs:ro
+      - ./certs:/certs:ro
     healthcheck:
       test: ["CMD-SHELL", "curl -k -f https://localhost:3000/_health || exit 1"]
       interval: 10s
