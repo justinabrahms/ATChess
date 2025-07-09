@@ -17,13 +17,11 @@ services:
       - PDS_BSKY_APP_VIEW_DID=did:web:api.bsky.app
       - PDS_CRAWLERS=https://bsky.network
       - LOG_ENABLED=true
-      # Required security keys
+      # Required security keys for PDS operation
       - PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX=1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef
       - PDS_REPO_SIGNING_KEY_K256_PRIVATE_KEY_HEX=abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890
-      # Fix OAuth validation for local development
-      - PDS_ENTRYWAY_DID=did:web:localhost%3A3000
-      - PDS_ENTRYWAY_URL=http://localhost:3000
-      - PDS_ENTRYWAY_JWT_VERIFY_KEY_K256_PUBLIC_KEY_HEX=04b678a0d8c7f3e9a1b2c4d5e6f789012345678901234567890123456789abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef
+      # Disable entryway for local development
+      - PDS_ENTRYWAY_URL=
     volumes:
       - pds-data:/pds
     healthcheck:
