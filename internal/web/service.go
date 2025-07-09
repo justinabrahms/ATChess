@@ -33,12 +33,7 @@ func (s *Service) decodeGameID(encodedGameID string) (string, error) {
 	base64Str := strings.ReplaceAll(encodedGameID, "-", "+")
 	base64Str = strings.ReplaceAll(base64Str, "_", "/")
 	
-	// Add padding if needed
-	if len(base64Str)%4 != 0 {
-		base64Str += strings.Repeat("=", 4-len(base64Str)%4)
-	}
-	
-	// Decode base64
+	// Decode base64 (padding should already be present)
 	decoded, err := base64.StdEncoding.DecodeString(base64Str)
 	if err != nil {
 		return "", fmt.Errorf("failed to decode base64: %w", err)

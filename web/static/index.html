@@ -407,7 +407,7 @@
             
             encodeGameId(gameId) {
                 // Convert AT Protocol URI to URL-safe slug
-                return btoa(gameId).replace(/[+/=]/g, c => ({'+': '-', '/': '_', '=': ''})[c]);
+                return btoa(gameId).replace(/[+/]/g, c => ({'+': '-', '/': '_'})[c]);
             }
             
             decodeGameId(gameSlug) {
