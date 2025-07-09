@@ -1,48 +1,69 @@
 package atproto
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
+	"net/http"
 	"time"
 
-	"github.com/bluesky-social/indigo/api"
-	"github.com/bluesky-social/indigo/api/atproto"
-	"github.com/bluesky-social/indigo/xrpc"
 	"github.com/justinabrahms/atchess/internal/chess"
 )
 
 type Client struct {
-	xrpcClient *xrpc.Client
+	pdsURL     string
+	accessJWT  string
 	did        string
 	handle     string
+	httpClient *http.Client
 }
 
 func NewClient(pdsURL, handle, password string) (*Client, error) {
-	client := &xrpc.Client{
-		Host: pdsURL,
+	httpClient := &http.Client{
+		Timeout: 30 * time.Second,
 	}
 	
 	// Create session
-	session, err := atproto.ServerCreateSession(context.Background(), client, &atproto.ServerCreateSession_Input{
-		Identifier: handle,
-		Password:   password,
-	})
+	sessionReq := map[string]interface{}{
+		"identifier": handle,
+		"password":   password,
+	}
+	
+	reqBody, _ := json.Marshal(sessionReq)
+	req, err := http.NewRequest("POST", pdsURL+"/xrpc/com.atproto.server.createSession", bytes.NewBuffer(reqBody))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	
+	req.Header.Set("Content-Type", "application/json")
+	
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create session: %w", err)
 	}
+	defer resp.Body.Close()
 	
-	// Set auth info
-	client.Auth = &xrpc.AuthInfo{
-		AccessJwt:  session.AccessJwt,
-		RefreshJwt: session.RefreshJwt,
-		Did:        session.Did,
-		Handle:     session.Handle,
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("failed to create session: HTTP %d", resp.StatusCode)
+	}
+	
+	var session struct {
+		AccessJwt string `json:"accessJwt"`
+		Did       string `json:"did"`
+		Handle    string `json:"handle"`
+	}
+	
+	if err := json.NewDecoder(resp.Body).Decode(&session); err != nil {
+		return nil, fmt.Errorf("failed to decode session response: %w", err)
 	}
 	
 	return &Client{
-		xrpcClient: client,
+		pdsURL:     pdsURL,
+		accessJWT:  session.AccessJwt,
 		did:        session.Did,
 		handle:     session.Handle,
+		httpClient: httpClient,
 	}, nil
 }
 
@@ -73,17 +94,42 @@ func (c *Client) CreateGame(ctx context.Context, opponentDID string, color strin
 	}
 	
 	// Create record in repository
-	resp, err := atproto.RepoCreateRecord(ctx, c.xrpcClient, &atproto.RepoCreateRecord_Input{
-		Repo:       c.did,
-		Collection: "app.atchess.game",
-		Record:     &gameRecord,
-	})
+	createReq := map[string]interface{}{
+		"repo":       c.did,
+		"collection": "app.atchess.game",
+		"record":     gameRecord,
+	}
+	
+	reqBody, _ := json.Marshal(createReq)
+	req, err := http.NewRequest("POST", c.pdsURL+"/xrpc/com.atproto.repo.createRecord", bytes.NewBuffer(reqBody))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+c.accessJWT)
+	
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create game record: %w", err)
 	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("failed to create game record: HTTP %d", resp.StatusCode)
+	}
+	
+	var createResp struct {
+		URI string `json:"uri"`
+		CID string `json:"cid"`
+	}
+	
+	if err := json.NewDecoder(resp.Body).Decode(&createResp); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
 	
 	return &chess.Game{
-		ID:        resp.Uri,
+		ID:        createResp.URI,
 		White:     whiteDID,
 		Black:     blackDID,
 		Status:    chess.StatusActive,
@@ -117,13 +163,29 @@ func (c *Client) RecordMove(ctx context.Context, gameURI string, move *chess.Mov
 	}
 	
 	// Create move record
-	_, err := atproto.RepoCreateRecord(ctx, c.xrpcClient, &atproto.RepoCreateRecord_Input{
-		Repo:       c.did,
-		Collection: "app.atchess.move",
-		Record:     &moveRecord,
-	})
+	createReq := map[string]interface{}{
+		"repo":       c.did,
+		"collection": "app.atchess.move",
+		"record":     moveRecord,
+	}
+	
+	reqBody, _ := json.Marshal(createReq)
+	req, err := http.NewRequest("POST", c.pdsURL+"/xrpc/com.atproto.repo.createRecord", bytes.NewBuffer(reqBody))
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+	
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+c.accessJWT)
+	
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("failed to create move record: %w", err)
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("failed to create move record: HTTP %d", resp.StatusCode)
 	}
 	
 	// Update game record with new FEN
@@ -144,17 +206,42 @@ func (c *Client) CreateChallenge(ctx context.Context, opponentDID, color, messag
 		"expiresAt":  time.Now().Add(24 * time.Hour).Format(time.RFC3339),
 	}
 	
-	resp, err := atproto.RepoCreateRecord(ctx, c.xrpcClient, &atproto.RepoCreateRecord_Input{
-		Repo:       c.did,
-		Collection: "app.atchess.challenge",
-		Record:     &challengeRecord,
-	})
+	createReq := map[string]interface{}{
+		"repo":       c.did,
+		"collection": "app.atchess.challenge",
+		"record":     challengeRecord,
+	}
+	
+	reqBody, _ := json.Marshal(createReq)
+	req, err := http.NewRequest("POST", c.pdsURL+"/xrpc/com.atproto.repo.createRecord", bytes.NewBuffer(reqBody))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+c.accessJWT)
+	
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create challenge record: %w", err)
 	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("failed to create challenge record: HTTP %d", resp.StatusCode)
+	}
+	
+	var createResp struct {
+		URI string `json:"uri"`
+		CID string `json:"cid"`
+	}
+	
+	if err := json.NewDecoder(resp.Body).Decode(&createResp); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
 	
 	return &chess.Challenge{
-		ID:         resp.Uri,
+		ID:         createResp.URI,
 		Challenger: c.did,
 		Challenged: opponentDID,
 		Status:     "pending",
