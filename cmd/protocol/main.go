@@ -79,6 +79,20 @@ func main() {
 	api.HandleFunc("/games/{id:.*}/moves", service.MakeMoveHandler).Methods("POST")
 	api.HandleFunc("/challenges", service.CreateChallengeHandler).Methods("POST")
 	
+	// Explicit OPTIONS handlers for CORS preflight requests
+	api.HandleFunc("/games", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}).Methods("OPTIONS")
+	api.HandleFunc("/games/{id:.*}", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}).Methods("OPTIONS")
+	api.HandleFunc("/games/{id:.*}/moves", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}).Methods("OPTIONS")
+	api.HandleFunc("/challenges", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}).Methods("OPTIONS")
+	
 	// Serve static files
 	router.PathPrefix("/").Handler(http.FileServer(http.Dir("./web/static/")))
 	
