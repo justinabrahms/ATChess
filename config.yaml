@@ -4,8 +4,8 @@ server:
   
 atproto:
   pds_url: http://localhost:3000
-  handle: "atchess.localhost"
-  password: "atchess-service-password"
+  handle: "player1.test"
+  password: "player1pass"
   
 development:
   debug: true
