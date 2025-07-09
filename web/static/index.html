@@ -432,8 +432,9 @@
                         // Show share button
                         document.getElementById('shareGameBtn').style.display = 'inline-block';
                         
-                        // Fetch game state from the API
-                        const response = await fetch(`http://localhost:8080/api/games/${encodeURIComponent(gameId)}`);
+                        // Fetch game state from the API using base64 encoded game ID
+                        const encodedGameId = this.encodeGameId(gameId);
+                        const response = await fetch(`http://localhost:8080/api/games/${encodedGameId}`);
                         if (response.ok) {
                             const game = await response.json();
                             console.log('Loaded game from API:', game);

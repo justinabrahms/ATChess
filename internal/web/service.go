@@ -2,10 +2,12 @@ package web
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
+	"strings"
 
 	"github.com/gorilla/mux"
 	"github.com/justinabrahms/atchess/internal/atproto"
@@ -24,6 +26,25 @@ func NewService(client *atproto.Client, config *config.Config) *Service {
 		client: client,
 		config: config,
 	}
+}
+
+func (s *Service) decodeGameID(encodedGameID string) (string, error) {
+	// Convert URL-safe base64 back to regular base64
+	base64Str := strings.ReplaceAll(encodedGameID, "-", "+")
+	base64Str = strings.ReplaceAll(base64Str, "_", "/")
+	
+	// Add padding if needed
+	if len(base64Str)%4 != 0 {
+		base64Str += strings.Repeat("=", 4-len(base64Str)%4)
+	}
+	
+	// Decode base64
+	decoded, err := base64.StdEncoding.DecodeString(base64Str)
+	if err != nil {
+		return "", fmt.Errorf("failed to decode base64: %w", err)
+	}
+	
+	return string(decoded), nil
 }
 
 func (s *Service) HealthHandler(w http.ResponseWriter, r *http.Request) {
@@ -128,8 +149,8 @@ func (s *Service) GetGameHandler(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	encodedGameID := vars["id"]
 	
-	// URL decode the game ID
-	gameID, err := url.QueryUnescape(encodedGameID)
+	// Base64 decode the game ID (using URL-safe base64 decoding)
+	gameID, err := s.decodeGameID(encodedGameID)
 	if err != nil {
 		log.Error().Err(err).Str("encodedGameID", encodedGameID).Msg("Failed to decode game ID")
 		http.Error(w, "Invalid game ID", http.StatusBadRequest)
