@@ -12,41 +12,24 @@ This guide helps you set up a local AT Protocol Personal Data Server (PDS) for t
 
 ### 1. Run Local PDS
 
-Create a `docker-compose.yml` file in the project root:
+The `docker-compose.yml` file is already configured with development keys. For production, you'll need to generate secure keys.
 
-```yaml
-version: '3.8'
+**For Development (using provided docker-compose.yml):**
+The included configuration uses development keys that are safe for local testing.
 
-services:
-  pds:
-    image: ghcr.io/bluesky-social/pds:latest
-    ports:
-      - "3000:3000"
-    environment:
-      - PDS_HOSTNAME=localhost:3000
-      - PDS_JWT_SECRET=your-secret-key-here
-      - PDS_ADMIN_PASSWORD=admin
-      - PDS_INVITE_REQUIRED=false
-      - PDS_EMAIL_SMTP_URL=smtp://fake
-      - PDS_EMAIL_FROM_ADDRESS=noreply@localhost
-      - PDS_DATA_DIRECTORY=/pds
-      - PDS_BLOBSTORE_DISK_LOCATION=/pds/blocks
-      - PDS_DID_PLC_URL=https://plc.directory
-      - PDS_BSKY_APP_VIEW_URL=https://api.bsky.app
-      - PDS_BSKY_APP_VIEW_DID=did:web:api.bsky.app
-      - PDS_CRAWLERS=https://bsky.network
-      - LOG_ENABLED=true
-    volumes:
-      - pds-data:/pds
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:3000/_health"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+**For Production:**
+Generate secure keys with the provided script:
 
-volumes:
-  pds-data:
+```bash
+./scripts/generate-pds-keys.sh
 ```
+
+This creates cryptographically secure keys for:
+- `PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX` - Identity management
+- `PDS_JWT_SECRET` - Session token signing  
+- `PDS_SERVICE_SIGNING_KEY` - Service authentication
+
+⚠️ **Security Note**: The development keys in docker-compose.yml are for local testing only. Never use them in production!
 
 Start the PDS:
 

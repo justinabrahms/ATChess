@@ -5,7 +5,7 @@ services:
       - "3000:3000"
     environment:
       - PDS_HOSTNAME=localhost:3000
-      - PDS_JWT_SECRET=your-secret-key-here-change-in-production
+      - PDS_JWT_SECRET=atchess-dev-jwt-secret-change-in-production
       - PDS_ADMIN_PASSWORD=admin
       - PDS_INVITE_REQUIRED=false
       - PDS_EMAIL_SMTP_URL=smtp://fake
@@ -17,6 +17,12 @@ services:
       - PDS_BSKY_APP_VIEW_DID=did:web:api.bsky.app
       - PDS_CRAWLERS=https://bsky.network
       - LOG_ENABLED=true
+      # Required PLC rotation key for development
+      - PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX=1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef
+      # Required service signing key
+      - PDS_SERVICE_SIGNING_KEY=atchess-dev-service-signing-key-change-in-production
+      # Development mode settings
+      - PDS_DEV_MODE=true
     volumes:
       - pds-data:/pds
     healthcheck:
