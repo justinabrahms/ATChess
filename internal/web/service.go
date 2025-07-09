@@ -68,6 +68,9 @@ func (s *Service) MakeMoveHandler(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	gameID := vars["id"]
 	
+	// Log for debugging
+	log.Info().Str("gameID", gameID).Str("path", r.URL.Path).Msg("MakeMoveHandler called")
+	
 	var req MakeMoveRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Invalid request body", http.StatusBadRequest)

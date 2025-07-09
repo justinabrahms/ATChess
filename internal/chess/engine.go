@@ -49,21 +49,29 @@ func (e *Engine) MakeMove(from, to string, promotion chess.PieceType) (*MoveResu
 		return nil, fmt.Errorf("invalid move: %s to %s", from, to)
 	}
 	
+	// Get position before move for proper SAN notation
+	positionBefore := e.game.Position()
+	
 	// Make the move
 	if err := e.game.Move(validMove); err != nil {
 		return nil, fmt.Errorf("failed to make move: %w", err)
 	}
 	
 	// Get position after move
-	position := e.game.Position()
+	positionAfter := e.game.Position()
+	
+	san := chess.AlgebraicNotation{}.Encode(positionBefore, validMove)
+	
+	isCheck := len(san) > 0 && (san[len(san)-1] == '+' || san[len(san)-1] == '#')
+	isCheckmate := len(san) > 0 && san[len(san)-1] == '#'
 	
 	result := &MoveResult{
 		From:      from,
 		To:        to,
-		SAN:       chess.AlgebraicNotation{}.Encode(position, validMove),
-		FEN:       position.String(),
-		Check:     e.isInCheck(),
-		Checkmate: e.game.Method() == chess.Checkmate,
+		SAN:       san,
+		FEN:       positionAfter.String(),
+		Check:     isCheck,
+		Checkmate: isCheckmate,
 		Draw:      e.game.Outcome() == chess.Draw,
 		GameOver:  e.game.Outcome() != chess.NoOutcome,
 	}
@@ -114,8 +122,8 @@ func (e *Engine) ValidateFEN(fen string) error {
 }
 
 func (e *Engine) isInCheck() bool {
-	// For now, just return false as we focus on basic move functionality
-	// In a full implementation, this would check if the king is under attack
+	// For now, we'll rely on the SAN notation to indicate check
+	// This method is not currently used in the main logic
 	return false
 }
 
