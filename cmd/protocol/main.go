@@ -59,7 +59,7 @@ func main() {
 	api := router.PathPrefix("/api").Subrouter()
 	api.HandleFunc("/health", service.HealthHandler).Methods("GET")
 	api.HandleFunc("/games", service.CreateGameHandler).Methods("POST")
-	api.HandleFunc("/games/{id}/moves", service.MakeMoveHandler).Methods("POST")
+	api.HandleFunc("/games/{id:.*}/moves", service.MakeMoveHandler).Methods("POST")
 	api.HandleFunc("/challenges", service.CreateChallengeHandler).Methods("POST")
 	
 	// Serve static files

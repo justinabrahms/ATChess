@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 
 	"github.com/gorilla/mux"
 	"github.com/justinabrahms/atchess/internal/atproto"
@@ -62,20 +63,34 @@ type MakeMoveRequest struct {
 	To        string `json:"to"`
 	Promotion string `json:"promotion,omitempty"`
 	FEN       string `json:"fen"`
+	GameID    string `json:"game_id,omitempty"`
 }
 
 func (s *Service) MakeMoveHandler(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
-	gameID := vars["id"]
-	
-	// Log for debugging
-	log.Info().Str("gameID", gameID).Str("path", r.URL.Path).Msg("MakeMoveHandler called")
+	encodedGameID := vars["id"]
 	
 	var req MakeMoveRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
 		return
 	}
+	
+	// Use game ID from request body if provided, otherwise try URL
+	gameID := req.GameID
+	if gameID == "" {
+		// URL decode the game ID
+		var err error
+		gameID, err = url.QueryUnescape(encodedGameID)
+		if err != nil {
+			log.Error().Err(err).Str("encodedGameID", encodedGameID).Msg("Failed to decode game ID")
+			http.Error(w, "Invalid game ID", http.StatusBadRequest)
+			return
+		}
+	}
+	
+	// Log for debugging
+	log.Info().Str("gameID", gameID).Str("encodedGameID", encodedGameID).Str("path", r.URL.Path).Msg("MakeMoveHandler called")
 	
 	// Create chess engine from current position
 	engine, err := chess.NewEngineFromFEN(req.FEN)
