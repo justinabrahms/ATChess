@@ -143,6 +143,11 @@
             <div class="form-group">
                 <label for="opponentDID">Opponent DID:</label>
                 <input type="text" id="opponentDID" placeholder="did:plc:example123...">
+                <small style="color: #666; font-size: 12px;">
+                    Test DIDs: 
+                    <a href="#" onclick="document.getElementById('opponentDID').value='did:plc:styupz2ghvg7hrq4optipm7s'; return false;">Player 1</a> | 
+                    <a href="#" onclick="document.getElementById('opponentDID').value='did:plc:yguha7jixn3rlblla2pzbmwl'; return false;">Player 2</a>
+                </small>
             </div>
             <div class="form-group">
                 <label for="colorChoice">Your Color:</label>
@@ -219,7 +224,7 @@
             
             async makeMove(from, to) {
                 try {
-                    const response = await fetch(`/api/games/${this.gameId}/moves`, {
+                    const response = await fetch(`http://localhost:8080/api/games/${this.gameId}/moves`, {
                         method: 'POST',
                         headers: {
                             'Content-Type': 'application/json',
@@ -227,7 +232,8 @@
                         body: JSON.stringify({
                             from: from,
                             to: to,
-                            fen: this.currentFEN
+                            fen: this.currentFEN,
+                            game_id: this.gameId
                         })
                     });
                     
@@ -338,7 +344,7 @@
                 }
                 
                 try {
-                    const response = await fetch('/api/games', {
+                    const response = await fetch('http://localhost:8080/api/games', {
                         method: 'POST',
                         headers: {
                             'Content-Type': 'application/json',
