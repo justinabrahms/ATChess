@@ -230,7 +230,7 @@
             
             async makeMove(from, to) {
                 try {
-                    const response = await fetch(`http://localhost:8080/api/games/${encodeURIComponent(this.gameId)}/moves`, {
+                    const response = await fetch(`http://localhost:8080/api/moves`, {
                         method: 'POST',
                         headers: {
                             'Content-Type': 'application/json',

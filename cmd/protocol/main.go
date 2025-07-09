@@ -76,7 +76,7 @@ func main() {
 	api.HandleFunc("/health", service.HealthHandler).Methods("GET")
 	api.HandleFunc("/games", service.CreateGameHandler).Methods("POST")
 	api.HandleFunc("/games/{id:.*}", service.GetGameHandler).Methods("GET")
-	api.HandleFunc("/games/{id:.*}/moves", service.MakeMoveHandler).Methods("POST")
+	api.HandleFunc("/moves", service.MakeMoveHandler).Methods("POST")
 	api.HandleFunc("/challenges", service.CreateChallengeHandler).Methods("POST")
 	
 	// Explicit OPTIONS handlers for CORS preflight requests
@@ -86,7 +86,7 @@ func main() {
 	api.HandleFunc("/games/{id:.*}", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}).Methods("OPTIONS")
-	api.HandleFunc("/games/{id:.*}/moves", func(w http.ResponseWriter, r *http.Request) {
+	api.HandleFunc("/moves", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}).Methods("OPTIONS")
 	api.HandleFunc("/challenges", func(w http.ResponseWriter, r *http.Request) {
@@ -166,7 +166,7 @@ API ENDPOINTS:
     GET  /api/health              - Service health check
     POST /api/games               - Create a new chess game
     GET  /api/games/{id}          - Get game state by ID
-    POST /api/games/{id}/moves    - Submit a move to a game
+    POST /api/moves               - Submit a move to a game (game_id in body)
     POST /api/challenges          - Create a game challenge
 
 BEHAVIOR:

@@ -67,30 +67,21 @@ type MakeMoveRequest struct {
 }
 
 func (s *Service) MakeMoveHandler(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	encodedGameID := vars["id"]
-	
 	var req MakeMoveRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
 		return
 	}
 	
-	// Use game ID from request body if provided, otherwise try URL
+	// Game ID must be provided in request body
 	gameID := req.GameID
 	if gameID == "" {
-		// URL decode the game ID
-		var err error
-		gameID, err = url.QueryUnescape(encodedGameID)
-		if err != nil {
-			log.Error().Err(err).Str("encodedGameID", encodedGameID).Msg("Failed to decode game ID")
-			http.Error(w, "Invalid game ID", http.StatusBadRequest)
-			return
-		}
+		http.Error(w, "game_id is required in request body", http.StatusBadRequest)
+		return
 	}
 	
 	// Log for debugging
-	log.Info().Str("gameID", gameID).Str("encodedGameID", encodedGameID).Str("path", r.URL.Path).Msg("MakeMoveHandler called")
+	log.Info().Str("gameID", gameID).Str("path", r.URL.Path).Msg("MakeMoveHandler called")
 	
 	// Create chess engine from current position
 	engine, err := chess.NewEngineFromFEN(req.FEN)
