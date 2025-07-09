@@ -44,6 +44,10 @@
             font-size: 36px;
             cursor: pointer;
             position: relative;
+            transition: background-color 0.2s ease, box-shadow 0.2s ease;
+        }
+        .square:hover {
+            opacity: 0.9;
         }
         .square.light {
             background-color: #f0d9b5;
@@ -52,10 +56,26 @@
             background-color: #b58863;
         }
         .square.selected {
-            background-color: #yellow;
+            background-color: #ffeb3b !important;
+            box-shadow: inset 0 0 0 3px #ff9800, 0 0 0 2px #ff6f00;
+            transform: scale(1.05);
         }
         .square.highlight {
             background-color: #7fc97f;
+        }
+        .square.possible-move {
+            background-color: rgba(124, 179, 66, 0.3) !important;
+        }
+        .square.possible-move:after {
+            content: '';
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            width: 20px;
+            height: 20px;
+            background-color: rgba(124, 179, 66, 0.6);
+            border-radius: 50%;
+            transform: translate(-50%, -50%);
         }
         .controls {
             text-align: center;
@@ -203,18 +223,44 @@
             
             handleSquareClick(e) {
                 const square = e.target.dataset.square;
+                const hasPiece = e.target.textContent.trim() !== '';
                 
                 if (this.selectedSquare === null) {
-                    // Select square
-                    this.selectedSquare = square;
-                    e.target.classList.add('selected');
+                    // Only select squares that have pieces
+                    if (hasPiece) {
+                        this.selectedSquare = square;
+                        e.target.classList.add('selected');
+                    }
                 } else if (this.selectedSquare === square) {
-                    // Deselect
+                    // Deselect same square
                     this.clearSelection();
                 } else {
-                    // Make move
-                    this.makeMove(this.selectedSquare, square);
-                    this.clearSelection();
+                    // Make move or select new piece
+                    if (hasPiece && this.isOwnPiece(e.target.textContent.trim())) {
+                        // If clicking on own piece, select it instead
+                        this.clearSelection();
+                        this.selectedSquare = square;
+                        e.target.classList.add('selected');
+                    } else {
+                        // Make move (to empty square or capture opponent piece)
+                        this.makeMove(this.selectedSquare, square);
+                        this.clearSelection();
+                    }
+                }
+            }
+            
+            isOwnPiece(pieceSymbol) {
+                if (!pieceSymbol) return false;
+                
+                // White pieces are uppercase symbols: ♔♕♖♗♘♙
+                // Black pieces are lowercase symbols: ♚♛♜♝♞♟
+                const whitePieces = ['♔', '♕', '♖', '♗', '♘', '♙'];
+                const blackPieces = ['♚', '♛', '♜', '♝', '♞', '♟'];
+                
+                if (this.currentPlayer === 'white') {
+                    return whitePieces.includes(pieceSymbol);
+                } else {
+                    return blackPieces.includes(pieceSymbol);
                 }
             }
             
@@ -226,6 +272,11 @@
                     }
                     this.selectedSquare = null;
                 }
+                
+                // Clear all possible move highlights
+                document.querySelectorAll('.square.possible-move').forEach(square => {
+                    square.classList.remove('possible-move');
+                });
             }
             
             async makeMove(from, to) {

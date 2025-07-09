@@ -244,7 +244,7 @@ func TestInvalidMoveSubmissionAlwaysRejectsIllegalMoves(t *testing.T) {
 		{"Castle through check", "e1", "g1"}, // in specific positions
 		{"Castle when in check", "e1", "g1"}, // when king is in check
 		{"En passant when not available", "e5", "d6"}, // without proper setup
-		{"Promote to invalid piece", "e7", "e8"}, // would need promotion parameter
+		{"Promote without promotion piece", "e7", "e8"}, // pawn on 7th rank moving to 8th without promotion
 	}
 	
 	for _, move := range invalidMoves {

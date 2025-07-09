@@ -148,7 +148,7 @@ func (c *Client) RecordMove(ctx context.Context, gameURI string, move *chess.Mov
 		"createdAt": time.Now().Format(time.RFC3339),
 		"game": map[string]interface{}{
 			"uri": gameURI,
-			"cid": "", // Would need to fetch game CID
+			"cid": "", // TODO: Would need to fetch game CID for proper linking
 		},
 		"player": c.did,
 		"from":   move.From,
@@ -223,10 +223,6 @@ func (c *Client) RecordMove(ctx context.Context, gameURI string, move *chess.Mov
 		URI    string                 `json:"uri"`
 		CID    string                 `json:"cid"`
 		Value  map[string]interface{} `json:"value"`
-	}
-	
-	if err := json.NewDecoder(getResp.Body).Decode(&recordResp); err != nil {
-		return fmt.Errorf("failed to decode game record: %w", err)
 	}
 	
 	// Update the game record with new FEN and status
