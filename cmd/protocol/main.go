@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"net/http"
 	"os"
@@ -18,6 +19,17 @@ import (
 )
 
 func main() {
+	// Parse command line flags
+	var showHelp bool
+	flag.BoolVar(&showHelp, "help", false, "Show help information")
+	flag.BoolVar(&showHelp, "h", false, "Show help information")
+	flag.Parse()
+
+	if showHelp {
+		showHelpMessage()
+		return
+	}
+
 	// Setup logging
 	log.Logger = zerolog.New(os.Stdout).With().Timestamp().Logger()
 	
@@ -85,4 +97,68 @@ func main() {
 	}
 	
 	log.Info().Msg("Server exited")
+}
+
+func showHelpMessage() {
+	fmt.Println(`ATChess Protocol Service
+
+DESCRIPTION:
+    AT Protocol service for the ATChess decentralized chess platform.
+    Handles chess game logic, move validation, and AT Protocol interactions.
+    Provides REST API endpoints for game operations and stores game data
+    in personal AT Protocol repositories.
+
+USAGE:
+    atchess-protocol [OPTIONS]
+
+OPTIONS:
+    -h, --help    Show this help message
+
+CONFIGURATION:
+    The protocol service is configured via config.yaml in the current directory.
+    
+    Example config.yaml:
+        server:
+          host: localhost
+          port: 8080        # Protocol service port
+        
+        atproto:
+          pds_url: http://localhost:3000
+          handle: "atchess.localhost"
+          password: "atchess-service-password"
+        
+        development:
+          debug: true
+          log_level: debug
+
+API ENDPOINTS:
+    GET  /api/health              - Service health check
+    POST /api/games               - Create a new chess game
+    POST /api/games/{id}/moves    - Submit a move to a game
+    POST /api/challenges          - Create a game challenge
+
+BEHAVIOR:
+    - Validates chess moves using notnil/chess engine
+    - Stores game data in AT Protocol repositories
+    - Handles game state management with FEN/PGN notation
+    - Provides REST API for chess operations
+    - Graceful shutdown on SIGINT/SIGTERM
+
+EXAMPLES:
+    # Start with default configuration
+    atchess-protocol
+    
+    # Show help
+    atchess-protocol --help
+    
+    # Create a game via API
+    curl -X POST http://localhost:8080/api/games \
+      -H "Content-Type: application/json" \
+      -d '{"opponent_did": "did:plc:...", "color": "white"}'
+
+SEE ALSO:
+    atchess-web(1), config.yaml(5)
+    
+    Documentation: docs/
+    Repository: https://github.com/justinabrahms/atchess`)
 }

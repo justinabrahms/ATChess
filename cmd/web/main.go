@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"fmt"
 	"net/http"
 	"os"
@@ -16,6 +17,17 @@ import (
 )
 
 func main() {
+	// Parse command line flags
+	var showHelp bool
+	flag.BoolVar(&showHelp, "help", false, "Show help information")
+	flag.BoolVar(&showHelp, "h", false, "Show help information")
+	flag.Parse()
+
+	if showHelp {
+		showHelpMessage()
+		return
+	}
+
 	// Setup logging
 	log.Logger = zerolog.New(os.Stdout).With().Timestamp().Logger()
 	
@@ -63,4 +75,57 @@ func main() {
 	}
 	
 	log.Info().Msg("Web server exited")
+}
+
+func showHelpMessage() {
+	fmt.Println(`ATChess Web Server
+
+DESCRIPTION:
+    Interactive web interface for the ATChess decentralized chess platform.
+    Serves a visual chessboard with drag-and-drop piece movement and real-time
+    game state updates. Connects to the ATChess protocol service for game logic
+    and AT Protocol storage.
+
+USAGE:
+    atchess-web [OPTIONS]
+
+OPTIONS:
+    -h, --help    Show this help message
+
+CONFIGURATION:
+    The web server is configured via config.yaml in the current directory.
+    
+    Example config.yaml:
+        server:
+          host: localhost
+          port: 8080        # Protocol service port (web runs on port+1)
+        
+        atproto:
+          pds_url: http://localhost:3000
+          handle: "atchess.localhost"
+          password: "atchess-service-password"
+        
+        development:
+          debug: true
+          log_level: debug
+
+BEHAVIOR:
+    - Web server runs on port 8081 (protocol service port + 1)
+    - Serves static files from ./web/static/
+    - Provides interactive chessboard interface
+    - Connects to atchess-protocol service for game operations
+    - Graceful shutdown on SIGINT/SIGTERM
+
+EXAMPLES:
+    # Start with default configuration
+    atchess-web
+    
+    # Show help
+    atchess-web --help
+
+SEE ALSO:
+    atchess-protocol(1), config.yaml(5)
+    
+    Documentation: docs/
+    Repository: https://github.com/justinabrahms/atchess`)
 }
