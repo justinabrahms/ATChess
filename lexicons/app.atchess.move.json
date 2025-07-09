@@ -1,0 +1,65 @@
+{
+  "lexicon": 1,
+  "id": "app.atchess.move",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "A chess move record",
+      "key": "tid",
+      "record": {
+        "type": "object",
+        "required": ["createdAt", "game", "player", "from", "to", "fen"],
+        "properties": {
+          "createdAt": {
+            "type": "string",
+            "format": "datetime",
+            "description": "When the move was made"
+          },
+          "game": {
+            "type": "ref",
+            "ref": "com.atproto.repo.strongRef",
+            "description": "Reference to the game record"
+          },
+          "player": {
+            "type": "string",
+            "format": "did",
+            "description": "DID of the player making the move"
+          },
+          "from": {
+            "type": "string",
+            "description": "Source square (e.g., 'e2')"
+          },
+          "to": {
+            "type": "string",
+            "description": "Destination square (e.g., 'e4')"
+          },
+          "san": {
+            "type": "string",
+            "description": "Standard Algebraic Notation (e.g., 'e4', 'Nf3')"
+          },
+          "fen": {
+            "type": "string",
+            "description": "Board position after move in FEN notation"
+          },
+          "promotion": {
+            "type": "string",
+            "enum": ["q", "r", "b", "n"],
+            "description": "Promotion piece if pawn promotion"
+          },
+          "check": {
+            "type": "boolean",
+            "description": "Whether this move puts opponent in check"
+          },
+          "checkmate": {
+            "type": "boolean",
+            "description": "Whether this move is checkmate"
+          },
+          "moveNumber": {
+            "type": "integer",
+            "description": "Move number in the game"
+          }
+        }
+      }
+    }
+  }
+}

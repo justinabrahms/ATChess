@@ -1,0 +1,62 @@
+{
+  "lexicon": 1,
+  "id": "app.atchess.game",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "A chess game record",
+      "key": "tid",
+      "record": {
+        "type": "object",
+        "required": ["createdAt", "white", "black", "status", "fen"],
+        "properties": {
+          "createdAt": {
+            "type": "string",
+            "format": "datetime",
+            "description": "When the game was created"
+          },
+          "white": {
+            "type": "string",
+            "format": "did",
+            "description": "DID of the white player"
+          },
+          "black": {
+            "type": "string",
+            "format": "did",
+            "description": "DID of the black player"
+          },
+          "status": {
+            "type": "string",
+            "enum": ["active", "draw", "white_won", "black_won", "abandoned"],
+            "description": "Current game status"
+          },
+          "fen": {
+            "type": "string",
+            "description": "Current board position in FEN notation"
+          },
+          "pgn": {
+            "type": "string",
+            "description": "Game moves in PGN notation"
+          },
+          "timeControl": {
+            "type": "object",
+            "properties": {
+              "initial": {
+                "type": "integer",
+                "description": "Initial time in seconds"
+              },
+              "increment": {
+                "type": "integer",
+                "description": "Increment per move in seconds"
+              }
+            }
+          },
+          "result": {
+            "type": "string",
+            "description": "Game result (1-0, 0-1, 1/2-1/2)"
+          }
+        }
+      }
+    }
+  }
+}

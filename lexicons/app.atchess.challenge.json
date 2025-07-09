@@ -1,0 +1,68 @@
+{
+  "lexicon": 1,
+  "id": "app.atchess.challenge",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "A chess game challenge/invitation",
+      "key": "tid",
+      "record": {
+        "type": "object",
+        "required": ["createdAt", "challenger", "challenged", "status"],
+        "properties": {
+          "createdAt": {
+            "type": "string",
+            "format": "datetime",
+            "description": "When the challenge was created"
+          },
+          "challenger": {
+            "type": "string",
+            "format": "did",
+            "description": "DID of the player issuing the challenge"
+          },
+          "challenged": {
+            "type": "string",
+            "format": "did",
+            "description": "DID of the player being challenged"
+          },
+          "status": {
+            "type": "string",
+            "enum": ["pending", "accepted", "declined", "cancelled"],
+            "description": "Challenge status"
+          },
+          "color": {
+            "type": "string",
+            "enum": ["white", "black", "random"],
+            "default": "random",
+            "description": "Color preference for challenger"
+          },
+          "timeControl": {
+            "type": "object",
+            "properties": {
+              "initial": {
+                "type": "integer",
+                "default": 600,
+                "description": "Initial time in seconds (default 10 minutes)"
+              },
+              "increment": {
+                "type": "integer",
+                "default": 0,
+                "description": "Increment per move in seconds"
+              }
+            }
+          },
+          "message": {
+            "type": "string",
+            "maxLength": 300,
+            "description": "Optional message with the challenge"
+          },
+          "expiresAt": {
+            "type": "string",
+            "format": "datetime",
+            "description": "When the challenge expires"
+          }
+        }
+      }
+    }
+  }
+}

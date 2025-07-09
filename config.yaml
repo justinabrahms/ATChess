@@ -1,0 +1,12 @@
+server:
+  host: localhost
+  port: 8080
+  
+atproto:
+  pds_url: http://localhost:3000
+  handle: "atchess.localhost"
+  password: "atchess-service-password"
+  
+development:
+  debug: true
+  log_level: debug

@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ATChess - Decentralized Chess</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #f0f0f0;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #333;
+            text-align: center;
+        }
+        .board-container {
+            display: flex;
+            justify-content: center;
+            margin: 20px 0;
+        }
+        .chessboard {
+            display: grid;
+            grid-template-columns: repeat(8, 60px);
+            grid-template-rows: repeat(8, 60px);
+            border: 2px solid #333;
+            background: #fff;
+        }
+        .square {
+            width: 60px;
+            height: 60px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 36px;
+            cursor: pointer;
+            position: relative;
+        }
+        .square.light {
+            background-color: #f0d9b5;
+        }
+        .square.dark {
+            background-color: #b58863;
+        }
+        .square.selected {
+            background-color: #yellow;
+        }
+        .square.highlight {
+            background-color: #7fc97f;
+        }
+        .controls {
+            text-align: center;
+            margin: 20px 0;
+        }
+        button {
+            padding: 10px 20px;
+            margin: 0 10px;
+            background: #4CAF50;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+        }
+        button:hover {
+            background: #45a049;
+        }
+        button:disabled {
+            background: #cccccc;
+            cursor: not-allowed;
+        }
+        .game-info {
+            margin: 20px 0;
+            padding: 15px;
+            background: #f9f9f9;
+            border-radius: 4px;
+        }
+        .form-group {
+            margin: 10px 0;
+        }
+        label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+        }
+        input, select {
+            width: 100%;
+            padding: 8px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+        }
+        .status {
+            text-align: center;
+            padding: 10px;
+            margin: 10px 0;
+            border-radius: 4px;
+        }
+        .status.info {
+            background: #d4edda;
+            color: #155724;
+        }
+        .status.error {
+            background: #f8d7da;
+            color: #721c24;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>ATChess</h1>
+        <p style="text-align: center;">Decentralized Chess on the AT Protocol</p>
+        
+        <div class="game-info">
+            <h3>Game Status</h3>
+            <div id="status" class="status info">Ready to play</div>
+            <div>
+                <strong>Current Player:</strong> <span id="currentPlayer">White</span>
+            </div>
+            <div>
+                <strong>FEN:</strong> <span id="fenDisplay">rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1</span>
+            </div>
+        </div>
+        
+        <div class="board-container">
+            <div class="chessboard" id="chessboard"></div>
+        </div>
+        
+        <div class="controls">
+            <button id="newGameBtn">New Game</button>
+            <button id="resetBtn">Reset Board</button>
+        </div>
+        
+        <div class="game-info">
+            <h3>Create New Game</h3>
+            <div class="form-group">
+                <label for="opponentDID">Opponent DID:</label>
+                <input type="text" id="opponentDID" placeholder="did:plc:example123...">
+            </div>
+            <div class="form-group">
+                <label for="colorChoice">Your Color:</label>
+                <select id="colorChoice">
+                    <option value="white">White</option>
+                    <option value="black">Black</option>
+                    <option value="random">Random</option>
+                </select>
+            </div>
+            <button id="createGameBtn">Create Game</button>
+        </div>
+    </div>
+
+    <script>
+        class ChessUI {
+            constructor() {
+                this.board = null;
+                this.selectedSquare = null;
+                this.currentFEN = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
+                this.currentPlayer = 'white';
+                this.gameId = null;
+                
+                this.initializeBoard();
+                this.setupEventListeners();
+                this.updateBoardFromFEN();
+            }
+            
+            initializeBoard() {
+                const board = document.getElementById('chessboard');
+                board.innerHTML = '';
+                
+                // Create squares (a8 to h1)
+                for (let rank = 8; rank >= 1; rank--) {
+                    for (let file = 0; file < 8; file++) {
+                        const square = document.createElement('div');
+                        const fileName = String.fromCharCode(97 + file); // a-h
+                        const squareName = fileName + rank;
+                        
+                        square.className = 'square ' + ((rank + file) % 2 === 0 ? 'dark' : 'light');
+                        square.dataset.square = squareName;
+                        square.addEventListener('click', (e) => this.handleSquareClick(e));
+                        
+                        board.appendChild(square);
+                    }
+                }
+            }
+            
+            handleSquareClick(e) {
+                const square = e.target.dataset.square;
+                
+                if (this.selectedSquare === null) {
+                    // Select square
+                    this.selectedSquare = square;
+                    e.target.classList.add('selected');
+                } else if (this.selectedSquare === square) {
+                    // Deselect
+                    this.clearSelection();
+                } else {
+                    // Make move
+                    this.makeMove(this.selectedSquare, square);
+                    this.clearSelection();
+                }
+            }
+            
+            clearSelection() {
+                if (this.selectedSquare) {
+                    const element = document.querySelector(`[data-square="${this.selectedSquare}"]`);
+                    if (element) {
+                        element.classList.remove('selected');
+                    }
+                    this.selectedSquare = null;
+                }
+            }
+            
+            async makeMove(from, to) {
+                try {
+                    const response = await fetch(`/api/games/${this.gameId}/moves`, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                        },
+                        body: JSON.stringify({
+                            from: from,
+                            to: to,
+                            fen: this.currentFEN
+                        })
+                    });
+                    
+                    if (!response.ok) {
+                        const error = await response.text();
+                        throw new Error(error);
+                    }
+                    
+                    const result = await response.json();
+                    this.currentFEN = result.fen;
+                    this.updateBoardFromFEN();
+                    this.updateStatus(`Move: ${result.san}`);
+                    
+                    // Update current player
+                    this.currentPlayer = this.currentPlayer === 'white' ? 'black' : 'white';
+                    document.getElementById('currentPlayer').textContent = 
+                        this.currentPlayer.charAt(0).toUpperCase() + this.currentPlayer.slice(1);
+                    
+                    if (result.checkmate) {
+                        this.updateStatus('Checkmate!', 'error');
+                    } else if (result.check) {
+                        this.updateStatus('Check!', 'error');
+                    } else if (result.draw) {
+                        this.updateStatus('Draw!', 'error');
+                    }
+                    
+                } catch (error) {
+                    this.updateStatus(`Error: ${error.message}`, 'error');
+                }
+            }
+            
+            updateBoardFromFEN() {
+                const pieces = this.parseFEN(this.currentFEN);
+                const squares = document.querySelectorAll('.square');
+                
+                squares.forEach(square => {
+                    const squareName = square.dataset.square;
+                    const piece = pieces[squareName];
+                    square.textContent = piece ? this.getPieceSymbol(piece) : '';
+                });
+                
+                document.getElementById('fenDisplay').textContent = this.currentFEN;
+            }
+            
+            parseFEN(fen) {
+                const pieces = {};
+                const [boardStr] = fen.split(' ');
+                const ranks = boardStr.split('/');
+                
+                for (let rankIndex = 0; rankIndex < 8; rankIndex++) {
+                    const rank = 8 - rankIndex;
+                    let fileIndex = 0;
+                    
+                    for (const char of ranks[rankIndex]) {
+                        if (char >= '1' && char <= '8') {
+                            fileIndex += parseInt(char);
+                        } else {
+                            const file = String.fromCharCode(97 + fileIndex);
+                            pieces[file + rank] = char;
+                            fileIndex++;
+                        }
+                    }
+                }
+                
+                return pieces;
+            }
+            
+            getPieceSymbol(piece) {
+                const symbols = {
+                    'K': '♔', 'Q': '♕', 'R': '♖', 'B': '♗', 'N': '♘', 'P': '♙',
+                    'k': '♚', 'q': '♛', 'r': '♜', 'b': '♝', 'n': '♞', 'p': '♟'
+                };
+                return symbols[piece] || piece;
+            }
+            
+            updateStatus(message, type = 'info') {
+                const status = document.getElementById('status');
+                status.textContent = message;
+                status.className = `status ${type}`;
+            }
+            
+            setupEventListeners() {
+                document.getElementById('newGameBtn').addEventListener('click', () => this.newGame());
+                document.getElementById('resetBtn').addEventListener('click', () => this.resetBoard());
+                document.getElementById('createGameBtn').addEventListener('click', () => this.createGame());
+            }
+            
+            newGame() {
+                this.currentFEN = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
+                this.currentPlayer = 'white';
+                this.gameId = null;
+                this.updateBoardFromFEN();
+                this.updateStatus('Ready to play');
+                document.getElementById('currentPlayer').textContent = 'White';
+            }
+            
+            resetBoard() {
+                this.newGame();
+            }
+            
+            async createGame() {
+                const opponentDID = document.getElementById('opponentDID').value;
+                const color = document.getElementById('colorChoice').value;
+                
+                if (!opponentDID) {
+                    this.updateStatus('Please enter opponent DID', 'error');
+                    return;
+                }
+                
+                try {
+                    const response = await fetch('/api/games', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                        },
+                        body: JSON.stringify({
+                            opponent_did: opponentDID,
+                            color: color
+                        })
+                    });
+                    
+                    if (!response.ok) {
+                        throw new Error('Failed to create game');
+                    }
+                    
+                    const game = await response.json();
+                    this.gameId = game.id;
+                    this.updateStatus(`Game created! ID: ${game.id}`);
+                    
+                } catch (error) {
+                    this.updateStatus(`Error: ${error.message}`, 'error');
+                }
+            }
+        }
+        
+        // Initialize the chess UI when the page loads
+        document.addEventListener('DOMContentLoaded', () => {
+            new ChessUI();
+        });
+    </script>
+</body>
+</html>
