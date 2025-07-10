@@ -39,13 +39,14 @@ type TimeControl struct {
 }
 
 type Challenge struct {
-	ID          string
-	Challenger  string // DID
-	Challenged  string // DID
-	Status      string
-	Color       string
-	TimeControl *TimeControl
-	Message     string
-	CreatedAt   string
-	ExpiresAt   string
+	ID              string
+	Challenger      string // DID
+	Challenged      string // DID
+	Status          string
+	Color           string
+	ProposedGameId  string
+	TimeControl     *TimeControl
+	Message         string
+	CreatedAt       string
+	ExpiresAt       string
 }

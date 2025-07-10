@@ -3,6 +3,8 @@ package atproto
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/base32"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -19,6 +21,22 @@ type Client struct {
 	did        string
 	handle     string
 	httpClient *http.Client
+}
+
+// generateGameID creates a deterministic record key for a game based on challenge parameters
+func generateGameID(challengerDID, challengedDID string, timestamp time.Time) string {
+	// Create deterministic input from challenge parameters
+	input := fmt.Sprintf("%s:%s:%d", challengerDID, challengedDID, timestamp.Unix())
+	
+	// Hash the input
+	hash := sha256.Sum256([]byte(input))
+	
+	// Encode to base32 and take first 13 characters (similar to TID length)
+	encoder := base32.StdEncoding.WithPadding(base32.NoPadding)
+	encoded := encoder.EncodeToString(hash[:8])
+	
+	// Convert to lowercase and add prefix to distinguish from auto-generated TIDs
+	return "ch" + strings.ToLower(encoded)[:11]
 }
 
 func NewClient(pdsURL, handle, password string) (*Client, error) {
@@ -69,7 +87,16 @@ func NewClient(pdsURL, handle, password string) (*Client, error) {
 	}, nil
 }
 
+// CreateGameFromChallenge creates a game record using a specific rkey and challenge reference
+func (c *Client) CreateGameFromChallenge(ctx context.Context, opponentDID, color, rkey, challengeURI, challengeCID string) (*chess.Game, error) {
+	return c.createGame(ctx, opponentDID, color, &rkey, challengeURI, challengeCID)
+}
+
 func (c *Client) CreateGame(ctx context.Context, opponentDID string, color string) (*chess.Game, error) {
+	return c.createGame(ctx, opponentDID, color, nil, "", "")
+}
+
+func (c *Client) createGame(ctx context.Context, opponentDID, color string, rkey *string, challengeURI, challengeCID string) (*chess.Game, error) {
 	// Determine who plays white/black
 	var whiteDID, blackDID string
 	if color == "white" {
@@ -95,11 +122,24 @@ func (c *Client) CreateGame(ctx context.Context, opponentDID string, color strin
 		"pgn":       "",
 	}
 	
+	// Add challenge reference if provided
+	if challengeURI != "" {
+		gameRecord["challenge"] = map[string]interface{}{
+			"uri": challengeURI,
+			"cid": challengeCID,
+		}
+	}
+	
 	// Create record in repository
 	createReq := map[string]interface{}{
 		"repo":       c.did,
 		"collection": "app.atchess.game",
 		"record":     gameRecord,
+	}
+	
+	// Add explicit rkey if provided
+	if rkey != nil {
+		createReq["rkey"] = *rkey
 	}
 	
 	reqBody, _ := json.Marshal(createReq)
@@ -262,15 +302,19 @@ func (c *Client) RecordMove(ctx context.Context, gameURI string, move *chess.Mov
 }
 
 func (c *Client) CreateChallenge(ctx context.Context, opponentDID, color, message string) (*chess.Challenge, error) {
+	createdAt := time.Now()
+	proposedGameID := generateGameID(c.did, opponentDID, createdAt)
+	
 	challengeRecord := map[string]interface{}{
-		"$type":      "app.atchess.challenge",
-		"createdAt":  time.Now().Format(time.RFC3339),
-		"challenger": c.did,
-		"challenged": opponentDID,
-		"status":     "pending",
-		"color":      color,
-		"message":    message,
-		"expiresAt":  time.Now().Add(24 * time.Hour).Format(time.RFC3339),
+		"$type":         "app.atchess.challenge",
+		"createdAt":     createdAt.Format(time.RFC3339),
+		"challenger":    c.did,
+		"challenged":    opponentDID,
+		"status":        "pending",
+		"color":         color,
+		"proposedGameId": proposedGameID,
+		"message":       message,
+		"expiresAt":     createdAt.Add(24 * time.Hour).Format(time.RFC3339),
 	}
 	
 	createReq := map[string]interface{}{
@@ -308,14 +352,15 @@ func (c *Client) CreateChallenge(ctx context.Context, opponentDID, color, messag
 	}
 	
 	return &chess.Challenge{
-		ID:         createResp.URI,
-		Challenger: c.did,
-		Challenged: opponentDID,
-		Status:     "pending",
-		Color:      color,
-		Message:    message,
-		CreatedAt:  challengeRecord["createdAt"].(string),
-		ExpiresAt:  challengeRecord["expiresAt"].(string),
+		ID:             createResp.URI,
+		Challenger:     c.did,
+		Challenged:     opponentDID,
+		Status:         "pending",
+		Color:          color,
+		ProposedGameId: proposedGameID,
+		Message:        message,
+		CreatedAt:      challengeRecord["createdAt"].(string),
+		ExpiresAt:      challengeRecord["expiresAt"].(string),
 	}, nil
 }
 

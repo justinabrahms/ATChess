@@ -36,6 +36,10 @@
             "default": "random",
             "description": "Color preference for challenger"
           },
+          "proposedGameId": {
+            "type": "string",
+            "description": "Proposed record key for the game that both players should create"
+          },
           "timeControl": {
             "type": "object",
             "properties": {
