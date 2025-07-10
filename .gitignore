@@ -31,3 +31,8 @@ build-errors.log
 
 # Docker volumes
 docker-compose.override.yml
+
+# Test script artifacts
+.atchess-test-pids
+protocol.log
+web.log

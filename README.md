@@ -155,6 +155,9 @@ make test-integration
 
 # Manual testing with two players
 # See docs/testing-guide.md for detailed instructions
+
+# Cross-PDS federation testing (advanced)
+./scripts/test-dual-pds-setup.sh
 ```
 
 ## API Endpoints
