@@ -212,6 +212,107 @@ After successful testing, you should see:
 4. **Web Interface**: Interactive chessboard responding to moves
 5. **Validation**: Invalid moves rejected with appropriate errors
 
+## Multi-PDS Testing (Cross-PDS Federation)
+
+For advanced testing of AT Protocol federation between different PDS instances, use the dual PDS setup to identify same-PDS vs cross-PDS protocol issues.
+
+### Setup Dual PDS Environment
+
+The dual PDS setup runs two separate PDS instances to test cross-PDS communication:
+
+```bash
+# Quick setup (recommended)
+./scripts/test-dual-pds-setup.sh
+```
+
+**Or manual setup:**
+
+```bash
+# 1. Start dual PDS containers
+docker-compose -f docker-compose.dual-pds.yml up -d
+
+# 2. Wait for both PDSes to be ready (15-30 seconds)
+# Check health: curl -f http://localhost:3002/_health && curl -f http://localhost:3003/_health
+
+# 3. Create cross-PDS test accounts
+./scripts/create-dual-pds-accounts.sh
+```
+
+### Dual PDS Configuration
+
+- **PDS for user3**: `localhost:3002` (separate data volume, security keys)
+- **PDS for user4**: `localhost:3003` (separate data volume, security keys)
+- **Test accounts**: `user3.test` and `user4.test` on different PDSes
+- **Ports**: Uses 3002/3003 to avoid conflicts with single PDS setup (port 3000)
+
+### Cross-PDS Test Scenarios
+
+#### 1. Basic Cross-PDS Game
+
+```bash
+# Start ATChess services
+make run-protocol &
+make run-web &
+
+# Navigate to http://localhost:8081
+# Login as user3 (user3.test / user3pass)
+# Create game and invite user4.test
+# Switch to user4 (user4.test / user4pass) 
+# Accept game and make moves
+```
+
+#### 2. Federation Testing via API
+
+```bash
+# Get user3 session (PDS on port 3002)
+curl -X POST http://localhost:3002/xrpc/com.atproto.server.createSession \
+  -H "Content-Type: application/json" \
+  -d '{"identifier": "user3.test", "password": "user3pass"}'
+
+# Get user4 session (PDS on port 3003)  
+curl -X POST http://localhost:3003/xrpc/com.atproto.server.createSession \
+  -H "Content-Type: application/json" \
+  -d '{"identifier": "user4.test", "password": "user4pass"}'
+
+# Test cross-PDS game creation and moves using the API endpoints
+# with the respective access tokens from each PDS
+```
+
+### What Cross-PDS Testing Identifies
+
+1. **Federation Issues**: Problems with AT Protocol record synchronization across PDSes
+2. **Network Communication**: Issues with PDS-to-PDS communication
+3. **Security**: Cross-PDS authentication and authorization problems  
+4. **Data Consistency**: Record replication and consistency across different PDS instances
+5. **Protocol Differences**: Same-PDS vs different-PDS behavior variations
+
+### Cross-PDS Troubleshooting
+
+**Problem**: Games not visible across PDSes
+```bash
+# Check PDS connectivity
+curl -f http://localhost:3002/_health
+curl -f http://localhost:3003/_health
+
+# Verify accounts exist on correct PDSes
+curl -X POST http://localhost:3002/xrpc/com.atproto.server.createSession \
+  -d '{"identifier": "user3.test", "password": "user3pass"}'
+```
+
+**Problem**: Cross-PDS invitations not working
+- Verify DIDs are correctly formatted for cross-PDS resolution
+- Check ATChess protocol service logs for federation errors
+- Ensure both PDSes are accessible from the protocol service
+
+**Clean Up Dual PDS Environment**
+```bash
+# Stop dual PDS containers
+docker-compose -f docker-compose.dual-pds.yml down
+
+# Remove volumes (optional - loses all test data)
+docker-compose -f docker-compose.dual-pds.yml down -v
+```
+
 ## Next Steps
 
 Once basic two-player testing works:
