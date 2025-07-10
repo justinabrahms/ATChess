@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"net/http"
 	"testing"
-	"time"
 
 	"github.com/justinabrahms/atchess/internal/atproto"
 	"github.com/justinabrahms/atchess/internal/chess"
@@ -244,38 +243,6 @@ func TestAPIEndpoints(t *testing.T) {
 	} else {
 		t.Log("⚠️  Move submission via API not working - routing issue with AT Protocol URIs")
 	}
-}
-
-// waitForPDS waits for the PDS to be ready
-func waitForPDS(t *testing.T) {
-	for i := 0; i < 30; i++ {
-		resp, err := http.Get(pdsURL + "/xrpc/com.atproto.server.describeServer")
-		if err == nil && resp.StatusCode == http.StatusOK {
-			resp.Body.Close()
-			return
-		}
-		if resp != nil {
-			resp.Body.Close()
-		}
-		time.Sleep(1 * time.Second)
-	}
-	t.Fatal("PDS not ready after 30 seconds")
-}
-
-// waitForProtocol waits for the protocol service to be ready
-func waitForProtocol(t *testing.T) {
-	for i := 0; i < 30; i++ {
-		resp, err := http.Get(protocolURL + "/api/health")
-		if err == nil && resp.StatusCode == http.StatusOK {
-			resp.Body.Close()
-			return
-		}
-		if resp != nil {
-			resp.Body.Close()
-		}
-		time.Sleep(1 * time.Second)
-	}
-	t.Fatal("Protocol service not ready after 30 seconds")
 }
 
 // TestMain sets up the test environment

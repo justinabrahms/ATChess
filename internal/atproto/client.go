@@ -142,13 +142,19 @@ func (c *Client) CreateGame(ctx context.Context, opponentDID string, color strin
 }
 
 func (c *Client) RecordMove(ctx context.Context, gameURI string, move *chess.MoveResult) error {
+	// First, fetch the game record to get its CID and current value
+	gameCID, gameValue, err := c.getGameRecord(ctx, gameURI)
+	if err != nil {
+		return fmt.Errorf("failed to get game record: %w", err)
+	}
+	
 	// Create move record
 	moveRecord := map[string]interface{}{
 		"$type":     "app.atchess.move",
 		"createdAt": time.Now().Format(time.RFC3339),
 		"game": map[string]interface{}{
 			"uri": gameURI,
-			"cid": "", // TODO: Would need to fetch game CID for proper linking
+			"cid": gameCID,
 		},
 		"player": c.did,
 		"from":   move.From,
@@ -190,7 +196,7 @@ func (c *Client) RecordMove(ctx context.Context, gameURI string, move *chess.Mov
 		return fmt.Errorf("failed to create move record: HTTP %d", resp.StatusCode)
 	}
 	
-	// Update game record with new FEN
+	// Update game record with new FEN only if it's in our repository
 	// Parse the game URI to get repo and rkey
 	parts := strings.Split(gameURI, "/")
 	if len(parts) < 5 || !strings.HasPrefix(gameURI, "at://") {
@@ -200,55 +206,36 @@ func (c *Client) RecordMove(ctx context.Context, gameURI string, move *chess.Mov
 	repo := parts[2] // The DID
 	rkey := parts[4] // The record key
 	
-	// First, fetch the current game record to get the CID
-	getReq, err := http.NewRequest("GET", fmt.Sprintf("%s/xrpc/com.atproto.repo.getRecord?repo=%s&collection=app.atchess.game&rkey=%s", 
-		c.pdsURL, repo, rkey), nil)
-	if err != nil {
-		return fmt.Errorf("failed to create get request: %w", err)
-	}
-	
-	getReq.Header.Set("Authorization", "Bearer "+c.accessJWT)
-	
-	getResp, err := c.httpClient.Do(getReq)
-	if err != nil {
-		return fmt.Errorf("failed to get game record: %w", err)
-	}
-	defer getResp.Body.Close()
-	
-	if getResp.StatusCode != http.StatusOK {
-		return fmt.Errorf("failed to get game record: HTTP %d", getResp.StatusCode)
-	}
-	
-	var recordResp struct {
-		URI    string                 `json:"uri"`
-		CID    string                 `json:"cid"`
-		Value  map[string]interface{} `json:"value"`
+	// Only update the game record if it belongs to the current user
+	if repo != c.did {
+		// Game belongs to another user, we can't update it
+		return nil
 	}
 	
 	// Update the game record with new FEN and status
-	recordResp.Value["fen"] = move.FEN
+	gameValue["fen"] = move.FEN
 	if move.Checkmate || move.Draw {
 		if move.Checkmate {
 			// Determine winner based on whose turn it was
 			fenParts := strings.Split(move.FEN, " ")
 			if len(fenParts) > 1 && fenParts[1] == "w" {
-				recordResp.Value["status"] = "black_won"
+				gameValue["status"] = "black_won"
 			} else {
-				recordResp.Value["status"] = "white_won"
+				gameValue["status"] = "white_won"
 			}
 		} else if move.Draw {
-			recordResp.Value["status"] = "draw"
+			gameValue["status"] = "draw"
 		}
 	}
-	recordResp.Value["updatedAt"] = time.Now().Format(time.RFC3339)
+	gameValue["updatedAt"] = time.Now().Format(time.RFC3339)
 	
 	// Use com.atproto.repo.putRecord to update the game
 	putReq := map[string]interface{}{
 		"repo":       repo,
 		"collection": "app.atchess.game",
 		"rkey":       rkey,
-		"record":     recordResp.Value,
-		"swapCid":    recordResp.CID, // Optimistic concurrency control
+		"record":     gameValue,
+		"swapCid":    gameCID, // Optimistic concurrency control
 	}
 	
 	putReqBody, _ := json.Marshal(putReq)
@@ -334,6 +321,50 @@ func (c *Client) CreateChallenge(ctx context.Context, opponentDID, color, messag
 
 func (c *Client) GetDID() string {
 	return c.did
+}
+
+// getGameRecord fetches a game record and returns its CID and value
+func (c *Client) getGameRecord(ctx context.Context, gameURI string) (string, map[string]interface{}, error) {
+	// Parse the AT Protocol URI to extract repo and rkey
+	// Format: at://did:plc:USER/app.atchess.game/RKEY
+	parts := strings.Split(gameURI, "/")
+	if len(parts) < 5 || !strings.HasPrefix(gameURI, "at://") {
+		return "", nil, fmt.Errorf("invalid AT Protocol URI format: %s", gameURI)
+	}
+	
+	repo := parts[2] // The DID
+	rkey := parts[4] // The record key
+	
+	req, err := http.NewRequest("GET", fmt.Sprintf("%s/xrpc/com.atproto.repo.getRecord?repo=%s&collection=app.atchess.game&rkey=%s", 
+		c.pdsURL, repo, rkey), nil)
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	
+	req.Header.Set("Authorization", "Bearer "+c.accessJWT)
+	
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to get game record: %w", err)
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", nil, fmt.Errorf("failed to get game record: HTTP %d - %s", resp.StatusCode, string(body))
+	}
+	
+	var getResp struct {
+		URI   string                 `json:"uri"`
+		CID   string                 `json:"cid"`
+		Value map[string]interface{} `json:"value"`
+	}
+	
+	if err := json.NewDecoder(resp.Body).Decode(&getResp); err != nil {
+		return "", nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+	
+	return getResp.CID, getResp.Value, nil
 }
 
 func (c *Client) GetGame(ctx context.Context, gameURI string) (*chess.Game, error) {
