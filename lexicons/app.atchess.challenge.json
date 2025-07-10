@@ -60,6 +60,28 @@
             "type": "string",
             "format": "datetime",
             "description": "When the challenge expires"
+          },
+          "games": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "uri": {
+                  "type": "string",
+                  "description": "AT Protocol URI of the game record"
+                },
+                "cid": {
+                  "type": "string",
+                  "description": "Content identifier of the game record"
+                },
+                "owner": {
+                  "type": "string",
+                  "format": "did", 
+                  "description": "DID of the player who owns this game record"
+                }
+              }
+            },
+            "description": "References to game records created from this challenge"
           }
         }
       }

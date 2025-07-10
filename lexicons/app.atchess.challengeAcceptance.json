@@ -1,0 +1,60 @@
+{
+  "lexicon": 1,
+  "id": "app.atchess.challengeAcceptance",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "Acceptance of a chess challenge",
+      "key": "tid",
+      "record": {
+        "type": "object",
+        "required": ["createdAt", "challenge", "accepter", "game"],
+        "properties": {
+          "createdAt": {
+            "type": "string",
+            "format": "datetime",
+            "description": "When the challenge was accepted"
+          },
+          "challenge": {
+            "type": "object",
+            "properties": {
+              "uri": {
+                "type": "string",
+                "description": "AT Protocol URI of the original challenge"
+              },
+              "cid": {
+                "type": "string",
+                "description": "Content identifier of the challenge record"
+              }
+            },
+            "description": "Reference to the original challenge being accepted"
+          },
+          "accepter": {
+            "type": "string",
+            "format": "did",
+            "description": "DID of the player accepting the challenge"
+          },
+          "game": {
+            "type": "object",
+            "properties": {
+              "uri": {
+                "type": "string",
+                "description": "AT Protocol URI of the game record created by accepter"
+              },
+              "cid": {
+                "type": "string",
+                "description": "Content identifier of the game record"
+              }
+            },
+            "description": "Reference to the game record created in accepter's repository"
+          },
+          "message": {
+            "type": "string",
+            "maxLength": 300,
+            "description": "Optional message with the acceptance"
+          }
+        }
+      }
+    }
+  }
+}

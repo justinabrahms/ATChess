@@ -38,6 +38,20 @@
             "type": "string",
             "description": "Game moves in PGN notation"
           },
+          "challenge": {
+            "type": "object",
+            "properties": {
+              "uri": {
+                "type": "string",
+                "description": "AT Protocol URI of the originating challenge"
+              },
+              "cid": {
+                "type": "string", 
+                "description": "Content identifier of the challenge record"
+              }
+            },
+            "description": "Reference to the challenge that created this game"
+          },
           "timeControl": {
             "type": "object",
             "properties": {
