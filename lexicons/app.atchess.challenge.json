@@ -43,6 +43,12 @@
           "timeControl": {
             "type": "object",
             "properties": {
+              "type": {
+                "type": "string",
+                "enum": ["correspondence", "rapid", "blitz", "bullet"],
+                "default": "correspondence",
+                "description": "Type of time control"
+              },
               "initial": {
                 "type": "integer",
                 "default": 600,
@@ -52,6 +58,13 @@
                 "type": "integer",
                 "default": 0,
                 "description": "Increment per move in seconds"
+              },
+              "daysPerMove": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 7,
+                "default": 3,
+                "description": "Days allowed per move for correspondence games"
               }
             }
           },

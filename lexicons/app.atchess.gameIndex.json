@@ -1,0 +1,103 @@
+{
+  "lexicon": 1,
+  "id": "app.atchess.gameIndex",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "Index entry for a public chess game",
+      "key": "tid",
+      "record": {
+        "type": "object",
+        "required": ["createdAt", "game", "players", "status", "visibility"],
+        "properties": {
+          "createdAt": {
+            "type": "string",
+            "format": "datetime",
+            "description": "When the index entry was created"
+          },
+          "game": {
+            "type": "ref",
+            "ref": "com.atproto.repo.strongRef",
+            "description": "Reference to the game record"
+          },
+          "players": {
+            "type": "object",
+            "required": ["white", "black"],
+            "properties": {
+              "white": {
+                "type": "object",
+                "required": ["did", "handle"],
+                "properties": {
+                  "did": {
+                    "type": "string",
+                    "format": "did",
+                    "description": "DID of white player"
+                  },
+                  "handle": {
+                    "type": "string",
+                    "description": "Handle of white player"
+                  }
+                }
+              },
+              "black": {
+                "type": "object",
+                "required": ["did", "handle"],
+                "properties": {
+                  "did": {
+                    "type": "string",
+                    "format": "did",
+                    "description": "DID of black player"
+                  },
+                  "handle": {
+                    "type": "string",
+                    "description": "Handle of black player"
+                  }
+                }
+              }
+            }
+          },
+          "status": {
+            "type": "string",
+            "enum": ["active", "draw", "white_won", "black_won", "abandoned"],
+            "description": "Current game status"
+          },
+          "visibility": {
+            "type": "string",
+            "enum": ["public", "unlisted"],
+            "default": "public",
+            "description": "Game visibility for spectators"
+          },
+          "moveCount": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "Number of moves played"
+          },
+          "lastMoveAt": {
+            "type": "string",
+            "format": "datetime",
+            "description": "When the last move was made"
+          },
+          "timeControl": {
+            "type": "object",
+            "properties": {
+              "daysPerMove": {
+                "type": "integer",
+                "description": "Days allowed per move for correspondence"
+              },
+              "type": {
+                "type": "string",
+                "description": "Time control type"
+              }
+            }
+          },
+          "spectatorCount": {
+            "type": "integer",
+            "minimum": 0,
+            "default": 0,
+            "description": "Current number of spectators"
+          }
+        }
+      }
+    }
+  }
+}

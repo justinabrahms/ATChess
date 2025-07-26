@@ -13,6 +13,7 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/justinabrahms/atchess/internal/atproto"
 	"github.com/justinabrahms/atchess/internal/config"
+	"github.com/justinabrahms/atchess/internal/firehose"
 	"github.com/justinabrahms/atchess/internal/web"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
@@ -40,17 +41,43 @@ func main() {
 	}
 	
 	// Create AT Protocol client
-	client, err := atproto.NewClient(
+	client, err := atproto.NewClientWithDPoP(
 		cfg.ATProto.PDSURL,
 		cfg.ATProto.Handle,
 		cfg.ATProto.Password,
+		cfg.ATProto.UseDPoP,
 	)
 	if err != nil {
 		log.Fatal().Err(err).Msg("Failed to create AT Protocol client")
 	}
 	
+	// Create WebSocket hub
+	hub := web.NewHub()
+	go hub.Run()
+	
 	// Create service
 	service := web.NewService(client, cfg)
+	
+	// Create firehose processor
+	processor := firehose.NewEventProcessor(hub)
+	
+	// Start firehose client (optional - can be disabled in config)
+	if cfg.Firehose.Enabled {
+		firehoseClient := firehose.NewClient(
+			cfg.Firehose.URL,
+			firehose.CreateChessEventHandler(processor),
+		)
+		
+		go func() {
+			log.Info().Str("url", cfg.Firehose.URL).Msg("Starting firehose client")
+			if err := firehoseClient.Start(context.Background()); err != nil {
+				log.Error().Err(err).Msg("Firehose client error")
+			}
+		}()
+		
+		// Track the current user's games
+		processor.TrackPlayer(client.GetDID())
+	}
 	
 	// Setup routes
 	router := mux.NewRouter()
@@ -78,6 +105,26 @@ func main() {
 	api.HandleFunc("/games/{id:.*}", service.GetGameHandler).Methods("GET")
 	api.HandleFunc("/moves", service.MakeMoveHandler).Methods("POST")
 	api.HandleFunc("/challenges", service.CreateChallengeHandler).Methods("POST")
+	api.HandleFunc("/challenge-notifications", service.GetChallengeNotificationsHandler).Methods("GET")
+	api.HandleFunc("/challenge-notifications/{key}", service.DeleteChallengeNotificationHandler).Methods("DELETE")
+	api.HandleFunc("/draw-offers", service.OfferDrawHandler).Methods("POST")
+	api.HandleFunc("/draw-offers/respond", service.RespondToDrawHandler).Methods("POST")
+	api.HandleFunc("/resign", service.ResignGameHandler).Methods("POST")
+	
+	// Spectator endpoints
+	api.HandleFunc("/spectator/games", service.GetActiveGamesHandler).Methods("GET")
+	api.HandleFunc("/spectator/games/{id:.*}", service.GetSpectatorGameHandler).Methods("GET")
+	api.HandleFunc("/spectator/games/{id:.*}/count", service.UpdateSpectatorCountHandler(hub)).Methods("POST")
+	api.HandleFunc("/spectator/games/{id:.*}/abandonment", service.CheckAbandonmentHandler).Methods("GET")
+	api.HandleFunc("/spectator/games/{id:.*}/claim-abandonment", service.ClaimAbandonedGameHandler).Methods("POST")
+	
+	// Time control endpoints
+	api.HandleFunc("/games/{id:.*}/time-violation", service.CheckTimeViolationHandler).Methods("GET")
+	api.HandleFunc("/games/{id:.*}/claim-time", service.ClaimTimeVictoryHandler).Methods("POST")
+	api.HandleFunc("/games/{id:.*}/time-remaining", service.GetTimeRemainingHandler).Methods("GET")
+	
+	// WebSocket endpoint for real-time updates
+	api.HandleFunc("/ws", service.WebSocketHandler(hub))
 	
 	// Explicit OPTIONS handlers for CORS preflight requests
 	api.HandleFunc("/games", func(w http.ResponseWriter, r *http.Request) {
@@ -90,6 +137,45 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 	}).Methods("OPTIONS")
 	api.HandleFunc("/challenges", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}).Methods("OPTIONS")
+	api.HandleFunc("/challenge-notifications", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}).Methods("OPTIONS")
+	api.HandleFunc("/challenge-notifications/{key}", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}).Methods("OPTIONS")
+	api.HandleFunc("/draw-offers", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}).Methods("OPTIONS")
+	api.HandleFunc("/draw-offers/respond", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}).Methods("OPTIONS")
+	api.HandleFunc("/resign", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}).Methods("OPTIONS")
+	api.HandleFunc("/spectator/games", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}).Methods("OPTIONS")
+	api.HandleFunc("/spectator/games/{id:.*}", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}).Methods("OPTIONS")
+	api.HandleFunc("/spectator/games/{id:.*}/count", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}).Methods("OPTIONS")
+	api.HandleFunc("/spectator/games/{id:.*}/abandonment", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}).Methods("OPTIONS")
+	api.HandleFunc("/spectator/games/{id:.*}/claim-abandonment", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}).Methods("OPTIONS")
+	api.HandleFunc("/games/{id:.*}/time-violation", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}).Methods("OPTIONS")
+	api.HandleFunc("/games/{id:.*}/claim-time", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}).Methods("OPTIONS")
+	api.HandleFunc("/games/{id:.*}/time-remaining", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}).Methods("OPTIONS")
 	

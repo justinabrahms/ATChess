@@ -185,3 +185,169 @@ func (s *Service) CreateChallengeHandler(w http.ResponseWriter, r *http.Request)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(challenge)
 }
+
+func (s *Service) GetChallengeNotificationsHandler(w http.ResponseWriter, r *http.Request) {
+	notifications, err := s.client.GetChallengeNotifications(context.Background())
+	if err != nil {
+		log.Error().Err(err).Msg("Failed to fetch challenge notifications")
+		http.Error(w, "Failed to fetch notifications", http.StatusInternalServerError)
+		return
+	}
+	
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(notifications)
+}
+
+func (s *Service) DeleteChallengeNotificationHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	notificationKey := vars["key"]
+	
+	if notificationKey == "" {
+		http.Error(w, "Missing notification key", http.StatusBadRequest)
+		return
+	}
+	
+	err := s.client.DeleteChallengeNotification(context.Background(), notificationKey)
+	if err != nil {
+		log.Error().Err(err).Str("key", notificationKey).Msg("Failed to delete notification")
+		http.Error(w, "Failed to delete notification", http.StatusInternalServerError)
+		return
+	}
+	
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Service) OfferDrawHandler(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		GameID  string `json:"gameId"`
+		Message string `json:"message"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+	
+	drawOffer, err := s.client.OfferDraw(context.Background(), req.GameID, req.Message)
+	if err != nil {
+		log.Error().Err(err).Str("gameID", req.GameID).Msg("Failed to offer draw")
+		http.Error(w, "Failed to offer draw", http.StatusInternalServerError)
+		return
+	}
+	
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(drawOffer)
+}
+
+func (s *Service) RespondToDrawHandler(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		DrawOfferURI string `json:"drawOfferUri"`
+		Accept       bool   `json:"accept"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+	
+	err := s.client.RespondToDrawOffer(context.Background(), req.DrawOfferURI, req.Accept)
+	if err != nil {
+		log.Error().Err(err).Str("uri", req.DrawOfferURI).Msg("Failed to respond to draw offer")
+		http.Error(w, "Failed to respond to draw offer", http.StatusInternalServerError)
+		return
+	}
+	
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Service) ResignGameHandler(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		GameID string `json:"gameId"`
+		Reason string `json:"reason"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+	
+	err := s.client.ResignGame(context.Background(), req.GameID, req.Reason)
+	if err != nil {
+		log.Error().Err(err).Str("gameID", req.GameID).Msg("Failed to resign game")
+		http.Error(w, "Failed to resign game", http.StatusInternalServerError)
+		return
+	}
+	
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"gameId":  req.GameID,
+	})
+}
+
+func (s *Service) CheckTimeViolationHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	gameID := vars["id"]
+	
+	if gameID == "" {
+		http.Error(w, "Missing game ID", http.StatusBadRequest)
+		return
+	}
+	
+	hasViolation, violation, err := s.client.CheckTimeViolation(context.Background(), gameID)
+	if err != nil {
+		log.Error().Err(err).Str("gameID", gameID).Msg("Failed to check time violation")
+		http.Error(w, "Failed to check time violation", http.StatusInternalServerError)
+		return
+	}
+	
+	response := map[string]interface{}{
+		"hasViolation": hasViolation,
+		"violation":    violation,
+	}
+	
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(response)
+}
+
+func (s *Service) ClaimTimeVictoryHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	gameID := vars["id"]
+	
+	if gameID == "" {
+		http.Error(w, "Missing game ID", http.StatusBadRequest)
+		return
+	}
+	
+	err := s.client.ClaimTimeVictory(context.Background(), gameID)
+	if err != nil {
+		log.Error().Err(err).Str("gameID", gameID).Msg("Failed to claim time victory")
+		http.Error(w, "Failed to claim time victory", http.StatusBadRequest)
+		return
+	}
+	
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *Service) GetTimeRemainingHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	gameID := vars["id"]
+	
+	if gameID == "" {
+		http.Error(w, "Missing game ID", http.StatusBadRequest)
+		return
+	}
+	
+	remaining, err := s.client.GetTimeRemaining(context.Background(), gameID)
+	if err != nil {
+		log.Error().Err(err).Str("gameID", gameID).Msg("Failed to get time remaining")
+		http.Error(w, "Failed to get time remaining", http.StatusInternalServerError)
+		return
+	}
+	
+	response := map[string]interface{}{
+		"gameId": gameID,
+		"remainingSeconds": int(remaining.Seconds()),
+		"remainingFormatted": chess.FormatTimeRemaining(remaining),
+	}
+	
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(response)
+}

@@ -1,0 +1,70 @@
+{
+  "lexicon": 1,
+  "id": "app.atchess.challengeNotification",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "Notification of incoming chess challenge",
+      "key": "tid",
+      "record": {
+        "type": "object",
+        "required": ["createdAt", "challenge", "challenger"],
+        "properties": {
+          "createdAt": {
+            "type": "string",
+            "format": "datetime",
+            "description": "When the notification was created"
+          },
+          "challenge": {
+            "type": "ref",
+            "ref": "com.atproto.repo.strongRef",
+            "description": "Reference to original challenge in challenger's repo"
+          },
+          "challenger": {
+            "type": "string",
+            "format": "did",
+            "description": "DID of the challenging player"
+          },
+          "challengerHandle": {
+            "type": "string",
+            "description": "Handle of the challenging player for display"
+          },
+          "timeControl": {
+            "type": "object",
+            "properties": {
+              "daysPerMove": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 7,
+                "default": 3,
+                "description": "Days allowed per move"
+              },
+              "type": {
+                "type": "string",
+                "enum": ["correspondence"],
+                "default": "correspondence",
+                "description": "Time control type"
+              }
+            },
+            "description": "Time control settings for the game"
+          },
+          "color": {
+            "type": "string",
+            "enum": ["white", "black", "random"],
+            "description": "Color preference from challenger"
+          },
+          "message": {
+            "type": "string",
+            "maxLength": 300,
+            "description": "Optional message from challenger"
+          },
+          "expiresAt": {
+            "type": "string",
+            "format": "datetime",
+            "description": "When this challenge expires"
+          }
+        }
+      }
+    }
+  }
+}

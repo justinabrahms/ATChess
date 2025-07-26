@@ -1,0 +1,19 @@
+# Example configuration with DPoP authentication enabled
+
+server:
+  host: localhost
+  port: 8080
+
+atproto:
+  pds_url: http://localhost:3000
+  handle: your-handle.bsky.social
+  password: your-password
+  use_dpop: true  # Enable DPoP authentication
+
+development:
+  debug: false
+  log_level: info
+
+firehose:
+  enabled: false
+  url: wss://bsky.social/xrpc/com.atproto.sync.subscribeRepos

@@ -1,0 +1,55 @@
+{
+  "lexicon": 1,
+  "id": "app.atchess.timeViolation",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "A time violation claim in a chess game",
+      "key": "tid",
+      "record": {
+        "type": "object",
+        "required": ["createdAt", "game", "claimingPlayer", "violatingPlayer"],
+        "properties": {
+          "createdAt": {
+            "type": "string",
+            "format": "datetime",
+            "description": "When the time violation was claimed"
+          },
+          "game": {
+            "type": "ref",
+            "ref": "com.atproto.repo.strongRef",
+            "description": "Reference to the game record"
+          },
+          "claimingPlayer": {
+            "type": "string",
+            "format": "did",
+            "description": "DID of the player claiming the time violation"
+          },
+          "violatingPlayer": {
+            "type": "string",
+            "format": "did",
+            "description": "DID of the player who violated time control"
+          },
+          "lastMoveTimestamp": {
+            "type": "string",
+            "format": "datetime",
+            "description": "Timestamp of the last move made"
+          },
+          "timeControlType": {
+            "type": "string",
+            "enum": ["correspondence", "rapid", "blitz", "bullet"],
+            "description": "Type of time control in effect"
+          },
+          "daysPerMove": {
+            "type": "integer",
+            "description": "Days per move for correspondence games"
+          },
+          "timeRemaining": {
+            "type": "integer",
+            "description": "Time remaining in seconds for timed games"
+          }
+        }
+      }
+    }
+  }
+}

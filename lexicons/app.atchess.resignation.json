@@ -1,0 +1,41 @@
+{
+  "lexicon": 1,
+  "id": "app.atchess.resignation",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "A resignation from a chess game",
+      "key": "tid",
+      "record": {
+        "type": "object",
+        "required": ["createdAt", "game", "resigningPlayer"],
+        "properties": {
+          "createdAt": {
+            "type": "string",
+            "format": "datetime",
+            "description": "When the player resigned"
+          },
+          "game": {
+            "type": "ref",
+            "ref": "com.atproto.repo.strongRef",
+            "description": "Reference to the game record"
+          },
+          "resigningPlayer": {
+            "type": "string",
+            "format": "did",
+            "description": "DID of the player who resigned"
+          },
+          "moveNumber": {
+            "type": "integer",
+            "description": "Move number when resignation occurred"
+          },
+          "reason": {
+            "type": "string",
+            "maxLength": 300,
+            "description": "Optional reason for resignation"
+          }
+        }
+      }
+    }
+  }
+}

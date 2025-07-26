@@ -1,0 +1,1001 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ATChess - Spectator View</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background-color: #f0f0f0;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #333;
+            text-align: center;
+        }
+        
+        /* Game browser styles */
+        .game-browser {
+            display: grid;
+            gap: 15px;
+            margin-top: 20px;
+        }
+        
+        .game-card {
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            padding: 15px;
+            background: #fafafa;
+            transition: all 0.2s ease;
+            cursor: pointer;
+        }
+        
+        .game-card:hover {
+            background: #f0f0f0;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+            transform: translateY(-2px);
+        }
+        
+        .game-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+        
+        .players {
+            font-size: 18px;
+            font-weight: bold;
+        }
+        
+        .white-player {
+            color: #333;
+        }
+        
+        .black-player {
+            color: #666;
+        }
+        
+        .game-status {
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 12px;
+            font-weight: bold;
+            text-transform: uppercase;
+        }
+        
+        .status-active {
+            background: #d4edda;
+            color: #155724;
+        }
+        
+        .status-completed {
+            background: #e2e3e5;
+            color: #383d41;
+        }
+        
+        .game-info {
+            display: flex;
+            gap: 20px;
+            align-items: center;
+            margin-bottom: 10px;
+            font-size: 14px;
+            color: #666;
+        }
+        
+        .material-balance {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .material-bar {
+            width: 100px;
+            height: 8px;
+            background: #e0e0e0;
+            border-radius: 4px;
+            position: relative;
+            overflow: hidden;
+        }
+        
+        .material-fill {
+            height: 100%;
+            background: #333;
+            transition: width 0.3s ease;
+        }
+        
+        .watch-button {
+            padding: 8px 16px;
+            background: #4CAF50;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: bold;
+            transition: background 0.2s ease;
+        }
+        
+        .watch-button:hover {
+            background: #45a049;
+        }
+        
+        /* Spectator view styles */
+        .spectator-view {
+            display: none;
+        }
+        
+        .spectator-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+        }
+        
+        .back-button {
+            padding: 8px 16px;
+            background: #2196F3;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            transition: background 0.2s ease;
+        }
+        
+        .back-button:hover {
+            background: #0b7dda;
+        }
+        
+        .spectator-count {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 8px 16px;
+            background: #f0f0f0;
+            border-radius: 20px;
+            font-size: 14px;
+        }
+        
+        .spectator-count-dot {
+            width: 8px;
+            height: 8px;
+            background: #4CAF50;
+            border-radius: 50%;
+            animation: pulse 2s infinite;
+        }
+        
+        @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.5; }
+            100% { opacity: 1; }
+        }
+        
+        .game-layout {
+            display: grid;
+            grid-template-columns: 1fr 350px;
+            gap: 20px;
+            align-items: start;
+        }
+        
+        .board-section {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        
+        .board-container {
+            display: flex;
+            justify-content: center;
+            margin: 20px 0;
+        }
+        
+        .chessboard {
+            display: grid;
+            grid-template-columns: repeat(8, 60px);
+            grid-template-rows: repeat(8, 60px);
+            border: 2px solid #333;
+            background: #fff;
+        }
+        
+        .square {
+            width: 60px;
+            height: 60px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 36px;
+            position: relative;
+        }
+        
+        .square.light {
+            background-color: #f0d9b5;
+        }
+        
+        .square.dark {
+            background-color: #b58863;
+        }
+        
+        .square.last-move {
+            background-color: #7fc97f !important;
+        }
+        
+        .turn-indicator {
+            text-align: center;
+            font-size: 18px;
+            font-weight: bold;
+            margin: 15px 0;
+            padding: 10px;
+            background: #f0f0f0;
+            border-radius: 4px;
+        }
+        
+        .sidebar {
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        
+        .material-display {
+            margin-bottom: 20px;
+            padding: 15px;
+            background: #f9f9f9;
+            border-radius: 4px;
+        }
+        
+        .material-row {
+            display: flex;
+            justify-content: space-between;
+            margin: 5px 0;
+            font-size: 14px;
+        }
+        
+        .material-advantage {
+            font-weight: bold;
+            font-size: 16px;
+            text-align: center;
+            margin-top: 10px;
+            padding: 8px;
+            background: white;
+            border-radius: 4px;
+        }
+        
+        .advantage-white {
+            color: #333;
+        }
+        
+        .advantage-black {
+            color: #666;
+        }
+        
+        .advantage-equal {
+            color: #999;
+        }
+        
+        .move-history {
+            max-height: 400px;
+            overflow-y: auto;
+            border: 1px solid #e0e0e0;
+            border-radius: 4px;
+            padding: 10px;
+        }
+        
+        .move-history h3 {
+            margin: 0 0 10px 0;
+            font-size: 16px;
+        }
+        
+        .move-pair {
+            display: grid;
+            grid-template-columns: 30px 1fr 1fr;
+            gap: 10px;
+            padding: 5px;
+            border-bottom: 1px solid #f0f0f0;
+        }
+        
+        .move-pair:last-child {
+            border-bottom: none;
+        }
+        
+        .move-number {
+            font-weight: bold;
+            color: #666;
+        }
+        
+        .move {
+            padding: 4px 8px;
+            border-radius: 4px;
+            cursor: pointer;
+            transition: background 0.2s ease;
+        }
+        
+        .move:hover {
+            background: #e0e0e0;
+        }
+        
+        .move.current {
+            background: #4CAF50;
+            color: white;
+        }
+        
+        /* Connection status indicator */
+        .connection-status {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            padding: 8px 16px;
+            border-radius: 20px;
+            font-size: 14px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            background: white;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            transition: all 0.3s ease;
+        }
+        
+        .connection-status.connected {
+            background: #d4edda;
+            color: #155724;
+        }
+        
+        .connection-status.disconnected {
+            background: #f8d7da;
+            color: #721c24;
+        }
+        
+        .connection-status.connecting {
+            background: #fff3cd;
+            color: #856404;
+        }
+        
+        .connection-status .status-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: currentColor;
+            animation: pulse 2s infinite;
+        }
+        
+        /* No games message */
+        .no-games {
+            text-align: center;
+            padding: 40px;
+            color: #999;
+            font-style: italic;
+        }
+        
+        /* Loading spinner */
+        .loading {
+            text-align: center;
+            padding: 40px;
+        }
+        
+        .spinner {
+            border: 3px solid #f3f3f3;
+            border-top: 3px solid #4CAF50;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto;
+        }
+        
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        
+        /* Responsive adjustments */
+        @media (max-width: 768px) {
+            .game-layout {
+                grid-template-columns: 1fr;
+            }
+            
+            .chessboard {
+                grid-template-columns: repeat(8, 45px);
+                grid-template-rows: repeat(8, 45px);
+            }
+            
+            .square {
+                width: 45px;
+                height: 45px;
+                font-size: 28px;
+            }
+            
+            .connection-status {
+                bottom: 10px;
+                right: 10px;
+                font-size: 12px;
+                padding: 6px 12px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>ATChess Spectator View</h1>
+        
+        <!-- Game Browser -->
+        <div class="game-browser" id="gameBrowser">
+            <div class="loading">
+                <div class="spinner"></div>
+                <p>Loading active games...</p>
+            </div>
+        </div>
+        
+        <!-- Spectator View -->
+        <div class="spectator-view" id="spectatorView">
+            <div class="spectator-header">
+                <button class="back-button" onclick="spectator.showGameBrowser()">← Back to Games</button>
+                <div class="spectator-count">
+                    <span class="spectator-count-dot"></span>
+                    <span id="spectatorCount">1 spectator</span>
+                </div>
+            </div>
+            
+            <div class="game-layout">
+                <div class="board-section">
+                    <div class="turn-indicator" id="turnIndicator">
+                        White to move
+                    </div>
+                    <div class="board-container">
+                        <div class="chessboard" id="chessboard"></div>
+                    </div>
+                </div>
+                
+                <div class="sidebar">
+                    <div class="material-display">
+                        <h3>Material Count</h3>
+                        <div class="material-row">
+                            <span>White:</span>
+                            <span id="whiteMaterial">39</span>
+                        </div>
+                        <div class="material-row">
+                            <span>Black:</span>
+                            <span id="blackMaterial">39</span>
+                        </div>
+                        <div class="material-advantage" id="materialAdvantage">
+                            Material Equal
+                        </div>
+                    </div>
+                    
+                    <div class="move-history">
+                        <h3>Move History</h3>
+                        <div id="moveList"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Connection Status Indicator -->
+    <div class="connection-status disconnected" id="connectionStatus" style="display: none;">
+        <span class="status-dot"></span>
+        <span class="status-text">Disconnected</span>
+    </div>
+    
+    <script>
+        class SpectatorUI {
+            constructor() {
+                this.currentGameId = null;
+                this.ws = null;
+                this.wsReconnectInterval = null;
+                this.wsReconnectDelay = 1000;
+                this.wsMaxReconnectDelay = 30000;
+                this.currentFEN = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
+                this.moves = [];
+                this.lastMoveSquares = null;
+                
+                // Mock data for demo - in production this would come from the API
+                this.mockGames = [
+                    {
+                        id: 'at://did:plc:example1/app.atchess.game/abc123',
+                        players: {
+                            white: { handle: 'alice.bsky.social', did: 'did:plc:alice' },
+                            black: { handle: 'bob.bsky.social', did: 'did:plc:bob' }
+                        },
+                        status: 'active',
+                        moveCount: 15,
+                        materialBalance: 0,
+                        fen: 'rnbqk2r/pppp1ppp/5n2/2b1p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4'
+                    },
+                    {
+                        id: 'at://did:plc:example2/app.atchess.game/def456',
+                        players: {
+                            white: { handle: 'charlie.bsky.social', did: 'did:plc:charlie' },
+                            black: { handle: 'diana.bsky.social', did: 'did:plc:diana' }
+                        },
+                        status: 'active',
+                        moveCount: 32,
+                        materialBalance: 3,
+                        fen: 'r1bqk2r/pp2bppp/2n1pn2/3p4/2PP4/2N2N2/PP2BPPP/R1BQK2R b KQkq - 0 8'
+                    }
+                ];
+                
+                this.initializeBoard();
+                this.loadGames();
+            }
+            
+            initializeBoard() {
+                const board = document.getElementById('chessboard');
+                board.innerHTML = '';
+                
+                // Create squares (a8 to h1)
+                for (let rank = 8; rank >= 1; rank--) {
+                    for (let file = 0; file < 8; file++) {
+                        const square = document.createElement('div');
+                        const fileName = String.fromCharCode(97 + file); // a-h
+                        const squareName = fileName + rank;
+                        
+                        square.className = 'square ' + ((rank + file) % 2 === 0 ? 'dark' : 'light');
+                        square.dataset.square = squareName;
+                        
+                        board.appendChild(square);
+                    }
+                }
+            }
+            
+            async loadGames() {
+                try {
+                    // Try to fetch from API first
+                    const response = await fetch('http://localhost:8080/api/spectator/games');
+                    let games = [];
+                    
+                    if (response.ok) {
+                        const data = await response.json();
+                        games = data.games || [];
+                    }
+                    
+                    // If no games from API, use mock data for demo
+                    if (games.length === 0) {
+                        games = this.mockGames;
+                    }
+                    
+                    this.displayGames(games);
+                    
+                } catch (error) {
+                    console.error('Error loading games:', error);
+                    // Use mock data as fallback
+                    this.displayGames(this.mockGames);
+                }
+            }
+            
+            displayGames(games) {
+                const browser = document.getElementById('gameBrowser');
+                
+                if (games.length === 0) {
+                    browser.innerHTML = '<div class="no-games">No active games to spectate</div>';
+                    return;
+                }
+                
+                browser.innerHTML = games.map(game => {
+                    const materialBalance = game.materialBalance || 0;
+                    const balancePercent = Math.min(Math.max((materialBalance + 10) / 20 * 100, 0), 100);
+                    
+                    return `
+                        <div class="game-card" onclick="spectator.watchGame('${this.encodeGameId(game.id)}')">
+                            <div class="game-header">
+                                <div class="players">
+                                    <span class="white-player">♔ ${game.players.white.handle}</span>
+                                    vs
+                                    <span class="black-player">♚ ${game.players.black.handle}</span>
+                                </div>
+                                <span class="game-status status-${game.status}">${game.status}</span>
+                            </div>
+                            <div class="game-info">
+                                <span>Move ${game.moveCount}</span>
+                                <div class="material-balance">
+                                    <span>Material:</span>
+                                    <div class="material-bar">
+                                        <div class="material-fill" style="width: ${balancePercent}%"></div>
+                                    </div>
+                                    <span>${materialBalance > 0 ? '+' : ''}${materialBalance}</span>
+                                </div>
+                            </div>
+                            <button class="watch-button">Watch Game</button>
+                        </div>
+                    `;
+                }).join('');
+            }
+            
+            encodeGameId(gameId) {
+                // Convert AT Protocol URI to URL-safe slug
+                return btoa(gameId).replace(/[+/]/g, c => ({'+': '-', '/': '_'})[c]);
+            }
+            
+            decodeGameId(gameSlug) {
+                // Convert URL-safe slug back to AT Protocol URI
+                const base64 = gameSlug.replace(/[-_]/g, c => ({'-': '+', '_': '/'})[c]);
+                const padded = base64 + '='.repeat((4 - base64.length % 4) % 4);
+                return atob(padded);
+            }
+            
+            async watchGame(encodedGameId) {
+                const gameId = this.decodeGameId(encodedGameId);
+                this.currentGameId = gameId;
+                
+                // Show spectator view
+                document.getElementById('gameBrowser').style.display = 'none';
+                document.getElementById('spectatorView').style.display = 'block';
+                
+                // Load game data
+                await this.loadGameData(encodedGameId);
+                
+                // Connect WebSocket for real-time updates
+                this.connectWebSocket();
+                
+                // Update spectator count
+                this.updateSpectatorCount('join');
+            }
+            
+            async loadGameData(encodedGameId) {
+                try {
+                    const response = await fetch(`http://localhost:8080/api/spectator/games/${encodedGameId}`);
+                    if (response.ok) {
+                        const data = await response.json();
+                        this.updateGameState(data);
+                    } else {
+                        // Use mock data for demo
+                        const mockGame = this.mockGames.find(g => this.encodeGameId(g.id) === encodedGameId);
+                        if (mockGame) {
+                            this.currentFEN = mockGame.fen;
+                            this.updateBoardFromFEN();
+                            this.updateTurnIndicator();
+                            this.updateMaterialCount();
+                        }
+                    }
+                } catch (error) {
+                    console.error('Error loading game data:', error);
+                    // Use mock data as fallback
+                    const mockGame = this.mockGames.find(g => this.encodeGameId(g.id) === encodedGameId);
+                    if (mockGame) {
+                        this.currentFEN = mockGame.fen;
+                        this.updateBoardFromFEN();
+                        this.updateTurnIndicator();
+                        this.updateMaterialCount();
+                    }
+                }
+            }
+            
+            updateGameState(data) {
+                const game = data.game;
+                this.currentFEN = game.fen || game.FEN;
+                this.moves = data.moves || [];
+                
+                this.updateBoardFromFEN();
+                this.updateTurnIndicator();
+                this.updateMaterialCount(data.materialCount);
+                this.updateMoveHistory();
+                
+                if (data.lastMove) {
+                    this.highlightLastMove(data.lastMove);
+                }
+            }
+            
+            updateBoardFromFEN() {
+                const pieces = this.parseFEN(this.currentFEN);
+                const squares = document.querySelectorAll('.square');
+                
+                squares.forEach(square => {
+                    const squareName = square.dataset.square;
+                    const piece = pieces[squareName];
+                    square.textContent = piece ? this.getPieceSymbol(piece) : '';
+                    
+                    // Clear last move highlight
+                    square.classList.remove('last-move');
+                });
+            }
+            
+            parseFEN(fen) {
+                if (!fen || typeof fen !== 'string') {
+                    return {};
+                }
+                
+                const pieces = {};
+                const [boardStr] = fen.split(' ');
+                const ranks = boardStr.split('/');
+                
+                for (let rankIndex = 0; rankIndex < 8; rankIndex++) {
+                    const rank = 8 - rankIndex;
+                    let fileIndex = 0;
+                    
+                    for (const char of ranks[rankIndex]) {
+                        if (char >= '1' && char <= '8') {
+                            fileIndex += parseInt(char);
+                        } else {
+                            const file = String.fromCharCode(97 + fileIndex);
+                            pieces[file + rank] = char;
+                            fileIndex++;
+                        }
+                    }
+                }
+                
+                return pieces;
+            }
+            
+            getPieceSymbol(piece) {
+                const symbols = {
+                    'K': '♔', 'Q': '♕', 'R': '♖', 'B': '♗', 'N': '♘', 'P': '♙',
+                    'k': '♚', 'q': '♛', 'r': '♜', 'b': '♝', 'n': '♞', 'p': '♟'
+                };
+                return symbols[piece] || piece;
+            }
+            
+            updateTurnIndicator() {
+                const fenParts = this.currentFEN.split(' ');
+                const turn = fenParts[1] === 'w' ? 'White' : 'Black';
+                document.getElementById('turnIndicator').textContent = `${turn} to move`;
+            }
+            
+            updateMaterialCount(materialCount) {
+                // Calculate material from FEN if not provided
+                if (!materialCount) {
+                    materialCount = this.calculateMaterialFromFEN();
+                }
+                
+                document.getElementById('whiteMaterial').textContent = materialCount.white || 39;
+                document.getElementById('blackMaterial').textContent = materialCount.black || 39;
+                
+                const balance = (materialCount.white || 39) - (materialCount.black || 39);
+                const advantageElement = document.getElementById('materialAdvantage');
+                
+                if (balance > 0) {
+                    advantageElement.textContent = `White +${balance}`;
+                    advantageElement.className = 'material-advantage advantage-white';
+                } else if (balance < 0) {
+                    advantageElement.textContent = `Black +${Math.abs(balance)}`;
+                    advantageElement.className = 'material-advantage advantage-black';
+                } else {
+                    advantageElement.textContent = 'Material Equal';
+                    advantageElement.className = 'material-advantage advantage-equal';
+                }
+            }
+            
+            calculateMaterialFromFEN() {
+                const pieces = this.parseFEN(this.currentFEN);
+                const values = { 'q': 9, 'Q': 9, 'r': 5, 'R': 5, 'b': 3, 'B': 3, 'n': 3, 'N': 3, 'p': 1, 'P': 1 };
+                
+                let white = 0, black = 0;
+                
+                for (const piece of Object.values(pieces)) {
+                    if (piece === piece.toUpperCase()) {
+                        white += values[piece] || 0;
+                    } else {
+                        black += values[piece] || 0;
+                    }
+                }
+                
+                return { white, black };
+            }
+            
+            updateMoveHistory() {
+                const moveList = document.getElementById('moveList');
+                moveList.innerHTML = '';
+                
+                for (let i = 0; i < this.moves.length; i += 2) {
+                    const moveNumber = Math.floor(i / 2) + 1;
+                    const whiteMove = this.moves[i];
+                    const blackMove = this.moves[i + 1];
+                    
+                    const movePair = document.createElement('div');
+                    movePair.className = 'move-pair';
+                    
+                    movePair.innerHTML = `
+                        <span class="move-number">${moveNumber}.</span>
+                        <span class="move ${i === this.moves.length - 1 ? 'current' : ''}">${whiteMove.san || whiteMove.move}</span>
+                        ${blackMove ? `<span class="move ${i + 1 === this.moves.length - 1 ? 'current' : ''}">${blackMove.san || blackMove.move}</span>` : '<span></span>'}
+                    `;
+                    
+                    moveList.appendChild(movePair);
+                }
+                
+                // Scroll to bottom
+                moveList.scrollTop = moveList.scrollHeight;
+            }
+            
+            highlightLastMove(lastMove) {
+                if (this.lastMoveSquares) {
+                    this.lastMoveSquares.forEach(square => {
+                        const element = document.querySelector(`[data-square="${square}"]`);
+                        if (element) {
+                            element.classList.remove('last-move');
+                        }
+                    });
+                }
+                
+                if (lastMove && lastMove.from && lastMove.to) {
+                    const fromElement = document.querySelector(`[data-square="${lastMove.from}"]`);
+                    const toElement = document.querySelector(`[data-square="${lastMove.to}"]`);
+                    
+                    if (fromElement) fromElement.classList.add('last-move');
+                    if (toElement) toElement.classList.add('last-move');
+                    
+                    this.lastMoveSquares = [lastMove.from, lastMove.to];
+                }
+            }
+            
+            showGameBrowser() {
+                // Disconnect WebSocket
+                this.disconnectWebSocket();
+                
+                // Update spectator count
+                if (this.currentGameId) {
+                    this.updateSpectatorCount('leave');
+                }
+                
+                // Show game browser
+                document.getElementById('spectatorView').style.display = 'none';
+                document.getElementById('gameBrowser').style.display = 'block';
+                
+                // Reload games
+                this.loadGames();
+            }
+            
+            connectWebSocket() {
+                if (!this.currentGameId) {
+                    return;
+                }
+                
+                // Clean up existing connection
+                this.disconnectWebSocket();
+                
+                const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+                const wsUrl = `${protocol}//localhost:8080/api/ws?gameId=${encodeURIComponent(this.currentGameId)}&spectator=true`;
+                
+                console.log('Connecting WebSocket to:', wsUrl);
+                this.updateConnectionStatus('connecting');
+                
+                try {
+                    this.ws = new WebSocket(wsUrl);
+                    
+                    this.ws.onopen = () => {
+                        console.log('WebSocket connected');
+                        this.updateConnectionStatus('connected');
+                        this.wsReconnectDelay = 1000; // Reset delay
+                    };
+                    
+                    this.ws.onmessage = (event) => {
+                        try {
+                            const data = JSON.parse(event.data);
+                            this.handleWebSocketMessage(data);
+                        } catch (error) {
+                            console.error('Error parsing WebSocket message:', error);
+                        }
+                    };
+                    
+                    this.ws.onerror = (error) => {
+                        console.error('WebSocket error:', error);
+                        this.updateConnectionStatus('disconnected');
+                    };
+                    
+                    this.ws.onclose = () => {
+                        console.log('WebSocket disconnected');
+                        this.updateConnectionStatus('disconnected');
+                        this.scheduleReconnect();
+                    };
+                    
+                } catch (error) {
+                    console.error('Error creating WebSocket:', error);
+                    this.updateConnectionStatus('disconnected');
+                }
+            }
+            
+            disconnectWebSocket() {
+                if (this.ws) {
+                    this.ws.onclose = null; // Prevent reconnect
+                    this.ws.close();
+                    this.ws = null;
+                }
+                
+                if (this.wsReconnectInterval) {
+                    clearTimeout(this.wsReconnectInterval);
+                    this.wsReconnectInterval = null;
+                }
+            }
+            
+            scheduleReconnect() {
+                if (this.wsReconnectInterval) {
+                    clearTimeout(this.wsReconnectInterval);
+                }
+                
+                this.wsReconnectInterval = setTimeout(() => {
+                    console.log('Attempting WebSocket reconnect...');
+                    this.connectWebSocket();
+                    
+                    // Exponential backoff
+                    this.wsReconnectDelay = Math.min(this.wsReconnectDelay * 2, this.wsMaxReconnectDelay);
+                }, this.wsReconnectDelay);
+            }
+            
+            handleWebSocketMessage(data) {
+                console.log('WebSocket message:', data);
+                
+                switch (data.type) {
+                    case 'move':
+                        if (data.gameId === this.currentGameId) {
+                            // Reload game data to get updated state
+                            this.loadGameData(this.encodeGameId(this.currentGameId));
+                        }
+                        break;
+                        
+                    case 'spectator_count':
+                        this.updateSpectatorCountDisplay(data.data.count);
+                        break;
+                        
+                    case 'game_end':
+                        // Update game status
+                        if (data.gameId === this.currentGameId) {
+                            this.loadGameData(this.encodeGameId(this.currentGameId));
+                        }
+                        break;
+                }
+            }
+            
+            updateConnectionStatus(status) {
+                const statusElement = document.getElementById('connectionStatus');
+                const statusText = statusElement.querySelector('.status-text');
+                
+                statusElement.style.display = 'flex';
+                statusElement.className = `connection-status ${status}`;
+                
+                switch (status) {
+                    case 'connected':
+                        statusText.textContent = 'Connected';
+                        break;
+                    case 'connecting':
+                        statusText.textContent = 'Connecting...';
+                        break;
+                    case 'disconnected':
+                        statusText.textContent = 'Disconnected';
+                        break;
+                }
+            }
+            
+            async updateSpectatorCount(action) {
+                if (!this.currentGameId) return;
+                
+                try {
+                    const response = await fetch(`http://localhost:8080/api/spectator/games/${this.encodeGameId(this.currentGameId)}/spectators`, {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                        },
+                        body: JSON.stringify({ action })
+                    });
+                    
+                    if (response.ok) {
+                        const data = await response.json();
+                        this.updateSpectatorCountDisplay(data.spectatorCount);
+                    }
+                } catch (error) {
+                    console.error('Error updating spectator count:', error);
+                }
+            }
+            
+            updateSpectatorCountDisplay(count) {
+                const element = document.getElementById('spectatorCount');
+                element.textContent = `${count} spectator${count !== 1 ? 's' : ''}`;
+            }
+        }
+        
+        // Initialize spectator UI
+        let spectator;
+        document.addEventListener('DOMContentLoaded', () => {
+            spectator = new SpectatorUI();
+        });
+    </script>
+</body>
+</html>

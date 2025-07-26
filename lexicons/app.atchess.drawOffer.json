@@ -1,0 +1,57 @@
+{
+  "lexicon": 1,
+  "id": "app.atchess.drawOffer",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "A draw offer in a chess game",
+      "key": "tid",
+      "record": {
+        "type": "object",
+        "required": ["createdAt", "game", "offeredBy"],
+        "properties": {
+          "createdAt": {
+            "type": "string",
+            "format": "datetime",
+            "description": "When the draw was offered"
+          },
+          "game": {
+            "type": "ref",
+            "ref": "com.atproto.repo.strongRef",
+            "description": "Reference to the game record"
+          },
+          "offeredBy": {
+            "type": "string",
+            "format": "did",
+            "description": "DID of the player offering the draw"
+          },
+          "moveNumber": {
+            "type": "integer",
+            "description": "Move number when draw was offered"
+          },
+          "message": {
+            "type": "string",
+            "maxLength": 300,
+            "description": "Optional message with the draw offer"
+          },
+          "status": {
+            "type": "string",
+            "enum": ["pending", "accepted", "declined", "withdrawn"],
+            "default": "pending",
+            "description": "Status of the draw offer"
+          },
+          "respondedAt": {
+            "type": "string",
+            "format": "datetime",
+            "description": "When the offer was responded to"
+          },
+          "respondedBy": {
+            "type": "string",
+            "format": "did",
+            "description": "DID of the player who responded"
+          }
+        }
+      }
+    }
+  }
+}

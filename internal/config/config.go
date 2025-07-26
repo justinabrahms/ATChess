@@ -11,6 +11,7 @@ type Config struct {
 	Server      ServerConfig      `mapstructure:"server"`
 	ATProto     ATProtoConfig     `mapstructure:"atproto"`
 	Development DevelopmentConfig `mapstructure:"development"`
+	Firehose    FirehoseConfig    `mapstructure:"firehose"`
 }
 
 type ServerConfig struct {
@@ -19,14 +20,20 @@ type ServerConfig struct {
 }
 
 type ATProtoConfig struct {
-	PDSURL   string `mapstructure:"pds_url"`
-	Handle   string `mapstructure:"handle"`
-	Password string `mapstructure:"password"`
+	PDSURL    string `mapstructure:"pds_url"`
+	Handle    string `mapstructure:"handle"`
+	Password  string `mapstructure:"password"`
+	UseDPoP   bool   `mapstructure:"use_dpop"`
 }
 
 type DevelopmentConfig struct {
 	Debug    bool   `mapstructure:"debug"`
 	LogLevel string `mapstructure:"log_level"`
+}
+
+type FirehoseConfig struct {
+	Enabled bool   `mapstructure:"enabled"`
+	URL     string `mapstructure:"url"`
 }
 
 func Load() (*Config, error) {
@@ -44,8 +51,11 @@ func Load() (*Config, error) {
 	viper.SetDefault("server.host", "localhost")
 	viper.SetDefault("server.port", 8080)
 	viper.SetDefault("atproto.pds_url", "http://localhost:3000")
+	viper.SetDefault("atproto.use_dpop", false)
 	viper.SetDefault("development.debug", false)
 	viper.SetDefault("development.log_level", "info")
+	viper.SetDefault("firehose.enabled", false)
+	viper.SetDefault("firehose.url", "wss://bsky.social/xrpc/com.atproto.sync.subscribeRepos")
 	
 	// Read config
 	if err := viper.ReadInConfig(); err != nil {
@@ -76,6 +86,10 @@ func loadDefaults() *Config {
 		Development: DevelopmentConfig{
 			Debug:    false,
 			LogLevel: "info",
+		},
+		Firehose: FirehoseConfig{
+			Enabled: false,
+			URL:     "wss://bsky.social/xrpc/com.atproto.sync.subscribeRepos",
 		},
 	}
 }

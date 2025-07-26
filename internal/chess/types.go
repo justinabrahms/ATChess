@@ -34,8 +34,10 @@ type Game struct {
 }
 
 type TimeControl struct {
-	Initial   int // seconds
-	Increment int // seconds per move
+	Type        string `json:"type"`        // "correspondence", "rapid", "blitz"
+	DaysPerMove int    `json:"daysPerMove"` // For correspondence games
+	Initial     int    `json:"initial"`     // seconds
+	Increment   int    `json:"increment"`   // seconds per move
 }
 
 type Challenge struct {
@@ -49,4 +51,20 @@ type Challenge struct {
 	Message         string
 	CreatedAt       string
 	ExpiresAt       string
+}
+
+// MaterialCount represents the material count for both sides
+type MaterialCount struct {
+	White int `json:"white"`
+	Black int `json:"black"`
+}
+
+// PieceValues maps piece types to their standard values
+var StandardPieceValues = map[string]int{
+	"pawn":   1,
+	"knight": 3,
+	"bishop": 3,
+	"rook":   5,
+	"queen":  9,
+	"king":   0, // King has no material value
 }
