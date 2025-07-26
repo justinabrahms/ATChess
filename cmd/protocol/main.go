@@ -98,6 +98,9 @@ func main() {
 		})
 	})
 	
+	// Root level health endpoint for load balancers and monitoring
+	router.HandleFunc("/health", service.HealthHandler).Methods("GET")
+	
 	// API routes
 	api := router.PathPrefix("/api").Subrouter()
 	api.HandleFunc("/health", service.HealthHandler).Methods("GET")

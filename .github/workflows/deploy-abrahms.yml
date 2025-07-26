@@ -1,0 +1,111 @@
+name: Deploy to abrah.ms
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  GO_VERSION: '1.21'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: ${{ env.GO_VERSION }}
+    
+    - name: Cache Go modules
+      uses: actions/cache@v3
+      with:
+        path: ~/go/pkg/mod
+        key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+        restore-keys: |
+          ${{ runner.os }}-go-
+    
+    - name: Build binaries
+      run: |
+        # Build protocol service
+        go build -o atchess-protocol ./cmd/protocol
+        
+        # Build web service
+        go build -o atchess-web ./cmd/web
+        
+        # Make binaries executable
+        chmod +x atchess-protocol atchess-web
+    
+    - name: Setup SSH
+      run: |
+        mkdir -p ~/.ssh
+        echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/deploy_key
+        chmod 600 ~/.ssh/deploy_key
+        ssh-keyscan -H -p ${{ secrets.DEPLOY_PORT || 22 }} ${{ secrets.DEPLOY_HOST }} >> ~/.ssh/known_hosts
+    
+    - name: Deploy to server
+      env:
+        DEPLOY_HOST: ${{ secrets.DEPLOY_HOST || 'abrah.ms' }}
+        DEPLOY_USER: ${{ secrets.DEPLOY_USER || 'atchess-deploy' }}
+        DEPLOY_PORT: ${{ secrets.DEPLOY_PORT || 22 }}
+      run: |
+        # Copy binaries
+        scp -i ~/.ssh/deploy_key -P $DEPLOY_PORT \
+          atchess-protocol atchess-web \
+          $DEPLOY_USER@$DEPLOY_HOST:/tmp/
+        
+        # Copy static files
+        tar -czf static.tar.gz -C web static
+        scp -i ~/.ssh/deploy_key -P $DEPLOY_PORT \
+          static.tar.gz \
+          $DEPLOY_USER@$DEPLOY_HOST:/tmp/
+        
+        # Deploy and restart services
+        ssh -i ~/.ssh/deploy_key -p $DEPLOY_PORT $DEPLOY_USER@$DEPLOY_HOST << 'ENDSSH'
+          set -e
+          
+          # Move binaries to app directory
+          cp /tmp/atchess-protocol /tmp/atchess-web /srv/atchess/app/
+          chmod +x /srv/atchess/app/atchess-*
+          
+          # Extract and move static files
+          cd /srv/atchess/app
+          tar -xzf /tmp/static.tar.gz
+          
+          # Clean up temporary files
+          rm -f /tmp/atchess-* /tmp/static.tar.gz
+          
+          # Restart services using sudo (allowed by sudoers)
+          sudo systemctl daemon-reload
+          sudo systemctl restart atchess-protocol
+          sudo systemctl restart atchess-web
+          
+          # Check service status
+          sleep 2
+          sudo systemctl status atchess-protocol --no-pager || true
+          sudo systemctl status atchess-web --no-pager || true
+        ENDSSH
+    
+    - name: Verify deployment
+      env:
+        DEPLOY_HOST: ${{ secrets.DEPLOY_HOST || 'atchess.abrah.ms' }}
+      run: |
+        # Wait for services to start
+        sleep 5
+        
+        # Check health endpoints
+        echo "Checking protocol service health..."
+        curl -f https://$DEPLOY_HOST/api/health || echo "Protocol health check failed"
+        
+        echo "Deployment completed!"
+        echo "ATChess is available at: https://$DEPLOY_HOST"
+    
+    - name: Clean up SSH
+      if: always()
+      run: |
+        rm -f ~/.ssh/deploy_key
