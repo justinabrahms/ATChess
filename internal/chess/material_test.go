@@ -2,9 +2,11 @@ package chess
 
 import (
 	"testing"
+	
+	"github.com/notnil/chess"
 )
 
-func TestGetMaterialCount(t *testing.T) {
+func TestMaterialCount(t *testing.T) {
 	tests := []struct {
 		name            string
 		fen             string
@@ -58,8 +60,8 @@ func TestGetMaterialCount(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			engine := NewEngine()
-			if err := engine.LoadFEN(tt.fen); err != nil {
+			engine, err := NewEngineFromFEN(tt.fen)
+			if err != nil {
 				t.Fatalf("Failed to load FEN: %v", err)
 			}
 
@@ -81,7 +83,7 @@ func TestGetMaterialCount(t *testing.T) {
 	}
 }
 
-func TestGetPieceValues(t *testing.T) {
+func TestPieceValuesStandard(t *testing.T) {
 	engine := NewEngine()
 	values := engine.GetPieceValues()
 
@@ -106,10 +108,7 @@ func TestGetPieceValues(t *testing.T) {
 func TestMaterialCountAfterCaptures(t *testing.T) {
 	engine := NewEngine()
 	
-	// Start from initial position
-	if err := engine.LoadFEN("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1"); err != nil {
-		t.Fatalf("Failed to load starting FEN: %v", err)
-	}
+	// Start from initial position - engine already starts with initial position
 
 	// Verify starting material
 	count := engine.GetMaterialCount()
@@ -128,9 +127,9 @@ func TestMaterialCountAfterCaptures(t *testing.T) {
 	}
 
 	for _, move := range moves {
-		result := engine.MakeMove(move.from, move.to)
-		if !result.Valid {
-			t.Fatalf("Move %s-%s failed: %s", move.from, move.to, result.Error)
+		_, err := engine.MakeMove(move.from, move.to, chess.NoPieceType)
+		if err != nil {
+			t.Fatalf("Move %s-%s failed: %v", move.from, move.to, err)
 		}
 	}
 

@@ -2,7 +2,6 @@ package firehose
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -50,23 +49,23 @@ func (p *EventProcessor) ProcessEvent(ctx context.Context, event Event) error {
 		return nil
 	}
 
-	switch event.Collection {
-	case "app.atchess.move":
+	// Route based on event type
+	switch event.Type {
+	case EventTypeMove:
 		return p.processMoveEvent(ctx, event)
-	case "app.atchess.game":
+	case EventTypeGame:
 		return p.processGameEvent(ctx, event)
-	case "app.atchess.drawOffer":
+	case EventTypeDrawOffer:
 		return p.processDrawOfferEvent(ctx, event)
-	case "app.atchess.resignation":
+	case EventTypeResignation:
 		return p.processResignationEvent(ctx, event)
-	case "app.atchess.challenge":
-		return p.processChallengeEvent(ctx, event)
-	case "app.atchess.challengeNotification":
+	case EventTypeChallengeNotification:
 		return p.processChallengeNotificationEvent(ctx, event)
 	default:
 		log.Debug().
-			Str("collection", event.Collection).
-			Msg("Ignoring unknown chess collection")
+			Str("type", string(event.Type)).
+			Str("path", event.Path).
+			Msg("Ignoring unknown chess event type")
 	}
 
 	return nil
@@ -85,10 +84,12 @@ func (p *EventProcessor) shouldProcessEvent(event Event) bool {
 	}
 
 	// For moves and game updates, check if it's a tracked game
-	if event.Collection == "app.atchess.move" || event.Collection == "app.atchess.game" {
+	if event.Type == EventTypeMove || event.Type == EventTypeGame {
 		// Extract game ID from the record
-		if gameRef, ok := getGameReference(event.Record); ok {
-			return p.trackedGames[gameRef]
+		if record, ok := event.Record.(map[string]interface{}); ok {
+			if gameRef := getGameReference(record); gameRef != "" {
+				return p.trackedGames[gameRef]
+			}
 		}
 	}
 
@@ -103,35 +104,19 @@ func (p *EventProcessor) processMoveEvent(ctx context.Context, event Event) erro
 	}
 
 	// Extract game reference
-	gameRef, ok := getGameReference(move)
-	if !ok {
+	gameRef := getGameReference(move)
+	if gameRef == "" {
 		return fmt.Errorf("move missing game reference")
 	}
 
-	// Extract move details
-	moveData := map[string]interface{}{
-		"from":       move["from"],
-		"to":         move["to"],
-		"san":        move["san"],
-		"fen":        move["fen"],
-		"player":     move["player"],
-		"moveNumber": move["moveNumber"],
-		"check":      move["check"],
-		"checkmate":  move["checkmate"],
-		"createdAt":  move["createdAt"],
+	// Send update to WebSocket clients watching this game
+	update := web.GameUpdate{
+		Type:   "move",
+		GameID: gameRef,
+		Data:   move,
 	}
 
-	// Broadcast to WebSocket clients
-	if p.hub != nil {
-		p.hub.HandleFirehoseEvent(ctx, "move", gameRef, moveData)
-	}
-
-	log.Info().
-		Str("gameID", gameRef).
-		Str("san", getString(move, "san")).
-		Str("player", getString(move, "player")).
-		Msg("Move processed from firehose")
-
+	p.hub.BroadcastToGame(gameRef, update)
 	return nil
 }
 
@@ -142,28 +127,27 @@ func (p *EventProcessor) processGameEvent(ctx context.Context, event Event) erro
 		return fmt.Errorf("invalid game record format")
 	}
 
-	// Extract game ID from URI
-	gameID := extractIDFromURI(event.URI)
-	if gameID != "" {
-		// Track this game for future events
-		p.TrackGame(gameID)
+	// Extract game ID
+	gameID, ok := game["id"].(string)
+	if !ok {
+		return fmt.Errorf("game missing ID")
 	}
 
-	// Broadcast game update
-	if p.hub != nil {
-		p.hub.HandleFirehoseEvent(ctx, "game_update", gameID, game)
+	// Send update to WebSocket clients
+	update := web.GameUpdate{
+		Type:   "game_update",
+		GameID: gameID,
+		Data:   game,
 	}
 
-	status := getString(game, "status")
-	if status != "active" {
-		log.Info().
-			Str("gameID", gameID).
-			Str("status", status).
-			Msg("Game ended")
-		
-		// Stop tracking ended games
-		p.UntrackGame(gameID)
-	}
+	p.hub.BroadcastToGame(gameID, update)
+
+	log.Info().
+		Str("type", string(event.Type)).
+		Str("repo", event.Repo).
+		Str("path", event.Path).
+		Str("gameID", gameID).
+		Msg("Processing game state update")
 
 	return nil
 }
@@ -175,22 +159,18 @@ func (p *EventProcessor) processDrawOfferEvent(ctx context.Context, event Event)
 		return fmt.Errorf("invalid draw offer record format")
 	}
 
-	gameRef, ok := getGameReference(drawOffer)
-	if !ok {
+	gameRef := getGameReference(drawOffer)
+	if gameRef == "" {
 		return fmt.Errorf("draw offer missing game reference")
 	}
 
-	// Broadcast draw offer
-	if p.hub != nil {
-		p.hub.HandleFirehoseEvent(ctx, "draw_offer", gameRef, drawOffer)
+	update := web.GameUpdate{
+		Type:   "draw_offer",
+		GameID: gameRef,
+		Data:   drawOffer,
 	}
 
-	log.Info().
-		Str("gameID", gameRef).
-		Str("offeredBy", getString(drawOffer, "offeredBy")).
-		Str("status", getString(drawOffer, "status")).
-		Msg("Draw offer processed")
-
+	p.hub.BroadcastToGame(gameRef, update)
 	return nil
 }
 
@@ -201,104 +181,112 @@ func (p *EventProcessor) processResignationEvent(ctx context.Context, event Even
 		return fmt.Errorf("invalid resignation record format")
 	}
 
-	gameRef, ok := getGameReference(resignation)
-	if !ok {
+	gameRef := getGameReference(resignation)
+	if gameRef == "" {
 		return fmt.Errorf("resignation missing game reference")
 	}
 
-	// Broadcast resignation
-	if p.hub != nil {
-		p.hub.HandleFirehoseEvent(ctx, "resignation", gameRef, resignation)
+	update := web.GameUpdate{
+		Type:   "resignation",
+		GameID: gameRef,
+		Data:   resignation,
 	}
 
-	log.Info().
-		Str("gameID", gameRef).
-		Str("resigningPlayer", getString(resignation, "resigningPlayer")).
-		Msg("Resignation processed")
-
-	return nil
-}
-
-// processChallengeEvent handles new challenges
-func (p *EventProcessor) processChallengeEvent(ctx context.Context, event Event) error {
-	challenge, ok := event.Record.(map[string]interface{})
-	if !ok {
-		return fmt.Errorf("invalid challenge record format")
-	}
-
-	// Track players involved in challenges
-	if challenger := getString(challenge, "challenger"); challenger != "" {
-		p.TrackPlayer(challenger)
-	}
-	if challenged := getString(challenge, "challenged"); challenged != "" {
-		p.TrackPlayer(challenged)
-	}
-
-	log.Debug().
-		Str("challenger", getString(challenge, "challenger")).
-		Str("challenged", getString(challenge, "challenged")).
-		Msg("Challenge processed")
-
+	p.hub.BroadcastToGame(gameRef, update)
 	return nil
 }
 
 // processChallengeNotificationEvent handles challenge notifications
 func (p *EventProcessor) processChallengeNotificationEvent(ctx context.Context, event Event) error {
-	// Challenge notifications are primarily for the UI
-	// The firehose processor just logs them
-	log.Debug().
-		Str("repo", event.Repo).
-		Msg("Challenge notification processed")
-	
+	notification, ok := event.Record.(map[string]interface{})
+	if !ok {
+		return fmt.Errorf("invalid challenge notification record format")
+	}
+
+	// Send to the challenged player
+	update := web.GameUpdate{
+		Type: "challenge_notification",
+		Data: notification,
+	}
+
+	// The repo is the challenged player's DID
+	p.hub.BroadcastToPlayer(event.Repo, update)
 	return nil
 }
 
-// Helper functions
-
-// getGameReference extracts game URI from a record
-func getGameReference(record map[string]interface{}) (string, bool) {
-	// Check for direct game field
-	if gameRef, ok := record["game"].(map[string]interface{}); ok {
-		if uri, ok := gameRef["uri"].(string); ok {
-			return extractIDFromURI(uri), true
+// isGameTracked checks if we're tracking this game
+func (p *EventProcessor) isGameTracked(event Event) bool {
+	// Check if it's a game-related event
+	if event.Type == EventTypeGame ||
+		event.Type == EventTypeMove ||
+		event.Type == EventTypeDrawOffer ||
+		event.Type == EventTypeResignation {
+		record, ok := event.Record.(map[string]interface{})
+		if !ok {
+			return false
+		}
+		if gameRef := getGameReference(record); gameRef != "" {
+			return p.trackedGames[gameRef]
 		}
 	}
-	
-	// For game records, use the record key
-	if record["$type"] == "app.atchess.game" {
-		// The game ID would be in the event URI
-		return "", false
-	}
-	
-	return "", false
+	return false
 }
 
-// extractIDFromURI extracts the record ID from an AT URI
-// Format: at://did:plc:xxx/collection/recordID
-func extractIDFromURI(uri string) string {
-	parts := strings.Split(uri, "/")
-	if len(parts) >= 5 {
-		return parts[4]
+// isPlayerInvolved checks if a tracked player is involved
+func (p *EventProcessor) isPlayerInvolved(event Event) bool {
+	// The repo is always one of the players
+	if p.trackedPlayers[event.Repo] {
+		return true
 	}
-	return ""
+
+	// For games, check both players
+	if event.Type == EventTypeGame {
+		game, ok := event.Record.(map[string]interface{})
+		if !ok {
+			return false
+		}
+		if white, ok := game["white"].(string); ok && p.trackedPlayers[white] {
+			return true
+		}
+		if black, ok := game["black"].(string); ok && p.trackedPlayers[black] {
+			return true
+		}
+	}
+
+	return false
 }
 
-// getString safely gets a string from a map
-func getString(m map[string]interface{}, key string) string {
-	if val, ok := m[key].(string); ok {
-		return val
+// getGameReference extracts game reference from various record types
+func getGameReference(record map[string]interface{}) string {
+	// Try direct game field
+	if game, ok := record["game"].(map[string]interface{}); ok {
+		if ref, ok := game["$link"].(string); ok {
+			return ref
+		}
 	}
+
+	// Try game ID field
+	if id, ok := record["id"].(string); ok {
+		return id
+	}
+
+	// Try gameId field
+	if id, ok := record["gameId"].(string); ok {
+		return id
+	}
+
 	return ""
 }
 
 // CreateChessEventHandler creates an event handler for the firehose client
 func CreateChessEventHandler(processor *EventProcessor) EventHandler {
-	return func(ctx context.Context, event Event) error {
+	return func(event Event) error {
 		// Only process chess-related events
-		if !strings.HasPrefix(event.Collection, "app.atchess.") {
+		if !strings.Contains(event.Path, "app.atchess") {
 			return nil
 		}
 
-		return processor.ProcessEvent(ctx, event)
+		// Process the event
+		return processor.ProcessEvent(context.Background(), event)
 	}
 }

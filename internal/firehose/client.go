@@ -44,6 +44,7 @@ const (
 	EventTypeGame       EventType = "game"
 	EventTypeChallenge  EventType = "challenge"
 	EventTypeChallengeAcceptance EventType = "challengeAcceptance"
+	EventTypeChallengeNotification EventType = "challengeNotification"
 )
 
 // Event represents a chess-related event from the firehose

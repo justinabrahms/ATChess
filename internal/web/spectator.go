@@ -69,28 +69,23 @@ func (s *Service) GetSpectatorGameHandler(w http.ResponseWriter, r *http.Request
 	}
 	
 	// Get material count
-	engine := chess.NewEngine()
-	if err := engine.LoadFEN(game.FEN); err != nil {
-		log.Error().Err(err).Str("fen", game.FEN).Msg("Failed to load FEN for material count")
-	}
-	materialCount := engine.GetMaterialCount()
-	
-	// Get moves for the game
-	moves, err := s.client.GetMoves(context.Background(), gameID)
+	engine, err := chess.NewEngineFromFEN(game.FEN)
+	var materialCount chess.MaterialCount
 	if err != nil {
-		log.Error().Err(err).Str("gameID", gameID).Msg("Failed to fetch moves")
-		moves = []chess.Move{} // Continue with empty moves
+		log.Error().Err(err).Str("fen", game.FEN).Msg("Failed to load FEN for material count")
+		// Use zero material count on error
+		materialCount = chess.MaterialCount{White: 0, Black: 0}
+	} else {
+		materialCount = engine.GetMaterialCount()
 	}
+	
+	// TODO: Get moves from AT Protocol when move records are implemented
+	// For now, moves are parsed from PGN in the engine
 	
 	// Prepare spectator response
 	response := map[string]interface{}{
 		"game": game,
-		"moves": moves,
-		"moveCount": len(moves),
 		"materialCount": materialCount,
-		"materialBalance": engine.GetMaterialBalance(),
-		"isDrawn": engine.IsDrawn(),
-		"drawReason": engine.GetDrawReason(),
 	}
 	
 	w.Header().Set("Content-Type", "application/json")
@@ -149,7 +144,7 @@ func (s *Service) CheckAbandonmentHandler(w http.ResponseWriter, r *http.Request
 	}
 	
 	// Only check active games
-	if game.Status != chess.GameStatusActive {
+	if game.Status != chess.StatusActive {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"abandoned": false,
@@ -158,38 +153,27 @@ func (s *Service) CheckAbandonmentHandler(w http.ResponseWriter, r *http.Request
 		return
 	}
 	
-	// Get last move
-	moves, err := s.client.GetMoves(context.Background(), gameID)
-	if err != nil || len(moves) == 0 {
-		// No moves yet, use game creation time
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"abandoned": false,
-			"lastActivity": game.CreatedAt,
-		})
-		return
-	}
-	
-	// Check time since last move
-	lastMove := moves[len(moves)-1]
-	lastMoveTime, err := time.Parse(time.RFC3339, lastMove.CreatedAt)
+	// TODO: Get last move from AT Protocol when move records are implemented
+	// For now, use game creation time as last activity
+	lastActivityStr := game.CreatedAt
+	lastActivityTime, err := time.Parse(time.RFC3339, lastActivityStr)
 	if err != nil {
-		log.Error().Err(err).Msg("Failed to parse move time")
-		http.Error(w, "Invalid move timestamp", http.StatusInternalServerError)
+		log.Error().Err(err).Msg("Failed to parse activity time")
+		http.Error(w, "Invalid timestamp", http.StatusInternalServerError)
 		return
 	}
 	
 	// Default abandonment timeout: 3 days for correspondence
 	abandonmentTimeout := 3 * 24 * time.Hour
-	timeSinceLastMove := time.Since(lastMoveTime)
+	timeSinceLastActivity := time.Since(lastActivityTime)
 	
-	abandoned := timeSinceLastMove > abandonmentTimeout
+	abandoned := timeSinceLastActivity > abandonmentTimeout
 	
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"abandoned": abandoned,
-		"lastActivity": lastMove.CreatedAt,
-		"timeSinceLastMove": timeSinceLastMove.String(),
+		"lastActivity": lastActivityStr,
+		"timeSinceLastMove": timeSinceLastActivity.String(),
 		"timeout": abandonmentTimeout.String(),
 		"canClaim": abandoned,
 	})
@@ -197,16 +181,11 @@ func (s *Service) CheckAbandonmentHandler(w http.ResponseWriter, r *http.Request
 
 // ClaimAbandonedGameHandler allows a player to claim victory in an abandoned game
 func (s *Service) ClaimAbandonedGameHandler(w http.ResponseWriter, r *http.Request) {
-	vars := mux.Vars(r)
-	gameID := vars["id"]
-	
-	// Verify the game is actually abandoned
-	// This reuses the abandonment check logic
-	
 	// TODO: Implement claim logic that:
-	// 1. Verifies abandonment
-	// 2. Updates game status to winner
-	// 3. Creates a system move or note about abandonment
+	// 1. Get gameID from request: vars := mux.Vars(r); gameID := vars["id"]
+	// 2. Verifies abandonment
+	// 3. Updates game status to winner
+	// 4. Creates a system move or note about abandonment
 	
 	http.Error(w, "Not implemented", http.StatusNotImplemented)
 }

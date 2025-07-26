@@ -258,6 +258,23 @@ func (c *Client) writePump() {
 	}
 }
 
+// BroadcastToGame sends an update to all clients watching a specific game
+func (h *Hub) BroadcastToGame(gameID string, update GameUpdate) {
+	update.GameID = gameID
+	h.broadcast <- update
+}
+
+// BroadcastToPlayer sends an update to all clients for a specific player
+func (h *Hub) BroadcastToPlayer(playerDID string, update GameUpdate) {
+	// For now, we broadcast to all clients and let them filter
+	// In a production system, you'd want to track clients by player DID
+	update.Data = map[string]interface{}{
+		"playerDID": playerDID,
+		"data": update.Data,
+	}
+	h.broadcast <- update
+}
+
 // Integration with firehose events
 func (h *Hub) HandleFirehoseEvent(ctx context.Context, eventType string, gameID string, data interface{}) {
 	update := GameUpdate{

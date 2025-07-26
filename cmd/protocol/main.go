@@ -64,13 +64,13 @@ func main() {
 	// Start firehose client (optional - can be disabled in config)
 	if cfg.Firehose.Enabled {
 		firehoseClient := firehose.NewClient(
-			cfg.Firehose.URL,
 			firehose.CreateChessEventHandler(processor),
+			firehose.WithURL(cfg.Firehose.URL),
 		)
 		
 		go func() {
 			log.Info().Str("url", cfg.Firehose.URL).Msg("Starting firehose client")
-			if err := firehoseClient.Start(context.Background()); err != nil {
+			if err := firehoseClient.Start(); err != nil {
 				log.Error().Err(err).Msg("Firehose client error")
 			}
 		}()
