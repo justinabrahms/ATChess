@@ -5,14 +5,6 @@ import (
 	"time"
 )
 
-// TimeControl represents the time control settings for a game
-type TimeControl struct {
-	Type        string `json:"type"`        // "correspondence", "rapid", "blitz"
-	DaysPerMove int    `json:"daysPerMove"` // For correspondence games
-	Initial     int    `json:"initial"`     // Initial time in seconds (future use)
-	Increment   int    `json:"increment"`   // Increment per move in seconds (future use)
-}
-
 // TimeViolation represents a time control violation
 type TimeViolation struct {
 	PlayerDID    string    `json:"playerDid"`
