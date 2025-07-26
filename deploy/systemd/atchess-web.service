@@ -1,0 +1,39 @@
+[Unit]
+Description=ATChess Web Service
+Documentation=https://github.com/justinabrahms/atchess
+After=network.target atchess-protocol.service
+
+[Service]
+Type=simple
+User=atchess
+Group=atchess
+WorkingDirectory=/opt/atchess
+ExecStart=/opt/atchess/bin/atchess-web
+Restart=always
+RestartSec=10
+
+# Environment variables
+Environment="ATCHESS_SERVER_HOST=0.0.0.0"
+Environment="ATCHESS_SERVER_PORT=8081"
+Environment="ATCHESS_DEVELOPMENT_LOG_LEVEL=info"
+EnvironmentFile=-/etc/atchess/web.env
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/atchess/data
+ReadOnlyPaths=/opt/atchess/bin
+
+# Resource limits
+LimitNOFILE=65536
+MemoryLimit=256M
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=atchess-web
+
+[Install]
+WantedBy=multi-user.target

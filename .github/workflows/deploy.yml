@@ -1,0 +1,102 @@
+name: Deploy to DigitalOcean
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+env:
+  GO_VERSION: '1.21'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: ${{ env.GO_VERSION }}
+    
+    - name: Cache Go modules
+      uses: actions/cache@v3
+      with:
+        path: ~/go/pkg/mod
+        key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+        restore-keys: |
+          ${{ runner.os }}-go-
+    
+    - name: Build binaries
+      run: |
+        make build
+        # Create deployment archive
+        tar -czf deploy.tar.gz \
+          bin/atchess-protocol \
+          bin/atchess-web \
+          deploy/systemd/*.service \
+          deploy/nginx/*.conf \
+          deploy/scripts/*.sh \
+          web/static
+    
+    - name: Deploy to server
+      uses: appleboy/ssh-action@v1.0.0
+      with:
+        host: ${{ secrets.DEPLOY_HOST }}
+        username: ${{ secrets.DEPLOY_USER }}
+        key: ${{ secrets.DEPLOY_SSH_KEY }}
+        port: ${{ secrets.DEPLOY_PORT }}
+        script: |
+          # Create deployment directory
+          sudo mkdir -p /opt/atchess
+          sudo chown $USER:$USER /opt/atchess
+    
+    - name: Copy files to server
+      uses: appleboy/scp-action@v0.1.5
+      with:
+        host: ${{ secrets.DEPLOY_HOST }}
+        username: ${{ secrets.DEPLOY_USER }}
+        key: ${{ secrets.DEPLOY_SSH_KEY }}
+        port: ${{ secrets.DEPLOY_PORT }}
+        source: "deploy.tar.gz"
+        target: "/tmp"
+    
+    - name: Extract and deploy
+      uses: appleboy/ssh-action@v1.0.0
+      with:
+        host: ${{ secrets.DEPLOY_HOST }}
+        username: ${{ secrets.DEPLOY_USER }}
+        key: ${{ secrets.DEPLOY_SSH_KEY }}
+        port: ${{ secrets.DEPLOY_PORT }}
+        script: |
+          # Extract deployment archive
+          cd /opt/atchess
+          tar -xzf /tmp/deploy.tar.gz
+          rm /tmp/deploy.tar.gz
+          
+          # Make binaries executable
+          chmod +x bin/atchess-protocol bin/atchess-web
+          
+          # Copy static files
+          sudo mkdir -p /var/www/atchess
+          sudo cp -r web/static/* /var/www/atchess/
+          
+          # Install systemd services
+          sudo cp deploy/systemd/*.service /etc/systemd/system/
+          sudo systemctl daemon-reload
+          
+          # Install nginx config
+          sudo cp deploy/nginx/atchess.conf /etc/nginx/sites-available/
+          sudo ln -sf /etc/nginx/sites-available/atchess.conf /etc/nginx/sites-enabled/
+          
+          # Restart services
+          sudo systemctl restart atchess-protocol
+          sudo systemctl restart atchess-web
+          sudo nginx -t && sudo systemctl reload nginx
+          
+          # Enable services to start on boot
+          sudo systemctl enable atchess-protocol
+          sudo systemctl enable atchess-web
