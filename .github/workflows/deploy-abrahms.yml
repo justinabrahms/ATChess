@@ -61,8 +61,8 @@ jobs:
         
         # Skip wrapper script - not needed
         
-        # Copy static files
-        tar -czf static.tar.gz -C web static
+        # Copy static files (without ownership info)
+        tar --no-same-owner -czf static.tar.gz -C web static
         scp -i ~/.ssh/deploy_key -P $DEPLOY_PORT \
           static.tar.gz \
           $DEPLOY_USER@$DEPLOY_HOST:/tmp/
@@ -90,9 +90,9 @@ jobs:
           
           # No wrapper script needed - environment is handled by systemd
           
-          # Extract and move static files
+          # Extract and move static files (no-same-owner to avoid permission issues)
           cd /srv/atchess/app
-          tar -xzf /tmp/static.tar.gz
+          tar --no-same-owner --no-same-permissions -xzf /tmp/static.tar.gz
           
           # Clean up temporary files
           rm -f /tmp/atchess-* /tmp/static.tar.gz
