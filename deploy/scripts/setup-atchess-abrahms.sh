@@ -216,7 +216,35 @@ EOF
 # Create environment file templates
 echo -e "${YELLOW}Creating environment configuration templates...${NC}"
 
-cat > $CONFIG_DIR/protocol.env << 'EOF'
+# Preserve existing credentials if they exist
+EXISTING_HANDLE=""
+EXISTING_PASSWORD=""
+EXISTING_PDS_URL="https://bsky.social"
+EXISTING_USE_DPOP="false"
+
+if [ -f "$CONFIG_DIR/protocol.env" ]; then
+    echo -e "${GREEN}Found existing protocol.env, preserving credentials...${NC}"
+    # Create backup
+    cp "$CONFIG_DIR/protocol.env" "$CONFIG_DIR/protocol.env.backup-$(date +%Y%m%d-%H%M%S)"
+    # Extract existing values, handling both ATPROTO_ and ATCHESS_ATPROTO_ prefixes
+    EXISTING_HANDLE=$(grep -E "^(ATCHESS_)?ATPROTO_HANDLE=" "$CONFIG_DIR/protocol.env" | head -1 | cut -d'=' -f2- | tr -d '"' | tr -d "'")
+    EXISTING_PASSWORD=$(grep -E "^(ATCHESS_)?ATPROTO_PASSWORD=" "$CONFIG_DIR/protocol.env" | head -1 | cut -d'=' -f2- | tr -d '"' | tr -d "'")
+    EXISTING_PDS_URL=$(grep -E "^(ATCHESS_)?ATPROTO_PDS_URL=" "$CONFIG_DIR/protocol.env" | head -1 | cut -d'=' -f2- | tr -d '"' | tr -d "'")
+    EXISTING_USE_DPOP=$(grep -E "^(ATCHESS_)?ATPROTO_USE_DPOP=" "$CONFIG_DIR/protocol.env" | head -1 | cut -d'=' -f2- | tr -d '"' | tr -d "'")
+    
+    # Use defaults if values weren't found
+    EXISTING_HANDLE=${EXISTING_HANDLE:-"your-handle.bsky.social"}
+    EXISTING_PDS_URL=${EXISTING_PDS_URL:-"https://bsky.social"}
+    EXISTING_USE_DPOP=${EXISTING_USE_DPOP:-"false"}
+fi
+
+# Use existing values or defaults
+HANDLE="${EXISTING_HANDLE:-your-handle.bsky.social}"
+PASSWORD="${EXISTING_PASSWORD:-your-app-password-here}"
+PDS_URL="${EXISTING_PDS_URL:-https://bsky.social}"
+USE_DPOP="${EXISTING_USE_DPOP:-false}"
+
+cat > $CONFIG_DIR/protocol.env << EOF
 # ATChess Protocol Service Configuration
 # 
 # The service will start in demo mode with these defaults.
@@ -240,11 +268,10 @@ SERVER_PORT=8080
 # 3. Create a new app password for ATChess
 # 4. Update the values below with your credentials
 #
-# Default values (service will NOT start with these):
-ATPROTO_PDS_URL=https://bsky.social
-ATPROTO_HANDLE=your-handle.bsky.social
-ATPROTO_PASSWORD=your-app-password-here
-ATPROTO_USE_DPOP=false
+ATPROTO_PDS_URL=$PDS_URL
+ATPROTO_HANDLE=$HANDLE
+ATPROTO_PASSWORD=$PASSWORD
+ATPROTO_USE_DPOP=$USE_DPOP
 
 # Firehose (optional)
 FIREHOSE_ENABLED=false
@@ -258,9 +285,10 @@ DEVELOPMENT_LOG_LEVEL=info
 # These mirror the above settings with ATCHESS_ prefix
 ATCHESS_SERVER_HOST=0.0.0.0
 ATCHESS_SERVER_PORT=8080
-ATCHESS_ATPROTO_PDS_URL=https://bsky.social
-ATCHESS_ATPROTO_HANDLE=your-handle.bsky.social
-ATCHESS_ATPROTO_PASSWORD=your-app-password-here
+ATCHESS_ATPROTO_PDS_URL=$PDS_URL
+ATCHESS_ATPROTO_HANDLE=$HANDLE
+ATCHESS_ATPROTO_PASSWORD=$PASSWORD
+ATCHESS_ATPROTO_USE_DPOP=$USE_DPOP
 ATCHESS_DEVELOPMENT_DEBUG=true
 ATCHESS_DEVELOPMENT_LOG_LEVEL=info
 EOF
@@ -362,15 +390,23 @@ systemctl reload caddy
 
 echo -e "${GREEN}Setup complete!${NC}"
 echo ""
-echo -e "${RED}IMPORTANT: The protocol service requires AT Protocol credentials!${NC}"
-echo ""
-echo -e "${YELLOW}Required steps before starting:${NC}"
-echo "1. Create a Bluesky account at: https://bsky.app"
-echo "2. Create an app password at: https://bsky.app/settings/app-passwords" 
-echo "3. Edit $CONFIG_DIR/protocol.env and update:"
-echo "   - ATPROTO_HANDLE (your Bluesky handle)"
-echo "   - ATPROTO_PASSWORD (your app password)"
-echo ""
+
+# Check if we preserved existing credentials
+if [ -n "$EXISTING_PASSWORD" ] && [ "$EXISTING_PASSWORD" != "your-app-password-here" ]; then
+    echo -e "${GREEN}✓ Existing AT Protocol credentials were preserved${NC}"
+    echo "  Handle: $EXISTING_HANDLE"
+    echo ""
+else
+    echo -e "${RED}IMPORTANT: The protocol service requires AT Protocol credentials!${NC}"
+    echo ""
+    echo -e "${YELLOW}Required steps before starting:${NC}"
+    echo "1. Create a Bluesky account at: https://bsky.app"
+    echo "2. Create an app password at: https://bsky.app/settings/app-passwords" 
+    echo "3. Edit $CONFIG_DIR/protocol.env and update:"
+    echo "   - ATPROTO_HANDLE (your Bluesky handle)"
+    echo "   - ATPROTO_PASSWORD (your app password)"
+    echo ""
+fi
 echo -e "${YELLOW}Next steps:${NC}"
 echo "1. Add your SSH public key to: /home/$DEPLOY_USER/.ssh/authorized_keys"
 echo "2. Configure AT Protocol credentials (see above)"
