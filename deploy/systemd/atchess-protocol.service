@@ -15,8 +15,9 @@ ExecStart=/srv/atchess/app/atchess-protocol
 Restart=on-failure
 RestartSec=5
 
-StandardOutput=append:/srv/atchess/logs/protocol.log
-StandardError=append:/srv/atchess/logs/protocol-error.log
+# Logging - using syslog for compatibility with older systemd
+StandardOutput=syslog
+StandardError=syslog
 
 # Security hardening
 NoNewPrivileges=true
@@ -33,15 +34,17 @@ LockPersonality=true
 RestrictRealtime=true
 RestrictSUIDSGID=true
 RemoveIPC=true
-PrivateMounts=true
+# PrivateMounts requires systemd 233+
 
 # Resource limits
 LimitNOFILE=1024
-MemoryLimit=256M
-CPUQuota=50%
+# MemoryLimit is deprecated, use MemoryMax for newer systemd
+# CPUQuota requires specific syntax
 
-# Logging
+# Logging - append: requires systemd 240+
 SyslogIdentifier=atchess-protocol
+StandardOutput=syslog
+StandardError=syslog
 
 [Install]
 WantedBy=multi-user.target

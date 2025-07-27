@@ -15,8 +15,9 @@ ExecStart=/srv/atchess/app/atchess-web
 Restart=on-failure
 RestartSec=5
 
-StandardOutput=append:/srv/atchess/logs/web.log
-StandardError=append:/srv/atchess/logs/web-error.log
+# Logging - using syslog for compatibility
+StandardOutput=syslog
+StandardError=syslog
 
 # Security hardening
 NoNewPrivileges=true
@@ -33,15 +34,17 @@ LockPersonality=true
 RestrictRealtime=true
 RestrictSUIDSGID=true
 RemoveIPC=true
-PrivateMounts=true
+# PrivateMounts requires systemd 233+
 
 # Resource limits
 LimitNOFILE=1024
-MemoryLimit=256M
-CPUQuota=50%
+# MemoryLimit is deprecated, use MemoryMax for newer systemd
+# CPUQuota requires specific syntax
 
 # Logging
 SyslogIdentifier=atchess-web
+StandardOutput=syslog
+StandardError=syslog
 
 [Install]
 WantedBy=multi-user.target

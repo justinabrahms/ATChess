@@ -151,18 +151,19 @@ LockPersonality=true
 RestrictRealtime=true
 RestrictSUIDSGID=true
 RemoveIPC=true
-PrivateMounts=true
+# PrivateMounts=true # Requires systemd 233+
 
 # Resource limits
 LimitNOFILE=1024
-LimitNPROC=512
 
 ExecStart=/srv/atchess/app/atchess-protocol
 Restart=on-failure
 RestartSec=5
 
-StandardOutput=append:/srv/atchess/logs/protocol.log
-StandardError=append:/srv/atchess/logs/protocol-error.log
+# Logging - using syslog for compatibility with older systemd
+StandardOutput=syslog
+StandardError=syslog
+SyslogIdentifier=atchess-protocol
 
 [Install]
 WantedBy=multi-user.target
@@ -196,18 +197,19 @@ LockPersonality=true
 RestrictRealtime=true
 RestrictSUIDSGID=true
 RemoveIPC=true
-PrivateMounts=true
+# PrivateMounts=true # Requires systemd 233+
 
 # Resource limits
 LimitNOFILE=1024
-LimitNPROC=512
 
 ExecStart=/srv/atchess/app/atchess-web
 Restart=on-failure
 RestartSec=5
 
-StandardOutput=append:/srv/atchess/logs/web.log
-StandardError=append:/srv/atchess/logs/web-error.log
+# Logging - using syslog for compatibility with older systemd
+StandardOutput=syslog
+StandardError=syslog
+SyslogIdentifier=atchess-web
 
 [Install]
 WantedBy=multi-user.target
@@ -311,6 +313,35 @@ EOF
 # Set permissions on config files
 chown $APP_USER:www $CONFIG_DIR/*.env
 chmod 640 $CONFIG_DIR/*.env
+
+# Create config.yaml to work around environment loading bug
+echo -e "${YELLOW}Creating config.yaml for protocol service...${NC}"
+cat > $APP_DIR/app/config.yaml << EOF
+# ATChess Configuration
+# This file is a workaround for environment variable loading
+# The actual values come from /etc/atchess/protocol.env
+
+server:
+  host: "0.0.0.0"
+  port: 8080
+
+atproto:
+  pds_url: "$PDS_URL"
+  handle: "$HANDLE"
+  password: "$PASSWORD"
+  use_dpop: $USE_DPOP
+
+development:
+  debug: true
+  log_level: "info"
+
+firehose:
+  enabled: false
+  url: "wss://bsky.social/xrpc/com.atproto.sync.subscribeRepos"
+EOF
+
+chown $APP_USER:www $APP_DIR/app/config.yaml
+chmod 640 $APP_DIR/app/config.yaml
 
 # Create sudo rules for deployment
 echo -e "${YELLOW}Setting up deployment permissions...${NC}"
