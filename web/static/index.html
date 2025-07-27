@@ -667,6 +667,11 @@
     </div>
 
     <script>
+        // API Configuration - use relative URLs since we're served from the same origin
+        const API_BASE = '/api';
+        const WS_BASE = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
+        const WS_HOST = window.location.host;
+        
         // Global state
         let currentUser = null;
         let currentGame = null;
@@ -713,7 +718,7 @@
             }
             
             try {
-                const response = await fetch('http://localhost:8080/api/auth/session', {
+                const response = await fetch(`${API_BASE}/auth/session`, {
                     headers: {
                         'X-Session-ID': sessionId
                     }
@@ -782,7 +787,7 @@
             authMessage.innerHTML = '';
             
             try {
-                const response = await fetch('http://localhost:8080/api/auth/oauth/login', {
+                const response = await fetch(`${API_BASE}/auth/oauth/login`, {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
@@ -820,7 +825,7 @@
             // Call logout endpoint
             if (sessionId) {
                 try {
-                    await fetch('http://localhost:8080/api/auth/logout', {
+                    await fetch(`${API_BASE}/auth/logout`, {
                         method: 'POST',
                         headers: {
                             'X-Session-ID': sessionId
@@ -982,7 +987,7 @@
         // Make a move
         async function makeMove(from, to) {
             try {
-                const response = await fetch('http://localhost:8080/api/moves', {
+                const response = await fetch(`${API_BASE}/moves`, {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
@@ -1022,7 +1027,7 @@
             try {
                 // First, resolve the handle to a DID
                 // For now, we'll create a challenge which will resolve the handle
-                const response = await fetch('http://localhost:8080/api/challenges', {
+                const response = await fetch(`${API_BASE}/challenges`, {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
@@ -1060,7 +1065,7 @@
         // Load challenges
         async function loadChallenges() {
             try {
-                const response = await fetch('http://localhost:8080/api/challenge-notifications');
+                const response = await fetch(`${API_BASE}/challenge-notifications`);
                 if (!response.ok) {
                     throw new Error('Failed to fetch challenges');
                 }
@@ -1111,7 +1116,7 @@
                 }
                 
                 // Create game
-                const response = await fetch('http://localhost:8080/api/games', {
+                const response = await fetch(`${API_BASE}/games`, {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
@@ -1131,7 +1136,7 @@
                 // Delete notification
                 const uriParts = notificationUri.split('/');
                 const key = uriParts[uriParts.length - 1];
-                await fetch(`http://localhost:8080/api/challenge-notifications/${key}`, {
+                await fetch(`${API_BASE}/challenge-notifications/${key}`, {
                     method: 'DELETE'
                 });
                 
@@ -1152,7 +1157,7 @@
                 const uriParts = notificationUri.split('/');
                 const key = uriParts[uriParts.length - 1];
                 
-                await fetch(`http://localhost:8080/api/challenge-notifications/${key}`, {
+                await fetch(`${API_BASE}/challenge-notifications/${key}`, {
                     method: 'DELETE'
                 });
                 
@@ -1166,7 +1171,7 @@
         // Load a game
         async function loadGame(encodedGameId) {
             try {
-                const response = await fetch(`http://localhost:8080/api/games/${encodedGameId}`);
+                const response = await fetch(`${API_BASE}/games/${encodedGameId}`);
                 if (!response.ok) {
                     throw new Error('Game not found');
                 }
@@ -1224,7 +1229,7 @@
             if (!currentGame || ws) return;
             
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-            const wsUrl = `${protocol}//localhost:8080/api/ws?gameId=${encodeURIComponent(currentGame.id)}`;
+            const wsUrl = `${WS_BASE}${WS_HOST}${API_BASE}/ws?gameId=${encodeURIComponent(currentGame.id)}`;
             
             ws = new WebSocket(wsUrl);
             
