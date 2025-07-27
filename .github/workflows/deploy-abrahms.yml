@@ -176,10 +176,17 @@ jobs:
         
         echo ""
         echo "🚀 Deployment complete!"
-        echo "ATChess is available at: https://$DEPLOY_HOST"
+        echo "ATChess web interface is available at: https://$DEPLOY_HOST"
         echo ""
-        echo "Note: The protocol service may need additional configuration."
-        echo "Check the logs above for service status details."
+        echo "⚠️  IMPORTANT: The protocol service requires AT Protocol credentials!"
+        echo "   Without valid Bluesky credentials in /etc/atchess/protocol.env,"
+        echo "   the protocol service will not start."
+        echo ""
+        echo "To configure AT Protocol:"
+        echo "1. SSH to the server"
+        echo "2. Edit /etc/atchess/protocol.env" 
+        echo "3. Add your Bluesky handle and app password"
+        echo "4. Restart: sudo systemctl restart atchess-protocol"
     
     - name: Clean up SSH
       if: always()

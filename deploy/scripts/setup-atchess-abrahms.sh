@@ -218,15 +218,32 @@ echo -e "${YELLOW}Creating environment configuration templates...${NC}"
 
 cat > $CONFIG_DIR/protocol.env << 'EOF'
 # ATChess Protocol Service Configuration
+# 
+# The service will start in demo mode with these defaults.
+# To connect to a real AT Protocol network:
+# 1. Replace ATPROTO_HANDLE with your Bluesky handle
+# 2. Create an app password at https://bsky.app/settings/app-passwords
+# 3. Replace ATPROTO_PASSWORD with your app password
+# 4. Restart the service: sudo systemctl restart atchess-protocol
 
 # Server
 SERVER_HOST=0.0.0.0
 SERVER_PORT=8080
 
-# AT Protocol
+# AT Protocol - REQUIRED for service to start
+# NOTE: The protocol service REQUIRES valid AT Protocol credentials to run.
+# Without valid credentials, the service will fail to start.
+# 
+# To get started:
+# 1. Create a Bluesky account at https://bsky.app
+# 2. Go to Settings > App Passwords
+# 3. Create a new app password for ATChess
+# 4. Update the values below with your credentials
+#
+# Default values (service will NOT start with these):
 ATPROTO_PDS_URL=https://bsky.social
 ATPROTO_HANDLE=your-handle.bsky.social
-ATPROTO_PASSWORD=your-app-password
+ATPROTO_PASSWORD=your-app-password-here
 ATPROTO_USE_DPOP=false
 
 # Firehose (optional)
@@ -235,15 +252,17 @@ FIREHOSE_URL=wss://bsky.social/xrpc/com.atproto.sync.subscribeRepos
 
 # Development
 DEVELOPMENT_DEBUG=true
-DEVELOPMENT_LOG_LEVEL=debug
+DEVELOPMENT_LOG_LEVEL=info
 
-# Add defaults to help with startup
+# Alternative environment variable names (both work)
+# These mirror the above settings with ATCHESS_ prefix
 ATCHESS_SERVER_HOST=0.0.0.0
 ATCHESS_SERVER_PORT=8080
 ATCHESS_ATPROTO_PDS_URL=https://bsky.social
-ATCHESS_ATPROTO_HANDLE=test.bsky.social
-ATCHESS_ATPROTO_PASSWORD=test-password
+ATCHESS_ATPROTO_HANDLE=your-handle.bsky.social
+ATCHESS_ATPROTO_PASSWORD=your-app-password-here
 ATCHESS_DEVELOPMENT_DEBUG=true
+ATCHESS_DEVELOPMENT_LOG_LEVEL=info
 EOF
 
 cat > $CONFIG_DIR/web.env << 'EOF'
@@ -343,13 +362,23 @@ systemctl reload caddy
 
 echo -e "${GREEN}Setup complete!${NC}"
 echo ""
+echo -e "${RED}IMPORTANT: The protocol service requires AT Protocol credentials!${NC}"
+echo ""
+echo -e "${YELLOW}Required steps before starting:${NC}"
+echo "1. Create a Bluesky account at: https://bsky.app"
+echo "2. Create an app password at: https://bsky.app/settings/app-passwords" 
+echo "3. Edit $CONFIG_DIR/protocol.env and update:"
+echo "   - ATPROTO_HANDLE (your Bluesky handle)"
+echo "   - ATPROTO_PASSWORD (your app password)"
+echo ""
 echo -e "${YELLOW}Next steps:${NC}"
 echo "1. Add your SSH public key to: /home/$DEPLOY_USER/.ssh/authorized_keys"
-echo "2. Edit configuration files:"
-echo "   - $CONFIG_DIR/protocol.env (AT Protocol credentials)"
-echo "   - $CONFIG_DIR/web.env (if needed)"
+echo "2. Configure AT Protocol credentials (see above)"
 echo "3. Deploy the ATChess binaries to: $APP_DIR/app/"
 echo "4. Start services: systemctl start atchess-protocol atchess-web"
+echo ""
+echo -e "${YELLOW}Note:${NC} The web service will run without AT Protocol credentials,"
+echo "but the protocol service will fail to start until valid credentials are provided."
 echo ""
 echo -e "${YELLOW}Useful commands:${NC}"
 echo "  atchess-status  - Check service status"
