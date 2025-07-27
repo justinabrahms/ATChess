@@ -40,11 +40,6 @@ func main() {
 	// Setup routes
 	router := mux.NewRouter()
 	
-	// Handle OAuth callback by serving the index page
-	router.HandleFunc("/callback", func(w http.ResponseWriter, r *http.Request) {
-		http.ServeFile(w, r, "./web/static/index.html")
-	}).Methods("GET")
-	
 	// Serve static files
 	router.PathPrefix("/").Handler(http.FileServer(http.Dir("./web/static/")))
 	

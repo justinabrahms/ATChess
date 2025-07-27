@@ -6,7 +6,7 @@
   "logo_uri": "https://atchess.abrah.ms/logo.jpg",
   "tos_uri": "https://atchess.abrah.ms/terms",
   "policy_uri": "https://atchess.abrah.ms/privacy",
-  "redirect_uris": ["https://atchess.abrah.ms/callback"],
+  "redirect_uris": ["https://atchess.abrah.ms/api/callback"],
   "scope": "atproto transition:generic",
   "grant_types": ["authorization_code", "refresh_token"],
   "response_types": ["code"],

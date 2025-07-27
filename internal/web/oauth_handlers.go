@@ -26,7 +26,7 @@ var (
 // InitializeOAuth sets up the OAuth client and stores
 func InitializeOAuth(baseURL string) error {
 	clientID := baseURL + "/client-metadata.json"
-	redirectURI := baseURL + "/callback"
+	redirectURI := baseURL + "/api/callback"
 	
 	client, err := oauth.NewOAuthClient(clientID, redirectURI)
 	if err != nil {
