@@ -94,11 +94,17 @@ jobs:
           cd /srv/atchess/app
           rm -rf web/static
           mkdir -p web
-          # Extract as atchess user to avoid permission issues
-          # Use --no-same-owner and --no-same-permissions to avoid permission errors
-          tar xzf /tmp/static.tar.gz --no-same-owner --no-same-permissions
+          # Extract to temp directory first to avoid permission issues
+          mkdir -p /tmp/extract_static
+          cd /tmp/extract_static
+          tar xzf /tmp/static.tar.gz
+          # Move the extracted files to the final location
+          cd /srv/atchess/app
+          mv /tmp/extract_static/static web/
           # Fix ownership (use sudo if needed for www group)
           sudo chown -R atchess:www web/static || chown -R atchess:atchess web/static
+          # Clean up temp directory
+          rm -rf /tmp/extract_static
           
           # Clean up temporary files
           rm -f /tmp/atchess-* /tmp/static.tar.gz
