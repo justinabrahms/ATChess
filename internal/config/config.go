@@ -47,6 +47,19 @@ func Load() (*Config, error) {
 	viper.AutomaticEnv()
 	viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
 	
+	// Also bind specific environment variables for compatibility
+	// This allows both ATCHESS_ prefixed and unprefixed versions
+	viper.BindEnv("server.host", "SERVER_HOST", "ATCHESS_SERVER_HOST")
+	viper.BindEnv("server.port", "SERVER_PORT", "ATCHESS_SERVER_PORT")
+	viper.BindEnv("atproto.pds_url", "ATPROTO_PDS_URL", "ATCHESS_ATPROTO_PDS_URL")
+	viper.BindEnv("atproto.handle", "ATPROTO_HANDLE", "ATCHESS_ATPROTO_HANDLE")
+	viper.BindEnv("atproto.password", "ATPROTO_PASSWORD", "ATCHESS_ATPROTO_PASSWORD")
+	viper.BindEnv("atproto.use_dpop", "ATPROTO_USE_DPOP", "ATCHESS_ATPROTO_USE_DPOP")
+	viper.BindEnv("development.debug", "DEVELOPMENT_DEBUG", "ATCHESS_DEVELOPMENT_DEBUG")
+	viper.BindEnv("development.log_level", "DEVELOPMENT_LOG_LEVEL", "ATCHESS_DEVELOPMENT_LOG_LEVEL")
+	viper.BindEnv("firehose.enabled", "FIREHOSE_ENABLED", "ATCHESS_FIREHOSE_ENABLED")
+	viper.BindEnv("firehose.url", "FIREHOSE_URL", "ATCHESS_FIREHOSE_URL")
+	
 	// Set defaults
 	viper.SetDefault("server.host", "localhost")
 	viper.SetDefault("server.port", 8080)
