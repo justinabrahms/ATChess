@@ -3,7 +3,7 @@
   "client_name": "ATChess",
   "client_name#en": "ATChess - Decentralized Chess",
   "client_uri": "https://atchess.abrah.ms",
-  "logo_uri": "https://atchess.abrah.ms/logo.png",
+  "logo_uri": "https://atchess.abrah.ms/logo.jpg",
   "tos_uri": "https://atchess.abrah.ms/terms",
   "policy_uri": "https://atchess.abrah.ms/privacy",
   "redirect_uris": ["https://atchess.abrah.ms/callback"],
