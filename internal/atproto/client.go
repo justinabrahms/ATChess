@@ -522,6 +522,37 @@ func (c *Client) GetHandle() string {
 	return c.handle
 }
 
+// ResolveHandle resolves a handle to a DID
+func (c *Client) ResolveHandle(ctx context.Context, handle string) (string, error) {
+	// If it's already a DID, return it
+	if strings.HasPrefix(handle, "did:") {
+		return handle, nil
+	}
+	
+	// Otherwise, resolve via com.atproto.identity.resolveHandle
+	url := fmt.Sprintf("%s/xrpc/com.atproto.identity.resolveHandle?handle=%s", c.pdsURL, handle)
+	
+	resp, err := c.makeRequest("GET", url, nil)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve handle: %w", err)
+	}
+	defer resp.Body.Close()
+	
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("failed to resolve handle: %s", string(body))
+	}
+	
+	var result struct {
+		DID string `json:"did"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", fmt.Errorf("failed to decode response: %w", err)
+	}
+	
+	return result.DID, nil
+}
+
 // CreateChallengeNotification creates a notification in the challenged player's repository
 func (c *Client) CreateChallengeNotification(ctx context.Context, challengedDID, challengeURI, challengeCID, challengerHandle, color, message string, timeControl map[string]interface{}) error {
 	// Calculate expiration time (24 hours from now)

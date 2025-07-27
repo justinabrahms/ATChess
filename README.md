@@ -74,11 +74,16 @@ make run-web        # Runs on port 8081
 ### 3. Play Chess
 
 1. Open http://localhost:8081 in your browser
-2. Create a new game with another player's DID
-3. Make moves on the interactive chessboard
-4. Games are automatically stored in the AT Protocol
+2. Log in with your Bluesky account:
+   - Use your Bluesky handle (e.g., yourname.bsky.social)
+   - Create an app password at https://bsky.app/settings/app-passwords
+3. Create games by challenging other Bluesky users
+4. Accept challenges from the inbox
+5. Play chess with real-time move synchronization
 
-**Note:** The PDS runs on HTTPS (https://localhost:3000) with self-signed certificates for security compliance. Your browser may show security warnings - this is expected for local development.
+**Using with Bluesky:** ATChess works with your existing Bluesky account. The protocol service needs to be configured with valid AT Protocol credentials (see Configuration section).
+
+**Local Development:** For testing with a local PDS, see the [Local PDS Setup Guide](docs/local-pds-setup.md).
 
 ## AT Protocol Integration
 
@@ -103,6 +108,37 @@ ATChess uses custom lexicons for storing chess data:
 - Color preferences
 - Time control proposals
 - Challenge status and expiration
+
+## Configuration
+
+### Protocol Service
+
+The protocol service requires AT Protocol credentials to function. Configure via environment variables or `config.yaml`:
+
+```bash
+# Environment variables (recommended for production)
+export ATPROTO_PDS_URL="https://bsky.social"
+export ATPROTO_HANDLE="your-bot.bsky.social"
+export ATPROTO_PASSWORD="xxxx-xxxx-xxxx-xxxx"  # App password from Bluesky
+export ATPROTO_USE_DPOP="true"                 # Enable DPoP authentication
+```
+
+Or create `config.yaml`:
+```yaml
+server:
+  host: 0.0.0.0
+  port: 8080
+
+atproto:
+  pds_url: "https://bsky.social"
+  handle: "your-bot.bsky.social"
+  password: "xxxx-xxxx-xxxx-xxxx"
+  use_dpop: true
+```
+
+### Web Service
+
+The web service serves the user interface and doesn't require AT Protocol credentials. Users log in with their own Bluesky accounts through the web interface.
 
 ## Development
 

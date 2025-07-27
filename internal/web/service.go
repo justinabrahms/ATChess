@@ -175,7 +175,19 @@ func (s *Service) CreateChallengeHandler(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	
-	challenge, err := s.client.CreateChallenge(context.Background(), req.OpponentDID, req.Color, req.Message)
+	// Resolve handle to DID if necessary
+	opponentDID := req.OpponentDID
+	if !strings.HasPrefix(opponentDID, "did:") {
+		resolvedDID, err := s.client.ResolveHandle(context.Background(), opponentDID)
+		if err != nil {
+			log.Error().Err(err).Str("handle", opponentDID).Msg("Failed to resolve handle")
+			http.Error(w, fmt.Sprintf("Failed to resolve handle '%s': %v", opponentDID, err), http.StatusBadRequest)
+			return
+		}
+		opponentDID = resolvedDID
+	}
+	
+	challenge, err := s.client.CreateChallenge(context.Background(), opponentDID, req.Color, req.Message)
 	if err != nil {
 		log.Error().Err(err).Msg("Failed to create challenge")
 		http.Error(w, "Failed to create challenge", http.StatusInternalServerError)
@@ -350,4 +362,73 @@ func (s *Service) GetTimeRemainingHandler(w http.ResponseWriter, r *http.Request
 	
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(response)
+}
+
+type AuthRequest struct {
+	Handle   string `json:"handle"`
+	Password string `json:"password"`
+}
+
+type AuthResponse struct {
+	Success     bool   `json:"success"`
+	DID         string `json:"did"`
+	Handle      string `json:"handle"`
+	AccessToken string `json:"accessToken"`
+	Error       string `json:"error,omitempty"`
+}
+
+func (s *Service) LoginHandler(w http.ResponseWriter, r *http.Request) {
+	var req AuthRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+	
+	// Validate input
+	if req.Handle == "" || req.Password == "" {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(AuthResponse{
+			Success: false,
+			Error:   "Handle and password are required",
+		})
+		return
+	}
+	
+	// Create a new AT Protocol client for this user
+	userClient, err := atproto.NewClientWithDPoP(
+		s.config.ATProto.PDSURL,
+		req.Handle,
+		req.Password,
+		s.config.ATProto.UseDPoP,
+	)
+	if err != nil {
+		log.Error().Err(err).Str("handle", req.Handle).Msg("Failed to authenticate user")
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(AuthResponse{
+			Success: false,
+			Error:   "Invalid credentials or authentication failed",
+		})
+		return
+	}
+	
+	// Return success with user info
+	// Note: In production, you'd want to create a session token instead of returning the raw JWT
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(AuthResponse{
+		Success:     true,
+		DID:         userClient.GetDID(),
+		Handle:      userClient.GetHandle(),
+		AccessToken: "session_" + base64.URLEncoding.EncodeToString([]byte(userClient.GetDID())),
+	})
+}
+
+func (s *Service) GetCurrentUserHandler(w http.ResponseWriter, r *http.Request) {
+	// For now, return the service's configured user
+	// In a real implementation, this would validate the session token
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"did":    s.client.GetDID(),
+		"handle": s.client.GetHandle(),
+		"authenticated": true,
+	})
 }

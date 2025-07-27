@@ -104,6 +104,8 @@ func main() {
 	// API routes
 	api := router.PathPrefix("/api").Subrouter()
 	api.HandleFunc("/health", service.HealthHandler).Methods("GET")
+	api.HandleFunc("/auth/login", service.LoginHandler).Methods("POST")
+	api.HandleFunc("/auth/current", service.GetCurrentUserHandler).Methods("GET")
 	api.HandleFunc("/games", service.CreateGameHandler).Methods("POST")
 	api.HandleFunc("/games/{id:.*}", service.GetGameHandler).Methods("GET")
 	api.HandleFunc("/moves", service.MakeMoveHandler).Methods("POST")
@@ -130,6 +132,12 @@ func main() {
 	api.HandleFunc("/ws", service.WebSocketHandler(hub))
 	
 	// Explicit OPTIONS handlers for CORS preflight requests
+	api.HandleFunc("/auth/login", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}).Methods("OPTIONS")
+	api.HandleFunc("/auth/current", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}).Methods("OPTIONS")
 	api.HandleFunc("/games", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}).Methods("OPTIONS")

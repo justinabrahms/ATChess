@@ -3,1893 +3,1237 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ATChess - Decentralized Chess</title>
+    <title>ATChess - Decentralized Chess on AT Protocol</title>
     <style>
-        body {
-            font-family: Arial, sans-serif;
+        * {
             margin: 0;
-            padding: 20px;
-            background-color: #f0f0f0;
+            padding: 0;
+            box-sizing: border-box;
         }
-        .container {
-            max-width: 1200px;
-            margin: 0 auto;
-            background: white;
-            padding: 20px;
-            border-radius: 8px;
+        
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            background-color: #f5f5f5;
+            color: #333;
+            line-height: 1.6;
+        }
+        
+        /* Header Styles */
+        .header {
+            background: #2c3e50;
+            color: white;
+            padding: 1rem 0;
             box-shadow: 0 2px 4px rgba(0,0,0,0.1);
         }
-        h1 {
-            color: #333;
-            text-align: center;
+        
+        .header-content {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 0 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
         }
+        
+        .logo {
+            font-size: 1.5rem;
+            font-weight: bold;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .logo .chess-icon {
+            font-size: 2rem;
+        }
+        
+        .user-info {
+            display: flex;
+            align-items: center;
+            gap: 20px;
+        }
+        
+        .user-handle {
+            font-weight: 500;
+        }
+        
+        .btn-logout {
+            background: #e74c3c;
+            color: white;
+            border: none;
+            padding: 0.5rem 1rem;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            transition: background 0.3s ease;
+        }
+        
+        .btn-logout:hover {
+            background: #c0392b;
+        }
+        
+        /* Auth Container */
+        .auth-container {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            min-height: calc(100vh - 60px);
+            padding: 20px;
+        }
+        
+        .auth-card {
+            background: white;
+            padding: 2rem;
+            border-radius: 8px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+            width: 100%;
+            max-width: 400px;
+        }
+        
+        .auth-card h2 {
+            text-align: center;
+            margin-bottom: 1.5rem;
+            color: #2c3e50;
+        }
+        
+        .form-group {
+            margin-bottom: 1rem;
+        }
+        
+        .form-group label {
+            display: block;
+            margin-bottom: 0.5rem;
+            font-weight: 500;
+            color: #555;
+        }
+        
+        .form-group input {
+            width: 100%;
+            padding: 0.75rem;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 1rem;
+            transition: border-color 0.3s ease;
+        }
+        
+        .form-group input:focus {
+            outline: none;
+            border-color: #3498db;
+        }
+        
+        .btn-primary {
+            width: 100%;
+            padding: 0.75rem;
+            background: #3498db;
+            color: white;
+            border: none;
+            border-radius: 4px;
+            font-size: 1rem;
+            font-weight: 500;
+            cursor: pointer;
+            transition: background 0.3s ease;
+        }
+        
+        .btn-primary:hover {
+            background: #2980b9;
+        }
+        
+        .btn-primary:disabled {
+            background: #95a5a6;
+            cursor: not-allowed;
+        }
+        
+        .auth-message {
+            margin-top: 1rem;
+            padding: 0.75rem;
+            border-radius: 4px;
+            text-align: center;
+            font-size: 14px;
+        }
+        
+        .auth-message.error {
+            background: #fee;
+            color: #c33;
+            border: 1px solid #fcc;
+        }
+        
+        .auth-message.info {
+            background: #e3f2fd;
+            color: #1976d2;
+            border: 1px solid #bbdefb;
+        }
+        
+        .auth-help {
+            margin-top: 1.5rem;
+            padding-top: 1.5rem;
+            border-top: 1px solid #eee;
+            text-align: center;
+            font-size: 14px;
+            color: #666;
+        }
+        
+        .auth-help a {
+            color: #3498db;
+            text-decoration: none;
+        }
+        
+        .auth-help a:hover {
+            text-decoration: underline;
+        }
+        
+        /* Main Container */
+        .main-container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            display: none;
+        }
+        
+        .game-area {
+            display: grid;
+            grid-template-columns: 1fr 350px;
+            gap: 20px;
+            margin-top: 20px;
+        }
+        
+        @media (max-width: 768px) {
+            .game-area {
+                grid-template-columns: 1fr;
+            }
+        }
+        
+        /* Game Board Styles */
+        .board-section {
+            background: white;
+            border-radius: 8px;
+            padding: 20px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        
         .board-container {
             display: flex;
             justify-content: center;
             margin: 20px 0;
         }
+        
         .chessboard {
             display: grid;
             grid-template-columns: repeat(8, 60px);
             grid-template-rows: repeat(8, 60px);
-            border: 2px solid #333;
-            background: #fff;
+            border: 2px solid #2c3e50;
+            box-shadow: 0 4px 8px rgba(0,0,0,0.2);
         }
+        
         .square {
             width: 60px;
             height: 60px;
             display: flex;
             align-items: center;
             justify-content: center;
-            font-size: 36px;
+            font-size: 40px;
             cursor: pointer;
+            transition: all 0.2s ease;
             position: relative;
-            transition: background-color 0.2s ease, box-shadow 0.2s ease;
         }
-        .square:hover {
-            opacity: 0.9;
-        }
+        
         .square.light {
             background-color: #f0d9b5;
         }
+        
         .square.dark {
             background-color: #b58863;
         }
+        
         .square.selected {
             background-color: #ffeb3b !important;
-            box-shadow: inset 0 0 0 3px #ff9800, 0 0 0 2px #ff6f00;
-            transform: scale(1.05);
+            box-shadow: inset 0 0 0 3px #ff9800;
         }
-        .square.highlight {
-            background-color: #7fc97f;
-        }
-        .square.possible-move {
-            background-color: rgba(124, 179, 66, 0.3) !important;
-        }
-        .square.possible-move:after {
+        
+        .square.possible-move::after {
             content: '';
             position: absolute;
-            top: 50%;
-            left: 50%;
             width: 20px;
             height: 20px;
-            background-color: rgba(124, 179, 66, 0.6);
+            background: rgba(124, 179, 66, 0.6);
             border-radius: 50%;
-            transform: translate(-50%, -50%);
-        }
-        .controls {
-            text-align: center;
-            margin: 20px 0;
-        }
-        button {
-            padding: 10px 20px;
-            margin: 0 10px;
-            background: #4CAF50;
-            color: white;
-            border: none;
-            border-radius: 4px;
-            cursor: pointer;
-        }
-        button:hover {
-            background: #45a049;
-        }
-        button:disabled {
-            background: #cccccc;
-            cursor: not-allowed;
         }
         
-        /* Game action buttons */
-        .game-actions {
-            display: flex;
-            gap: 10px;
-            justify-content: center;
-            margin: 15px 0;
-        }
-        
-        .btn-draw {
-            background: #2196F3;
-        }
-        
-        .btn-draw:hover {
-            background: #0b7dda;
-        }
-        
-        .btn-resign {
-            background: #f44336;
-        }
-        
-        .btn-resign:hover {
-            background: #da190b;
-        }
-        
-        /* Draw offer notification */
-        .draw-offer-prompt {
-            position: fixed;
-            top: 50%;
-            left: 50%;
-            transform: translate(-50%, -50%);
-            background: white;
-            padding: 20px;
-            border-radius: 8px;
-            box-shadow: 0 4px 12px rgba(0,0,0,0.3);
-            z-index: 1001;
-            text-align: center;
-            min-width: 300px;
-        }
-        
-        .draw-offer-prompt h3 {
-            margin: 0 0 15px 0;
-            color: #333;
-        }
-        
-        .draw-offer-prompt .draw-actions {
-            display: flex;
-            gap: 10px;
-            justify-content: center;
-            margin-top: 15px;
-        }
-        
-        .draw-offer-prompt button {
-            flex: 1;
-        }
-        
-        /* Confirmation dialog */
-        .confirmation-dialog {
-            position: fixed;
-            top: 50%;
-            left: 50%;
-            transform: translate(-50%, -50%);
-            background: white;
-            padding: 20px;
-            border-radius: 8px;
-            box-shadow: 0 4px 12px rgba(0,0,0,0.3);
-            z-index: 1001;
-            text-align: center;
-            min-width: 300px;
-        }
-        
-        .confirmation-dialog h3 {
-            margin: 0 0 10px 0;
-            color: #333;
-        }
-        
-        .confirmation-dialog p {
-            margin: 0 0 20px 0;
-            color: #666;
-        }
-        
-        .confirmation-dialog .dialog-actions {
-            display: flex;
-            gap: 10px;
-            justify-content: center;
-        }
-        
-        .confirmation-dialog button {
-            flex: 1;
-        }
-        
-        /* Overlay for dialogs */
-        .dialog-overlay {
-            position: fixed;
-            top: 0;
-            left: 0;
-            right: 0;
-            bottom: 0;
-            background: rgba(0, 0, 0, 0.5);
-            z-index: 1000;
-        }
-        .game-info {
-            margin: 20px 0;
-            padding: 15px;
-            background: #f9f9f9;
-            border-radius: 4px;
-        }
-        .form-group {
-            margin: 10px 0;
-        }
-        label {
-            display: block;
-            margin-bottom: 5px;
-            font-weight: bold;
-        }
-        input, select {
+        .square.possible-capture::after {
+            content: '';
+            position: absolute;
             width: 100%;
-            padding: 8px;
-            border: 1px solid #ddd;
-            border-radius: 4px;
+            height: 100%;
+            border: 3px solid rgba(220, 38, 127, 0.8);
+            border-radius: 50%;
         }
-        .status {
-            text-align: center;
+        
+        /* Sidebar Styles */
+        .sidebar {
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+        
+        .sidebar-card {
+            background: white;
+            border-radius: 8px;
+            padding: 20px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        
+        .sidebar-card h3 {
+            margin-bottom: 15px;
+            color: #2c3e50;
+            font-size: 1.1rem;
+        }
+        
+        /* Game Info */
+        .game-status {
             padding: 10px;
-            margin: 10px 0;
             border-radius: 4px;
+            text-align: center;
+            font-weight: 500;
+            margin-bottom: 15px;
         }
-        .status.info {
+        
+        .game-status.active {
             background: #d4edda;
             color: #155724;
         }
-        .status.error {
+        
+        .game-status.waiting {
+            background: #fff3cd;
+            color: #856404;
+        }
+        
+        .game-status.ended {
             background: #f8d7da;
             color: #721c24;
         }
         
-        /* Time control display */
-        .time-control-info {
-            margin: 10px 0;
-            padding: 10px;
-            background: #f0f0f0;
-            border-radius: 6px;
-            display: none;
-        }
-        
-        .time-control-info.active {
-            display: block;
-        }
-        
-        .time-remaining {
-            font-size: 18px;
-            font-weight: bold;
-            color: #333;
+        .game-info-row {
             display: flex;
-            align-items: center;
+            justify-content: space-between;
+            margin-bottom: 10px;
+            font-size: 14px;
+        }
+        
+        .game-info-label {
+            color: #666;
+        }
+        
+        .game-info-value {
+            font-weight: 500;
+        }
+        
+        /* Game Actions */
+        .game-actions {
+            display: flex;
             gap: 10px;
+            margin-top: 15px;
         }
         
-        .time-remaining.low-time {
-            color: #d32f2f;
-            animation: pulse 1s infinite;
-        }
-        
-        .time-remaining.very-low-time {
-            color: #b71c1c;
-            animation: pulse 0.5s infinite;
-        }
-        
-        @keyframes pulse {
-            0% { opacity: 1; }
-            50% { opacity: 0.7; }
-            100% { opacity: 1; }
-        }
-        
-        .claim-time-btn {
-            background: #ff5722;
-            color: white;
-            padding: 8px 16px;
+        .game-actions button {
+            flex: 1;
+            padding: 0.75rem;
             border: none;
             border-radius: 4px;
+            font-size: 14px;
+            font-weight: 500;
             cursor: pointer;
-            font-size: 14px;
-            margin-top: 10px;
-        }
-        
-        .claim-time-btn:hover {
-            background: #e64a19;
-        }
-        
-        .time-control-type {
-            font-size: 14px;
-            color: #666;
-            margin-bottom: 5px;
-        }
-        
-        /* Challenge Inbox Styles */
-        .challenge-inbox {
-            position: fixed;
-            right: 20px;
-            top: 20px;
-            width: 350px;
-            max-height: 500px;
-            background: white;
-            border-radius: 8px;
-            box-shadow: 0 4px 8px rgba(0,0,0,0.2);
-            overflow: hidden;
             transition: all 0.3s ease;
         }
         
-        .challenge-inbox.collapsed {
-            height: 50px;
+        .btn-draw {
+            background: #3498db;
+            color: white;
         }
         
-        .challenge-inbox-header {
-            background: #4CAF50;
+        .btn-draw:hover {
+            background: #2980b9;
+        }
+        
+        .btn-resign {
+            background: #e74c3c;
             color: white;
-            padding: 12px 15px;
+        }
+        
+        .btn-resign:hover {
+            background: #c0392b;
+        }
+        
+        /* Create Game Form */
+        .create-game-form {
+            display: flex;
+            flex-direction: column;
+            gap: 15px;
+        }
+        
+        .input-group {
+            display: flex;
+            flex-direction: column;
+            gap: 5px;
+        }
+        
+        .input-group label {
+            font-size: 14px;
+            color: #666;
+            font-weight: 500;
+        }
+        
+        .input-group input,
+        .input-group select {
+            padding: 0.75rem;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 14px;
+        }
+        
+        .btn-create-game {
+            background: #27ae60;
+            color: white;
+            padding: 0.75rem;
+            border: none;
+            border-radius: 4px;
+            font-weight: 500;
             cursor: pointer;
+            transition: background 0.3s ease;
+        }
+        
+        .btn-create-game:hover {
+            background: #229954;
+        }
+        
+        /* Active Games List */
+        .games-list {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            max-height: 300px;
+            overflow-y: auto;
+        }
+        
+        .game-item {
+            padding: 10px;
+            border: 1px solid #e0e0e0;
+            border-radius: 4px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+        }
+        
+        .game-item:hover {
+            background: #f5f5f5;
+            border-color: #3498db;
+        }
+        
+        .game-item-header {
             display: flex;
             justify-content: space-between;
-            align-items: center;
+            margin-bottom: 5px;
         }
         
-        .challenge-inbox-header h3 {
-            margin: 0;
-            font-size: 16px;
-            display: flex;
-            align-items: center;
-            gap: 8px;
+        .game-item-players {
+            font-weight: 500;
+            font-size: 14px;
         }
         
-        .challenge-count {
-            background: #ff9800;
-            color: white;
-            border-radius: 50%;
-            width: 22px;
-            height: 22px;
-            display: inline-flex;
-            align-items: center;
-            justify-content: center;
+        .game-item-status {
             font-size: 12px;
-            font-weight: bold;
+            padding: 2px 8px;
+            border-radius: 12px;
+            background: #e0e0e0;
         }
         
-        .challenge-inbox-body {
-            max-height: 450px;
-            overflow-y: auto;
-            padding: 10px;
+        .game-item-status.your-turn {
+            background: #4caf50;
+            color: white;
         }
         
+        .game-item-details {
+            font-size: 12px;
+            color: #666;
+        }
+        
+        /* Challenge Inbox */
         .challenge-item {
-            border: 1px solid #e0e0e0;
-            border-radius: 6px;
             padding: 12px;
+            border: 1px solid #e0e0e0;
+            border-radius: 4px;
             margin-bottom: 10px;
             background: #f9f9f9;
-            transition: all 0.2s ease;
-        }
-        
-        .challenge-item:hover {
-            background: #f0f0f0;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
         }
         
         .challenge-from {
-            font-weight: bold;
-            color: #333;
+            font-weight: 500;
             margin-bottom: 5px;
         }
         
         .challenge-details {
             font-size: 14px;
             color: #666;
-            margin-bottom: 8px;
-        }
-        
-        .challenge-message {
-            font-style: italic;
-            color: #555;
-            margin: 8px 0;
-            padding: 8px;
-            background: white;
-            border-radius: 4px;
+            margin-bottom: 10px;
         }
         
         .challenge-actions {
             display: flex;
             gap: 10px;
-            margin-top: 10px;
         }
         
         .challenge-actions button {
             flex: 1;
-            padding: 8px 16px;
+            padding: 0.5rem;
+            border: none;
+            border-radius: 4px;
             font-size: 14px;
+            cursor: pointer;
+            transition: all 0.3s ease;
         }
         
         .btn-accept {
-            background: #4CAF50;
+            background: #27ae60;
+            color: white;
         }
         
         .btn-accept:hover {
-            background: #45a049;
+            background: #229954;
         }
         
         .btn-decline {
-            background: #f44336;
+            background: #e74c3c;
+            color: white;
         }
         
         .btn-decline:hover {
-            background: #da190b;
+            background: #c0392b;
         }
         
-        .no-challenges {
+        .no-items {
             text-align: center;
             color: #999;
             padding: 20px;
             font-style: italic;
-        }
-        
-        .toggle-arrow {
-            transition: transform 0.3s ease;
-        }
-        
-        .challenge-inbox.collapsed .toggle-arrow {
-            transform: rotate(180deg);
-        }
-        
-        .challenge-inbox.collapsed .challenge-inbox-body {
-            display: none;
-        }
-        
-        /* Connection status indicator */
-        .connection-status {
-            position: fixed;
-            bottom: 20px;
-            right: 20px;
-            padding: 8px 16px;
-            border-radius: 20px;
             font-size: 14px;
-            display: flex;
-            align-items: center;
-            gap: 8px;
-            background: white;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-            transition: all 0.3s ease;
         }
         
-        .connection-status.connected {
-            background: #d4edda;
-            color: #155724;
-        }
-        
-        .connection-status.disconnected {
-            background: #f8d7da;
-            color: #721c24;
-        }
-        
-        .connection-status.connecting {
-            background: #fff3cd;
-            color: #856404;
-        }
-        
-        .connection-status .status-dot {
-            width: 8px;
-            height: 8px;
+        /* Loading Spinner */
+        .loading {
+            display: inline-block;
+            width: 20px;
+            height: 20px;
+            border: 3px solid #f3f3f3;
+            border-top: 3px solid #3498db;
             border-radius: 50%;
-            background: currentColor;
-            animation: pulse 2s infinite;
+            animation: spin 1s linear infinite;
         }
         
-        @keyframes pulse {
-            0% { opacity: 1; }
-            50% { opacity: 0.5; }
-            100% { opacity: 1; }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
         }
         
-        /* Notification styles */
-        .notification {
-            position: fixed;
-            top: 20px;
-            left: 50%;
-            transform: translateX(-50%);
-            padding: 12px 24px;
-            border-radius: 4px;
-            background: #333;
-            color: white;
-            font-size: 14px;
-            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
-            z-index: 1000;
-            animation: slideDown 0.3s ease;
-        }
-        
-        @keyframes slideDown {
-            from {
-                transform: translateX(-50%) translateY(-100%);
-                opacity: 0;
-            }
-            to {
-                transform: translateX(-50%) translateY(0);
-                opacity: 1;
-            }
-        }
-        
-        .notification.draw-offer {
-            background: #ff9800;
-        }
-        
-        .notification.resignation {
-            background: #f44336;
-        }
-        
-        /* Responsive adjustments */
+        /* Responsive */
         @media (max-width: 768px) {
-            .challenge-inbox {
-                position: static;
-                width: 100%;
-                margin-bottom: 20px;
-                max-height: 300px;
+            .chessboard {
+                grid-template-columns: repeat(8, 45px);
+                grid-template-rows: repeat(8, 45px);
             }
             
-            .container {
-                margin-top: 0;
-            }
-            
-            .connection-status {
-                bottom: 10px;
-                right: 10px;
-                font-size: 12px;
-                padding: 6px 12px;
+            .square {
+                width: 45px;
+                height: 45px;
+                font-size: 30px;
             }
         }
     </style>
 </head>
 <body>
-    <!-- Challenge Inbox -->
-    <div class="challenge-inbox" id="challengeInbox">
-        <div class="challenge-inbox-header" onclick="toggleChallengeInbox()">
-            <h3>
-                Challenge Inbox
-                <span class="challenge-count" id="challengeCount" style="display: none;">0</span>
-            </h3>
-            <span class="toggle-arrow">▼</span>
+    <!-- Header -->
+    <header class="header">
+        <div class="header-content">
+            <div class="logo">
+                <span class="chess-icon">♔</span>
+                <span>ATChess</span>
+            </div>
+            <div class="user-info" id="userInfo" style="display: none;">
+                <span class="user-handle" id="userHandle"></span>
+                <button class="btn-logout" onclick="logout()">Logout</button>
+            </div>
         </div>
-        <div class="challenge-inbox-body" id="challengeInboxBody">
-            <div class="no-challenges">No pending challenges</div>
+    </header>
+
+    <!-- Auth Container -->
+    <div class="auth-container" id="authContainer">
+        <div class="auth-card">
+            <h2>Welcome to ATChess</h2>
+            <form id="loginForm" onsubmit="handleLogin(event)">
+                <div class="form-group">
+                    <label for="handle">Bluesky Handle</label>
+                    <input 
+                        type="text" 
+                        id="handle" 
+                        name="handle" 
+                        placeholder="yourname.bsky.social"
+                        required
+                    />
+                </div>
+                <div class="form-group">
+                    <label for="password">App Password</label>
+                    <input 
+                        type="password" 
+                        id="password" 
+                        name="password" 
+                        placeholder="xxxx-xxxx-xxxx-xxxx"
+                        required
+                    />
+                </div>
+                <button type="submit" class="btn-primary" id="loginBtn">
+                    Login with Bluesky
+                </button>
+            </form>
+            <div id="authMessage"></div>
+            <div class="auth-help">
+                <p>Need an app password?</p>
+                <p><a href="https://bsky.app/settings/app-passwords" target="_blank">Create one in Bluesky Settings</a></p>
+            </div>
         </div>
     </div>
-    
-    <div class="container">
-        <h1>ATChess</h1>
-        <p style="text-align: center;">Decentralized Chess on the AT Protocol</p>
-        
-        <!-- Connection Status Indicator -->
-        <div class="connection-status disconnected" id="connectionStatus" style="display: none;">
-            <span class="status-dot"></span>
-            <span class="status-text">Disconnected</span>
-        </div>
-        
-        <div class="game-info">
-            <h3>Game Status</h3>
-            <div id="status" class="status info">Ready to play</div>
-            <div>
-                <strong>Current Player:</strong> <span id="currentPlayer">White</span>
-            </div>
-            <div>
-                <strong>FEN:</strong> <span id="fenDisplay">rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1</span>
-            </div>
-            
-            <!-- Time Control Display -->
-            <div class="time-control-info" id="timeControlInfo">
-                <div class="time-control-type" id="timeControlType">Correspondence Game</div>
-                <div class="time-remaining" id="timeRemaining">
-                    <span>⏱️ Time remaining:</span>
-                    <span id="timeRemainingValue">--</span>
+
+    <!-- Main Container -->
+    <div class="main-container" id="mainContainer">
+        <div class="game-area">
+            <!-- Chess Board Section -->
+            <div class="board-section">
+                <div class="board-container">
+                    <div class="chessboard" id="chessboard"></div>
                 </div>
-                <button class="claim-time-btn" id="claimTimeBtn" style="display: none;">Claim Time Victory</button>
             </div>
-        </div>
-        
-        <div class="board-container">
-            <div class="chessboard" id="chessboard"></div>
-        </div>
-        
-        <div class="controls">
-            <button id="newGameBtn">New Game</button>
-            <button id="resetBtn">Reset Board</button>
-            <button id="shareGameBtn" style="display: none;">Share Game</button>
-        </div>
-        
-        <div class="game-actions" id="gameActions" style="display: none;">
-            <button id="offerDrawBtn" class="btn-draw">Offer Draw</button>
-            <button id="resignBtn" class="btn-resign">Resign</button>
-        </div>
-        
-        <div class="game-info">
-            <h3>Create New Game</h3>
-            <div style="background: #e6f3ff; padding: 10px; border-radius: 4px; margin-bottom: 15px; font-size: 14px;">
-                <strong>Note:</strong> You are currently logged in as <strong>Player 1</strong> (player1.test).<br>
-                To play against someone else, use <strong>Player 2</strong> as opponent.
+
+            <!-- Sidebar -->
+            <div class="sidebar">
+                <!-- Game Info -->
+                <div class="sidebar-card">
+                    <h3>Game Info</h3>
+                    <div class="game-status active" id="gameStatus">Ready to play</div>
+                    <div class="game-info-row">
+                        <span class="game-info-label">Current Turn:</span>
+                        <span class="game-info-value" id="currentTurn">-</span>
+                    </div>
+                    <div class="game-info-row">
+                        <span class="game-info-label">Playing as:</span>
+                        <span class="game-info-value" id="playingAs">-</span>
+                    </div>
+                    <div class="game-info-row">
+                        <span class="game-info-label">Opponent:</span>
+                        <span class="game-info-value" id="opponent">-</span>
+                    </div>
+                    <div class="game-actions" id="gameActions" style="display: none;">
+                        <button class="btn-draw" onclick="offerDraw()">Offer Draw</button>
+                        <button class="btn-resign" onclick="resignGame()">Resign</button>
+                    </div>
+                </div>
+
+                <!-- Create New Game -->
+                <div class="sidebar-card">
+                    <h3>Create New Game</h3>
+                    <form class="create-game-form" onsubmit="createGame(event)">
+                        <div class="input-group">
+                            <label for="opponentHandle">Opponent's Handle</label>
+                            <input 
+                                type="text" 
+                                id="opponentHandle" 
+                                placeholder="opponent.bsky.social"
+                                required
+                            />
+                        </div>
+                        <div class="input-group">
+                            <label for="colorChoice">Play as</label>
+                            <select id="colorChoice">
+                                <option value="random">Random</option>
+                                <option value="white">White</option>
+                                <option value="black">Black</option>
+                            </select>
+                        </div>
+                        <button type="submit" class="btn-create-game">Create Game</button>
+                    </form>
+                </div>
+
+                <!-- Active Games -->
+                <div class="sidebar-card">
+                    <h3>Your Games</h3>
+                    <div class="games-list" id="gamesList">
+                        <div class="no-items">No active games</div>
+                    </div>
+                </div>
+
+                <!-- Challenge Inbox -->
+                <div class="sidebar-card">
+                    <h3>Challenges</h3>
+                    <div id="challengesList">
+                        <div class="no-items">No pending challenges</div>
+                    </div>
+                </div>
             </div>
-            <div class="form-group">
-                <label for="opponentDID">Opponent DID:</label>
-                <input type="text" id="opponentDID" placeholder="did:plc:example123...">
-                <small style="color: #666; font-size: 12px;">
-                    Test DIDs: 
-                    <a href="#" onclick="document.getElementById('opponentDID').value='did:plc:styupz2ghvg7hrq4optipm7s'; return false;">Player 1</a> | 
-                    <a href="#" onclick="document.getElementById('opponentDID').value='did:plc:yguha7jixn3rlblla2pzbmwl'; return false;">Player 2</a>
-                </small>
-            </div>
-            <div class="form-group">
-                <label for="colorChoice">Your Color:</label>
-                <select id="colorChoice">
-                    <option value="white">White</option>
-                    <option value="black">Black</option>
-                    <option value="random">Random</option>
-                </select>
-            </div>
-            <button id="createGameBtn">Create Game</button>
         </div>
     </div>
 
     <script>
-        class ChessUI {
-            constructor() {
-                this.board = null;
-                this.selectedSquare = null;
-                this.currentFEN = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
-                this.currentPlayer = 'white';
-                this.gameId = null;
-                this.challenges = [];
-                this.ws = null;
-                this.wsReconnectInterval = null;
-                this.wsReconnectDelay = 1000;
-                this.wsMaxReconnectDelay = 30000;
-                this.wsPingInterval = null;
-                this.pendingDrawOffer = false;
-                this.gameActive = true;
-                this.isMyTurn = true;
-                this.timeControlData = null;
-                this.timeUpdateInterval = null;
-                this.timeCheckInterval = null;
-                
-                this.initializeBoard();
-                this.setupEventListeners();
-                this.updateBoardFromFEN();
-                this.loadGameFromUrl();
-                this.loadChallenges();
-                
-                // Refresh challenges every 30 seconds
-                setInterval(() => this.loadChallenges(), 30000);
+        // Global state
+        let currentUser = null;
+        let currentGame = null;
+        let selectedSquare = null;
+        let currentFEN = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
+        let ws = null;
+        
+        // Initialize the app
+        function init() {
+            // Check if user is logged in
+            const savedAuth = localStorage.getItem('atchess_auth');
+            if (savedAuth) {
+                const auth = JSON.parse(savedAuth);
+                currentUser = auth;
+                showMainInterface();
+            } else {
+                showAuthInterface();
             }
+        }
+        
+        // Show auth interface
+        function showAuthInterface() {
+            document.getElementById('authContainer').style.display = 'flex';
+            document.getElementById('mainContainer').style.display = 'none';
+            document.getElementById('userInfo').style.display = 'none';
+        }
+        
+        // Show main interface
+        function showMainInterface() {
+            document.getElementById('authContainer').style.display = 'none';
+            document.getElementById('mainContainer').style.display = 'block';
+            document.getElementById('userInfo').style.display = 'flex';
+            document.getElementById('userHandle').textContent = '@' + currentUser.handle;
             
-            initializeBoard() {
-                const board = document.getElementById('chessboard');
-                board.innerHTML = '';
-                
-                // Create squares (a8 to h1)
-                for (let rank = 8; rank >= 1; rank--) {
-                    for (let file = 0; file < 8; file++) {
-                        const square = document.createElement('div');
-                        const fileName = String.fromCharCode(97 + file); // a-h
-                        const squareName = fileName + rank;
-                        
-                        square.className = 'square ' + ((rank + file) % 2 === 0 ? 'dark' : 'light');
-                        square.dataset.square = squareName;
-                        square.addEventListener('click', (e) => this.handleSquareClick(e));
-                        
-                        board.appendChild(square);
-                    }
-                }
+            initializeBoard();
+            loadActiveGames();
+            loadChallenges();
+            
+            // Check for game in URL
+            const urlParams = new URLSearchParams(window.location.search);
+            const gameId = urlParams.get('game');
+            if (gameId) {
+                loadGame(gameId);
             }
+        }
+        
+        // Handle login
+        async function handleLogin(event) {
+            event.preventDefault();
             
-            handleSquareClick(e) {
-                const square = e.target.dataset.square;
-                const hasPiece = e.target.textContent.trim() !== '';
-                
-                if (this.selectedSquare === null) {
-                    // Only select squares that have pieces
-                    if (hasPiece) {
-                        this.selectedSquare = square;
-                        e.target.classList.add('selected');
-                    }
-                } else if (this.selectedSquare === square) {
-                    // Deselect same square
-                    this.clearSelection();
-                } else {
-                    // Make move or select new piece
-                    if (hasPiece && this.isOwnPiece(e.target.textContent.trim())) {
-                        // If clicking on own piece, select it instead
-                        this.clearSelection();
-                        this.selectedSquare = square;
-                        e.target.classList.add('selected');
-                    } else {
-                        // Make move (to empty square or capture opponent piece)
-                        this.makeMove(this.selectedSquare, square);
-                        this.clearSelection();
-                    }
-                }
-            }
+            const handle = document.getElementById('handle').value;
+            const password = document.getElementById('password').value;
+            const loginBtn = document.getElementById('loginBtn');
+            const authMessage = document.getElementById('authMessage');
             
-            isOwnPiece(pieceSymbol) {
-                if (!pieceSymbol) return false;
-                
-                // White pieces are uppercase symbols: ♔♕♖♗♘♙
-                // Black pieces are lowercase symbols: ♚♛♜♝♞♟
-                const whitePieces = ['♔', '♕', '♖', '♗', '♘', '♙'];
-                const blackPieces = ['♚', '♛', '♜', '♝', '♞', '♟'];
-                
-                if (this.currentPlayer === 'white') {
-                    return whitePieces.includes(pieceSymbol);
-                } else {
-                    return blackPieces.includes(pieceSymbol);
-                }
-            }
+            // Show loading state
+            loginBtn.disabled = true;
+            loginBtn.innerHTML = '<span class="loading"></span> Logging in...';
+            authMessage.innerHTML = '';
             
-            clearSelection() {
-                if (this.selectedSquare) {
-                    const element = document.querySelector(`[data-square="${this.selectedSquare}"]`);
-                    if (element) {
-                        element.classList.remove('selected');
-                    }
-                    this.selectedSquare = null;
-                }
-                
-                // Clear all possible move highlights
-                document.querySelectorAll('.square.possible-move').forEach(square => {
-                    square.classList.remove('possible-move');
-                });
-            }
-            
-            async makeMove(from, to) {
-                try {
-                    console.log('Making move:', { from, to, gameId: this.gameId, currentFEN: this.currentFEN });
-                    
-                    // If no game ID, create a game first (auto-create for local games)
-                    if (!this.gameId) {
-                        console.log('No game ID found, creating a new game automatically');
-                        await this.createAutoGame();
-                    }
-                    
-                    const response = await fetch(`http://localhost:8080/api/moves`, {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json',
-                        },
-                        body: JSON.stringify({
-                            from: from,
-                            to: to,
-                            fen: this.currentFEN,
-                            game_id: this.gameId
-                        })
-                    });
-                    
-                    if (!response.ok) {
-                        const error = await response.text();
-                        throw new Error(error);
-                    }
-                    
-                    const result = await response.json();
-                    console.log('Move result:', result);
-                    
-                    if (!result.fen) {
-                        throw new Error('No FEN in response: ' + JSON.stringify(result));
-                    }
-                    
-                    this.currentFEN = result.fen;
-                    this.updateBoardFromFEN();
-                    this.updateStatus(`Move: ${result.san || 'Unknown'}`);
-                    
-                    // Update current player
-                    this.currentPlayer = this.currentPlayer === 'white' ? 'black' : 'white';
-                    document.getElementById('currentPlayer').textContent = 
-                        this.currentPlayer.charAt(0).toUpperCase() + this.currentPlayer.slice(1);
-                    
-                    // Update turn status
-                    this.isMyTurn = false;
-                    this.updateGameActionButtons();
-                    
-                    // Update time control display
-                    if (this.timeControlData) {
-                        this.updateTimeRemaining();
-                    }
-                    
-                    // Update URL to persist game state after moves
-                    if (this.gameId) {
-                        const gameSlug = this.encodeGameId(this.gameId);
-                        const newUrl = window.location.origin + window.location.pathname + '?game=' + gameSlug;
-                        window.history.replaceState({gameId: this.gameId}, `ATChess - Game ${gameSlug}`, newUrl);
-                        console.log('Updated URL to persist game state:', newUrl);
-                    }
-                    
-                    if (result.checkmate) {
-                        this.updateStatus('Checkmate!', 'error');
-                        this.gameActive = false;
-                        this.updateGameActionButtons();
-                        this.stopTimeUpdates();
-                    } else if (result.check) {
-                        this.updateStatus('Check!', 'error');
-                    } else if (result.draw) {
-                        this.updateStatus('Draw!', 'error');
-                        this.gameActive = false;
-                        this.updateGameActionButtons();
-                        this.stopTimeUpdates();
-                    }
-                    
-                } catch (error) {
-                    this.updateStatus(`Error: ${error.message}`, 'error');
-                }
-            }
-            
-            updateBoardFromFEN() {
-                const pieces = this.parseFEN(this.currentFEN);
-                const squares = document.querySelectorAll('.square');
-                
-                squares.forEach(square => {
-                    const squareName = square.dataset.square;
-                    const piece = pieces[squareName];
-                    square.textContent = piece ? this.getPieceSymbol(piece) : '';
+            try {
+                const response = await fetch('http://localhost:8080/api/auth/login', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ handle, password })
                 });
                 
-                document.getElementById('fenDisplay').textContent = this.currentFEN;
-            }
-            
-            parseFEN(fen) {
-                if (!fen || typeof fen !== 'string') {
-                    console.error('Invalid FEN provided to parseFEN:', fen);
-                    return {};
-                }
+                const data = await response.json();
                 
-                const pieces = {};
-                const fenParts = fen.split(' ');
-                if (fenParts.length < 1) {
-                    console.error('Invalid FEN format:', fen);
-                    return {};
-                }
-                
-                const [boardStr] = fenParts;
-                const ranks = boardStr.split('/');
-                
-                if (ranks.length !== 8) {
-                    console.error('Invalid FEN board format:', boardStr);
-                    return {};
-                }
-                
-                for (let rankIndex = 0; rankIndex < 8; rankIndex++) {
-                    const rank = 8 - rankIndex;
-                    let fileIndex = 0;
+                if (data.success) {
+                    // Save auth data
+                    currentUser = {
+                        did: data.did,
+                        handle: data.handle,
+                        accessToken: data.accessToken
+                    };
+                    localStorage.setItem('atchess_auth', JSON.stringify(currentUser));
                     
-                    for (const char of ranks[rankIndex]) {
-                        if (char >= '1' && char <= '8') {
-                            fileIndex += parseInt(char);
-                        } else {
-                            const file = String.fromCharCode(97 + fileIndex);
-                            pieces[file + rank] = char;
-                            fileIndex++;
-                        }
-                    }
-                }
-                
-                return pieces;
-            }
-            
-            getPieceSymbol(piece) {
-                const symbols = {
-                    'K': '♔', 'Q': '♕', 'R': '♖', 'B': '♗', 'N': '♘', 'P': '♙',
-                    'k': '♚', 'q': '♛', 'r': '♜', 'b': '♝', 'n': '♞', 'p': '♟'
-                };
-                return symbols[piece] || piece;
-            }
-            
-            updateStatus(message, type = 'info') {
-                const status = document.getElementById('status');
-                status.textContent = message;
-                status.className = `status ${type}`;
-            }
-            
-            setupEventListeners() {
-                document.getElementById('newGameBtn').addEventListener('click', () => this.newGame());
-                document.getElementById('resetBtn').addEventListener('click', () => this.resetBoard());
-                document.getElementById('createGameBtn').addEventListener('click', () => this.createGame());
-                document.getElementById('shareGameBtn').addEventListener('click', () => this.shareGame());
-                document.getElementById('offerDrawBtn').addEventListener('click', () => this.offerDraw());
-                document.getElementById('resignBtn').addEventListener('click', () => this.showResignConfirmation());
-                document.getElementById('claimTimeBtn').addEventListener('click', () => this.claimTimeVictory());
-            }
-            
-            newGame() {
-                this.currentFEN = 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
-                this.currentPlayer = 'white';
-                this.gameId = null;
-                this.gameActive = true;
-                this.isMyTurn = true;
-                this.pendingDrawOffer = false;
-                this.updateBoardFromFEN();
-                this.updateStatus('Ready to play');
-                document.getElementById('currentPlayer').textContent = 'White';
-                
-                // Hide game action buttons
-                document.getElementById('gameActions').style.display = 'none';
-                
-                // Hide time control
-                this.hideTimeControl();
-                
-                // Disconnect WebSocket since we're starting a new game
-                this.disconnectWebSocket();
-            }
-            
-            resetBoard() {
-                this.newGame();
-            }
-            
-            async createGame() {
-                const opponentDID = document.getElementById('opponentDID').value;
-                const color = document.getElementById('colorChoice').value;
-                
-                if (!opponentDID) {
-                    this.updateStatus('Please enter opponent DID', 'error');
-                    return;
-                }
-                
-                try {
-                    const response = await fetch('http://localhost:8080/api/games', {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json',
-                        },
-                        body: JSON.stringify({
-                            opponent_did: opponentDID,
-                            color: color
-                        })
-                    });
-                    
-                    if (!response.ok) {
-                        throw new Error('Failed to create game');
-                    }
-                    
-                    const game = await response.json();
-                    this.gameId = game.id;
-                    this.updateStatus(`Game created! ID: ${game.id}`);
-                    
-                    // Update URL to game permalink
-                    const gameSlug = this.encodeGameId(game.id);
-                    const newUrl = window.location.origin + window.location.pathname + '?game=' + gameSlug;
-                    window.history.pushState({gameId: game.id}, `ATChess - Game ${gameSlug}`, newUrl);
-                    
-                    // Show share button and game actions
-                    document.getElementById('shareGameBtn').style.display = 'inline-block';
-                    this.updateGameActionButtons();
-                    
-                    // Connect WebSocket for real-time updates
-                    this.connectWebSocket();
-                    
-                    // Load time control if applicable
-                    this.loadTimeControl();
-                    
-                } catch (error) {
-                    this.updateStatus(`Error: ${error.message}`, 'error');
-                }
-            }
-            
-            async createAutoGame() {
-                // Create a game automatically with a default opponent for local games
-                const defaultOpponent = 'did:plc:yguha7jixn3rlblla2pzbmwl'; // Player 2 from the note
-                
-                try {
-                    const response = await fetch('http://localhost:8080/api/games', {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json',
-                        },
-                        body: JSON.stringify({
-                            opponent_did: defaultOpponent,
-                            color: 'white'
-                        })
-                    });
-                    
-                    if (!response.ok) {
-                        throw new Error('Failed to auto-create game');
-                    }
-                    
-                    const game = await response.json();
-                    this.gameId = game.id;
-                    this.updateStatus(`Game auto-created and moves will be saved! ID: ${game.id}`);
-                    
-                    // Update URL to game permalink
-                    const gameSlug = this.encodeGameId(game.id);
-                    const newUrl = window.location.origin + window.location.pathname + '?game=' + gameSlug;
-                    window.history.pushState({gameId: game.id}, `ATChess - Game ${gameSlug}`, newUrl);
-                    
-                    // Show share button and game actions
-                    document.getElementById('shareGameBtn').style.display = 'inline-block';
-                    this.updateGameActionButtons();
-                    
-                    // Connect WebSocket for real-time updates
-                    this.connectWebSocket();
-                    
-                } catch (error) {
-                    this.updateStatus(`Error auto-creating game: ${error.message}`, 'error');
-                    throw error; // Re-throw to prevent the move from being made
-                }
-            }
-            
-            encodeGameId(gameId) {
-                // Convert AT Protocol URI to URL-safe slug
-                return btoa(gameId).replace(/[+/]/g, c => ({'+': '-', '/': '_'})[c]);
-            }
-            
-            decodeGameId(gameSlug) {
-                // Convert URL-safe slug back to AT Protocol URI
-                const base64 = gameSlug.replace(/[-_]/g, c => ({'-': '+', '_': '/'})[c]);
-                const padded = base64 + '='.repeat((4 - base64.length % 4) % 4);
-                return atob(padded);
-            }
-            
-            async loadGameFromUrl() {
-                const urlParams = new URLSearchParams(window.location.search);
-                const gameSlug = urlParams.get('game');
-                
-                if (gameSlug) {
-                    try {
-                        const gameId = this.decodeGameId(gameSlug);
-                        this.gameId = gameId;
-                        
-                        // Update page title
-                        document.title = `ATChess - Game ${gameSlug}`;
-                        
-                        // Show share button
-                        document.getElementById('shareGameBtn').style.display = 'inline-block';
-                        
-                        // Fetch game state from the API using base64 encoded game ID
-                        const encodedGameId = this.encodeGameId(gameId);
-                        const response = await fetch(`http://localhost:8080/api/games/${encodedGameId}`);
-                        if (response.ok) {
-                            const game = await response.json();
-                            console.log('Loaded game from API:', game);
-                            
-                            // Update game state - fallback to initial position if no FEN
-                            this.currentFEN = game.fen || 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
-                            this.updateBoardFromFEN();
-                            
-                            // Determine current player from FEN
-                            const fenParts = this.currentFEN.split(' ');
-                            this.currentPlayer = fenParts[1] === 'w' ? 'white' : 'black';
-                            document.getElementById('currentPlayer').textContent = 
-                                this.currentPlayer.charAt(0).toUpperCase() + this.currentPlayer.slice(1);
-                            
-                            this.updateStatus(`Loaded game: ${gameSlug}`);
-                            
-                            // Show game action buttons
-                            this.updateGameActionButtons();
-                            
-                            // Connect WebSocket for real-time updates
-                            this.connectWebSocket();
-                            
-                            // Load time control if applicable
-                            this.loadTimeControl();
-                        } else {
-                            this.updateStatus(`Game not found: ${gameSlug}`, 'error');
-                        }
-                        
-                    } catch (error) {
-                        this.updateStatus(`Error loading game from URL: ${error.message}`, 'error');
-                    }
-                }
-            }
-            
-            shareGame() {
-                if (this.gameId) {
-                    const gameSlug = this.encodeGameId(this.gameId);
-                    const gameUrl = window.location.origin + window.location.pathname + '?game=' + gameSlug;
-                    
-                    // Try to use the Clipboard API
-                    if (navigator.clipboard && navigator.clipboard.writeText) {
-                        navigator.clipboard.writeText(gameUrl).then(() => {
-                            this.updateStatus('Game URL copied to clipboard!');
-                        }).catch(() => {
-                            this.fallbackCopyToClipboard(gameUrl);
-                        });
-                    } else {
-                        this.fallbackCopyToClipboard(gameUrl);
-                    }
+                    // Show main interface
+                    showMainInterface();
                 } else {
-                    this.updateStatus('No game to share', 'error');
+                    authMessage.innerHTML = `<div class="auth-message error">${data.error || 'Login failed'}</div>`;
                 }
+            } catch (error) {
+                authMessage.innerHTML = `<div class="auth-message error">Connection error. Please try again.</div>`;
+            } finally {
+                loginBtn.disabled = false;
+                loginBtn.textContent = 'Login with Bluesky';
             }
-            
-            fallbackCopyToClipboard(text) {
-                // Fallback method for older browsers
-                const textArea = document.createElement('textarea');
-                textArea.value = text;
-                textArea.style.position = 'fixed';
-                textArea.style.opacity = '0';
-                document.body.appendChild(textArea);
-                textArea.focus();
-                textArea.select();
-                try {
-                    document.execCommand('copy');
-                    this.updateStatus('Game URL copied to clipboard!');
-                } catch (err) {
-                    this.updateStatus(`Share this URL: ${text}`, 'info');
-                }
-                document.body.removeChild(textArea);
+        }
+        
+        // Logout
+        function logout() {
+            localStorage.removeItem('atchess_auth');
+            currentUser = null;
+            currentGame = null;
+            if (ws) {
+                ws.close();
+                ws = null;
             }
+            showAuthInterface();
+        }
+        
+        // Initialize chess board
+        function initializeBoard() {
+            const board = document.getElementById('chessboard');
+            board.innerHTML = '';
             
-            async loadChallenges() {
-                try {
-                    const response = await fetch('http://localhost:8080/api/challenge-notifications');
-                    if (!response.ok) {
-                        throw new Error('Failed to fetch challenges');
-                    }
+            for (let rank = 8; rank >= 1; rank--) {
+                for (let file = 0; file < 8; file++) {
+                    const square = document.createElement('div');
+                    const fileName = String.fromCharCode(97 + file);
+                    const squareName = fileName + rank;
                     
-                    const challenges = await response.json();
-                    this.challenges = challenges || [];
-                    this.updateChallengeInbox();
+                    square.className = 'square ' + ((rank + file) % 2 === 0 ? 'dark' : 'light');
+                    square.dataset.square = squareName;
+                    square.onclick = () => handleSquareClick(squareName);
                     
-                } catch (error) {
-                    console.error('Error loading challenges:', error);
+                    board.appendChild(square);
                 }
             }
             
-            updateChallengeInbox() {
-                const inboxBody = document.getElementById('challengeInboxBody');
-                const countBadge = document.getElementById('challengeCount');
-                
-                if (this.challenges.length === 0) {
-                    inboxBody.innerHTML = '<div class="no-challenges">No pending challenges</div>';
-                    countBadge.style.display = 'none';
-                } else {
-                    countBadge.textContent = this.challenges.length;
-                    countBadge.style.display = 'inline-flex';
-                    
-                    inboxBody.innerHTML = this.challenges.map(challenge => {
-                        const timeControl = this.formatTimeControl(challenge.TimeControl);
-                        return `
-                            <div class="challenge-item" data-uri="${challenge.URI}">
-                                <div class="challenge-from">From: ${challenge.ChallengerHandle || 'Unknown'}</div>
-                                <div class="challenge-details">
-                                    <div>⏱️ ${timeControl}</div>
-                                    <div>🎨 They play: ${challenge.Color === 'white' ? 'White' : challenge.Color === 'black' ? 'Black' : 'Random'}</div>
-                                </div>
-                                ${challenge.Message ? `<div class="challenge-message">"${challenge.Message}"</div>` : ''}
-                                <div class="challenge-actions">
-                                    <button class="btn-accept" onclick="chessUI.acceptChallenge('${challenge.URI}', '${challenge.ChallengeURI}', '${challenge.Challenger}', '${challenge.Color}', ${JSON.stringify(challenge.TimeControl)})">Accept</button>
-                                    <button class="btn-decline" onclick="chessUI.declineChallenge('${challenge.URI}')">Decline</button>
-                                </div>
-                            </div>
-                        `;
-                    }).join('');
-                }
-            }
+            updateBoardFromFEN();
+        }
+        
+        // Update board from FEN
+        function updateBoardFromFEN() {
+            const pieces = parseFEN(currentFEN);
+            const squares = document.querySelectorAll('.square');
             
-            formatTimeControl(timeControl) {
-                if (!timeControl) return 'Unlimited';
-                
-                if (timeControl.type === 'correspondence' && timeControl.daysPerMove) {
-                    return `${timeControl.daysPerMove} day${timeControl.daysPerMove > 1 ? 's' : ''} per move`;
-                } else if (timeControl.type === 'rapid' && timeControl.initialMinutes) {
-                    return `${timeControl.initialMinutes} min${timeControl.incrementSeconds ? ` + ${timeControl.incrementSeconds}s` : ''}`;
-                } else if (timeControl.type === 'blitz' && timeControl.initialMinutes) {
-                    return `${timeControl.initialMinutes} min${timeControl.incrementSeconds ? ` + ${timeControl.incrementSeconds}s` : ''}`;
-                }
-                
-                return 'Custom time control';
-            }
+            squares.forEach(square => {
+                const squareName = square.dataset.square;
+                const piece = pieces[squareName];
+                square.textContent = piece ? getPieceSymbol(piece) : '';
+            });
+        }
+        
+        // Parse FEN notation
+        function parseFEN(fen) {
+            const pieces = {};
+            const [boardStr] = fen.split(' ');
+            const ranks = boardStr.split('/');
             
-            async acceptChallenge(notificationUri, challengeUri, challengerDid, theirColor, timeControl) {
-                try {
-                    // Determine our color based on their preference
-                    let ourColor;
-                    if (theirColor === 'white') {
-                        ourColor = 'black';
-                    } else if (theirColor === 'black') {
-                        ourColor = 'white';
+            for (let rankIndex = 0; rankIndex < 8; rankIndex++) {
+                const rank = 8 - rankIndex;
+                let fileIndex = 0;
+                
+                for (const char of ranks[rankIndex]) {
+                    if (char >= '1' && char <= '8') {
+                        fileIndex += parseInt(char);
                     } else {
-                        // Random - we'll choose white
-                        ourColor = 'white';
+                        const file = String.fromCharCode(97 + fileIndex);
+                        pieces[file + rank] = char;
+                        fileIndex++;
                     }
-                    
-                    // Create a game based on the challenge
-                    const response = await fetch('http://localhost:8080/api/games', {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json',
-                        },
-                        body: JSON.stringify({
-                            opponent_did: challengerDid,
-                            color: ourColor
-                        })
-                    });
-                    
-                    if (!response.ok) {
-                        throw new Error('Failed to create game from challenge');
-                    }
-                    
-                    const game = await response.json();
-                    
-                    // Delete the notification
-                    await this.deleteNotification(notificationUri);
-                    
-                    // Load the new game
-                    this.gameId = game.id;
-                    this.updateStatus(`Challenge accepted! Game created: ${game.id}`);
-                    
-                    // Store time control data if available
-                    if (timeControl && timeControl.type === 'correspondence') {
-                        this.timeControlData = timeControl;
-                    }
-                    
-                    // Update URL to game permalink
-                    const gameSlug = this.encodeGameId(game.id);
-                    const newUrl = window.location.origin + window.location.pathname + '?game=' + gameSlug;
-                    window.history.pushState({gameId: game.id}, `ATChess - Game ${gameSlug}`, newUrl);
-                    
-                    // Show share button and game actions
-                    document.getElementById('shareGameBtn').style.display = 'inline-block';
-                    this.updateGameActionButtons();
-                    
-                    // Connect WebSocket for real-time updates
-                    this.connectWebSocket();
-                    
-                    // Load time control if applicable
-                    this.loadTimeControl();
-                    
-                    // Refresh challenges
-                    this.loadChallenges();
-                    
-                } catch (error) {
-                    this.updateStatus(`Error accepting challenge: ${error.message}`, 'error');
                 }
             }
             
-            async declineChallenge(notificationUri) {
-                try {
-                    await this.deleteNotification(notificationUri);
-                    this.updateStatus('Challenge declined');
-                    this.loadChallenges();
-                } catch (error) {
-                    this.updateStatus(`Error declining challenge: ${error.message}`, 'error');
-                }
+            return pieces;
+        }
+        
+        // Get piece symbol
+        function getPieceSymbol(piece) {
+            const symbols = {
+                'K': '♔', 'Q': '♕', 'R': '♖', 'B': '♗', 'N': '♘', 'P': '♙',
+                'k': '♚', 'q': '♛', 'r': '♜', 'b': '♝', 'n': '♞', 'p': '♟'
+            };
+            return symbols[piece] || piece;
+        }
+        
+        // Handle square click
+        function handleSquareClick(square) {
+            if (!currentGame || !isMyTurn()) {
+                return;
             }
             
-            async deleteNotification(notificationUri) {
-                // Extract the record key from the URI
-                // URI format: at://did:plc:xxx/app.atchess.challengeNotification/key
-                const parts = notificationUri.split('/');
-                const key = parts[parts.length - 1];
-                
-                const response = await fetch(`http://localhost:8080/api/challenge-notifications/${key}`, {
-                    method: 'DELETE'
+            const pieceAtSquare = document.querySelector(`[data-square="${square}"]`).textContent;
+            
+            if (selectedSquare === null) {
+                if (pieceAtSquare && isMyPiece(square)) {
+                    selectSquare(square);
+                }
+            } else if (selectedSquare === square) {
+                clearSelection();
+            } else {
+                if (pieceAtSquare && isMyPiece(square)) {
+                    clearSelection();
+                    selectSquare(square);
+                } else {
+                    makeMove(selectedSquare, square);
+                }
+            }
+        }
+        
+        // Select a square
+        function selectSquare(square) {
+            selectedSquare = square;
+            document.querySelector(`[data-square="${square}"]`).classList.add('selected');
+            // TODO: Show possible moves
+        }
+        
+        // Clear selection
+        function clearSelection() {
+            if (selectedSquare) {
+                document.querySelector(`[data-square="${selectedSquare}"]`).classList.remove('selected');
+                selectedSquare = null;
+            }
+            // Clear possible move indicators
+            document.querySelectorAll('.possible-move, .possible-capture').forEach(sq => {
+                sq.classList.remove('possible-move', 'possible-capture');
+            });
+        }
+        
+        // Check if it's my turn
+        function isMyTurn() {
+            if (!currentGame) return false;
+            const [, turn] = currentFEN.split(' ');
+            const myColor = getMyColor();
+            return (turn === 'w' && myColor === 'white') || (turn === 'b' && myColor === 'black');
+        }
+        
+        // Get my color in current game
+        function getMyColor() {
+            if (!currentGame) return null;
+            return currentGame.white === currentUser.did ? 'white' : 'black';
+        }
+        
+        // Check if piece belongs to current player
+        function isMyPiece(square) {
+            const piece = document.querySelector(`[data-square="${square}"]`).textContent;
+            if (!piece) return false;
+            
+            const myColor = getMyColor();
+            const whitePieces = ['♔', '♕', '♖', '♗', '♘', '♙'];
+            const isWhitePiece = whitePieces.includes(piece);
+            
+            return (myColor === 'white' && isWhitePiece) || (myColor === 'black' && !isWhitePiece);
+        }
+        
+        // Make a move
+        async function makeMove(from, to) {
+            try {
+                const response = await fetch('http://localhost:8080/api/moves', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        from: from,
+                        to: to,
+                        fen: currentFEN,
+                        game_id: currentGame.id
+                    })
                 });
                 
                 if (!response.ok) {
-                    throw new Error('Failed to delete notification');
-                }
-            }
-            
-            // WebSocket methods
-            connectWebSocket() {
-                if (!this.gameId) {
-                    console.log('No game ID, not connecting WebSocket');
-                    return;
+                    const error = await response.text();
+                    throw new Error(error);
                 }
                 
-                // Clean up existing connection
-                this.disconnectWebSocket();
+                const result = await response.json();
+                currentFEN = result.fen;
+                updateBoardFromFEN();
+                clearSelection();
                 
-                const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-                const wsUrl = `${protocol}//localhost:8080/api/ws?gameId=${encodeURIComponent(this.gameId)}`;
+                updateGameStatus();
                 
-                console.log('Connecting WebSocket to:', wsUrl);
-                this.updateConnectionStatus('connecting');
-                
-                try {
-                    this.ws = new WebSocket(wsUrl);
-                    
-                    this.ws.onopen = () => {
-                        console.log('WebSocket connected');
-                        this.updateConnectionStatus('connected');
-                        this.wsReconnectDelay = 1000; // Reset delay on successful connection
-                        
-                        // Start ping/pong to keep connection alive
-                        this.startPingPong();
-                    };
-                    
-                    this.ws.onmessage = (event) => {
-                        try {
-                            const data = JSON.parse(event.data);
-                            this.handleWebSocketMessage(data);
-                        } catch (error) {
-                            console.error('Error parsing WebSocket message:', error);
-                        }
-                    };
-                    
-                    this.ws.onerror = (error) => {
-                        console.error('WebSocket error:', error);
-                        this.updateConnectionStatus('disconnected');
-                    };
-                    
-                    this.ws.onclose = () => {
-                        console.log('WebSocket disconnected');
-                        this.updateConnectionStatus('disconnected');
-                        this.stopPingPong();
-                        
-                        // Attempt to reconnect
-                        this.scheduleReconnect();
-                    };
-                    
-                } catch (error) {
-                    console.error('Error creating WebSocket:', error);
-                    this.updateConnectionStatus('disconnected');
-                }
-            }
-            
-            disconnectWebSocket() {
-                if (this.ws) {
-                    this.ws.onclose = null; // Prevent reconnect on manual disconnect
-                    this.ws.close();
-                    this.ws = null;
-                }
-                
-                this.stopPingPong();
-                
-                if (this.wsReconnectInterval) {
-                    clearTimeout(this.wsReconnectInterval);
-                    this.wsReconnectInterval = null;
-                }
-            }
-            
-            scheduleReconnect() {
-                if (this.wsReconnectInterval) {
-                    clearTimeout(this.wsReconnectInterval);
-                }
-                
-                this.wsReconnectInterval = setTimeout(() => {
-                    console.log('Attempting WebSocket reconnect...');
-                    this.connectWebSocket();
-                    
-                    // Exponential backoff
-                    this.wsReconnectDelay = Math.min(this.wsReconnectDelay * 2, this.wsMaxReconnectDelay);
-                }, this.wsReconnectDelay);
-            }
-            
-            startPingPong() {
-                this.stopPingPong();
-                
-                // Send ping every 30 seconds
-                this.wsPingInterval = setInterval(() => {
-                    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-                        this.ws.send(JSON.stringify({ type: 'ping' }));
-                    }
-                }, 30000);
-            }
-            
-            stopPingPong() {
-                if (this.wsPingInterval) {
-                    clearInterval(this.wsPingInterval);
-                    this.wsPingInterval = null;
-                }
-            }
-            
-            handleWebSocketMessage(data) {
-                console.log('WebSocket message:', data);
-                
-                switch (data.type) {
-                    case 'move':
-                        // Only update if it's not our move (opponent's move)
-                        if (data.gameId === this.gameId && data.fen && data.fen !== this.currentFEN) {
-                            console.log('Opponent move received:', data);
-                            this.currentFEN = data.fen;
-                            this.updateBoardFromFEN();
-                            
-                            // Update current player
-                            const fenParts = this.currentFEN.split(' ');
-                            this.currentPlayer = fenParts[1] === 'w' ? 'white' : 'black';
-                            document.getElementById('currentPlayer').textContent = 
-                                this.currentPlayer.charAt(0).toUpperCase() + this.currentPlayer.slice(1);
-                            
-                            // Update turn status - it's now our turn
-                            this.isMyTurn = true;
-                            this.updateGameActionButtons();
-                            
-                            // Update time control display
-                            if (this.timeControlData) {
-                                this.updateTimeRemaining();
-                            }
-                            
-                            // Show notification
-                            this.showNotification(`Opponent played: ${data.move || 'move'}`);
-                            this.updateStatus(`Opponent played: ${data.move || 'move'}`);
-                        }
-                        break;
-                        
-                    case 'draw_offer':
-                        this.showNotification('Your opponent offers a draw', 'draw-offer');
-                        this.updateStatus('Draw offered by opponent', 'info');
-                        this.showDrawOfferPrompt();
-                        break;
-                        
-                    case 'resignation':
-                        this.showNotification('Your opponent resigned', 'resignation');
-                        this.updateStatus('Game over - Opponent resigned', 'error');
-                        this.gameActive = false;
-                        this.updateGameActionButtons();
-                        break;
-                        
-                    case 'draw_accepted':
-                        this.showNotification('Draw accepted - Game ended', 'info');
-                        this.updateStatus('Draw accepted - Game ended', 'info');
-                        this.gameActive = false;
-                        this.pendingDrawOffer = false;
-                        this.updateGameActionButtons();
-                        break;
-                        
-                    case 'draw_declined':
-                        this.showNotification('Draw offer declined');
-                        this.updateStatus('Your draw offer was declined');
-                        this.pendingDrawOffer = false;
-                        this.updateGameActionButtons();
-                        break;
-                        
-                    case 'game_update':
-                        if (data.status) {
-                            this.updateStatus(`Game status: ${data.status}`, 'info');
-                        }
-                        break;
-                        
-                    case 'pong':
-                        // Pong received, connection is alive
-                        break;
-                        
-                    default:
-                        console.log('Unknown WebSocket message type:', data.type);
-                }
-            }
-            
-            updateConnectionStatus(status) {
-                const statusElement = document.getElementById('connectionStatus');
-                const statusText = statusElement.querySelector('.status-text');
-                
-                // Only show when we have a game
-                if (this.gameId) {
-                    statusElement.style.display = 'flex';
-                } else {
-                    statusElement.style.display = 'none';
-                    return;
-                }
-                
-                statusElement.className = `connection-status ${status}`;
-                
-                switch (status) {
-                    case 'connected':
-                        statusText.textContent = 'Connected';
-                        break;
-                    case 'connecting':
-                        statusText.textContent = 'Connecting...';
-                        break;
-                    case 'disconnected':
-                        statusText.textContent = 'Disconnected';
-                        break;
-                }
-            }
-            
-            showNotification(message, className = '') {
-                const notification = document.createElement('div');
-                notification.className = `notification ${className}`;
-                notification.textContent = message;
-                
-                document.body.appendChild(notification);
-                
-                // Auto-remove after 5 seconds
-                setTimeout(() => {
-                    notification.style.animation = 'slideDown 0.3s ease reverse';
-                    setTimeout(() => notification.remove(), 300);
-                }, 5000);
-            }
-            
-            updateGameActionButtons() {
-                const gameActionsDiv = document.getElementById('gameActions');
-                const offerDrawBtn = document.getElementById('offerDrawBtn');
-                const resignBtn = document.getElementById('resignBtn');
-                
-                // Show/hide game action buttons based on game state
-                if (this.gameId && this.gameActive) {
-                    gameActionsDiv.style.display = 'flex';
-                    
-                    // Enable/disable buttons based on turn
-                    if (this.isMyTurn) {
-                        offerDrawBtn.disabled = this.pendingDrawOffer;
-                        offerDrawBtn.textContent = this.pendingDrawOffer ? 'Draw Offered' : 'Offer Draw';
-                        resignBtn.disabled = false;
-                    } else {
-                        offerDrawBtn.disabled = true;
-                        resignBtn.disabled = true;
-                    }
-                } else {
-                    gameActionsDiv.style.display = 'none';
-                }
-            }
-            
-            async offerDraw() {
-                if (!this.gameId || !this.isMyTurn || this.pendingDrawOffer) {
-                    return;
-                }
-                
-                try {
-                    const response = await fetch(`http://localhost:8080/api/games/${this.encodeGameId(this.gameId)}/draw`, {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json',
-                        }
-                    });
-                    
-                    if (!response.ok) {
-                        throw new Error('Failed to offer draw');
-                    }
-                    
-                    this.pendingDrawOffer = true;
-                    this.updateGameActionButtons();
-                    this.updateStatus('Draw offer sent');
-                    
-                    // Send draw offer through WebSocket
-                    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-                        this.ws.send(JSON.stringify({
-                            type: 'draw_offer',
-                            gameId: this.gameId
-                        }));
-                    }
-                    
-                } catch (error) {
-                    this.updateStatus(`Error offering draw: ${error.message}`, 'error');
-                }
-            }
-            
-            showResignConfirmation() {
-                if (!this.gameId || !this.gameActive) {
-                    return;
-                }
-                
-                const overlay = document.createElement('div');
-                overlay.className = 'dialog-overlay';
-                
-                const dialog = document.createElement('div');
-                dialog.className = 'confirmation-dialog';
-                dialog.innerHTML = `
-                    <h3>Resign Game?</h3>
-                    <p>Are you sure you want to resign? This action cannot be undone.</p>
-                    <div class="dialog-actions">
-                        <button onclick="chessUI.confirmResign()">Yes, Resign</button>
-                        <button onclick="chessUI.cancelDialog()">Cancel</button>
-                    </div>
-                `;
-                
-                document.body.appendChild(overlay);
-                document.body.appendChild(dialog);
-                
-                this.currentDialog = { overlay, dialog };
-            }
-            
-            async confirmResign() {
-                this.cancelDialog();
-                
-                try {
-                    const response = await fetch(`http://localhost:8080/api/games/${this.encodeGameId(this.gameId)}/resign`, {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json',
-                        }
-                    });
-                    
-                    if (!response.ok) {
-                        throw new Error('Failed to resign');
-                    }
-                    
-                    this.gameActive = false;
-                    this.updateGameActionButtons();
-                    this.updateStatus('You resigned', 'error');
-                    
-                    // Send resignation through WebSocket
-                    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-                        this.ws.send(JSON.stringify({
-                            type: 'resignation',
-                            gameId: this.gameId
-                        }));
-                    }
-                    
-                } catch (error) {
-                    this.updateStatus(`Error resigning: ${error.message}`, 'error');
-                }
-            }
-            
-            cancelDialog() {
-                if (this.currentDialog) {
-                    this.currentDialog.overlay.remove();
-                    this.currentDialog.dialog.remove();
-                    this.currentDialog = null;
-                }
-            }
-            
-            showDrawOfferPrompt() {
-                const overlay = document.createElement('div');
-                overlay.className = 'dialog-overlay';
-                
-                const prompt = document.createElement('div');
-                prompt.className = 'draw-offer-prompt';
-                prompt.innerHTML = `
-                    <h3>Draw Offer</h3>
-                    <p>Your opponent has offered a draw.</p>
-                    <div class="draw-actions">
-                        <button onclick="chessUI.acceptDraw()">Accept Draw</button>
-                        <button onclick="chessUI.declineDraw()">Decline</button>
-                    </div>
-                `;
-                
-                document.body.appendChild(overlay);
-                document.body.appendChild(prompt);
-                
-                this.currentDrawPrompt = { overlay, prompt };
-            }
-            
-            async acceptDraw() {
-                if (this.currentDrawPrompt) {
-                    this.currentDrawPrompt.overlay.remove();
-                    this.currentDrawPrompt.prompt.remove();
-                    this.currentDrawPrompt = null;
-                }
-                
-                try {
-                    const response = await fetch(`http://localhost:8080/api/games/${this.encodeGameId(this.gameId)}/draw/accept`, {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json',
-                        }
-                    });
-                    
-                    if (!response.ok) {
-                        throw new Error('Failed to accept draw');
-                    }
-                    
-                    this.gameActive = false;
-                    this.updateGameActionButtons();
-                    this.updateStatus('Draw accepted - Game ended', 'info');
-                    
-                    // Notify opponent through WebSocket
-                    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-                        this.ws.send(JSON.stringify({
-                            type: 'draw_accepted',
-                            gameId: this.gameId
-                        }));
-                    }
-                    
-                } catch (error) {
-                    this.updateStatus(`Error accepting draw: ${error.message}`, 'error');
-                }
-            }
-            
-            async declineDraw() {
-                if (this.currentDrawPrompt) {
-                    this.currentDrawPrompt.overlay.remove();
-                    this.currentDrawPrompt.prompt.remove();
-                    this.currentDrawPrompt = null;
-                }
-                
-                this.updateStatus('Draw offer declined');
-                
-                // Notify opponent through WebSocket
-                if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-                    this.ws.send(JSON.stringify({
-                        type: 'draw_declined',
-                        gameId: this.gameId
-                    }));
-                }
-            }
-            
-            // Time Control Methods
-            async loadTimeControl() {
-                if (!this.gameId || !this.gameActive) {
-                    this.hideTimeControl();
-                    return;
-                }
-                
-                try {
-                    // Get game details to check if it has time control
-                    const response = await fetch(`http://localhost:8080/api/games/${this.encodeGameId(this.gameId)}`);
-                    if (!response.ok) {
-                        throw new Error('Failed to fetch game details');
-                    }
-                    
-                    const game = await response.json();
-                    
-                    // Check if game has time control
-                    if (!game.timeControl || game.timeControl.type !== 'correspondence') {
-                        this.hideTimeControl();
-                        return;
-                    }
-                    
-                    this.timeControlData = game.timeControl;
-                    this.showTimeControl();
-                    
-                    // Start updating time remaining
-                    this.updateTimeRemaining();
-                    this.startTimeUpdates();
-                    
-                } catch (error) {
-                    console.error('Error loading time control:', error);
-                    this.hideTimeControl();
-                }
-            }
-            
-            showTimeControl() {
-                const timeControlInfo = document.getElementById('timeControlInfo');
-                const timeControlType = document.getElementById('timeControlType');
-                
-                timeControlInfo.classList.add('active');
-                
-                if (this.timeControlData && this.timeControlData.daysPerMove) {
-                    timeControlType.textContent = `Correspondence Game (${this.timeControlData.daysPerMove} day${this.timeControlData.daysPerMove > 1 ? 's' : ''} per move)`;
-                }
-            }
-            
-            hideTimeControl() {
-                const timeControlInfo = document.getElementById('timeControlInfo');
-                timeControlInfo.classList.remove('active');
-                this.stopTimeUpdates();
-            }
-            
-            startTimeUpdates() {
-                this.stopTimeUpdates();
-                
-                // Update time display every second
-                this.timeUpdateInterval = setInterval(() => {
-                    this.updateTimeRemaining();
-                }, 1000);
-                
-                // Check for time violations every 30 seconds
-                this.timeCheckInterval = setInterval(() => {
-                    this.checkTimeViolation();
-                }, 30000);
-            }
-            
-            stopTimeUpdates() {
-                if (this.timeUpdateInterval) {
-                    clearInterval(this.timeUpdateInterval);
-                    this.timeUpdateInterval = null;
-                }
-                
-                if (this.timeCheckInterval) {
-                    clearInterval(this.timeCheckInterval);
-                    this.timeCheckInterval = null;
-                }
-            }
-            
-            async updateTimeRemaining() {
-                if (!this.gameId || !this.isMyTurn || !this.gameActive) {
-                    return;
-                }
-                
-                try {
-                    const response = await fetch(`http://localhost:8080/api/games/${this.encodeGameId(this.gameId)}/time-remaining`);
-                    if (!response.ok) {
-                        throw new Error('Failed to fetch time remaining');
-                    }
-                    
-                    const data = await response.json();
-                    this.displayTimeRemaining(data.remainingSeconds, data.remainingFormatted);
-                    
-                } catch (error) {
-                    console.error('Error updating time remaining:', error);
-                }
-            }
-            
-            displayTimeRemaining(seconds, formatted) {
-                const timeRemainingEl = document.getElementById('timeRemaining');
-                const timeValueEl = document.getElementById('timeRemainingValue');
-                
-                timeValueEl.textContent = formatted || this.formatTime(seconds);
-                
-                // Remove all time classes
-                timeRemainingEl.classList.remove('low-time', 'very-low-time');
-                
-                // Add appropriate class based on time remaining
-                const hours = seconds / 3600;
-                if (hours < 1) {
-                    timeRemainingEl.classList.add('very-low-time');
-                } else if (hours < 24) {
-                    timeRemainingEl.classList.add('low-time');
-                }
-            }
-            
-            formatTime(seconds) {
-                if (seconds <= 0) {
-                    return 'Time expired';
-                }
-                
-                const days = Math.floor(seconds / 86400);
-                const hours = Math.floor((seconds % 86400) / 3600);
-                const minutes = Math.floor((seconds % 3600) / 60);
-                
-                if (days > 0) {
-                    if (hours > 0) {
-                        return `${days} day${days > 1 ? 's' : ''}, ${hours} hour${hours > 1 ? 's' : ''}`;
-                    }
-                    return `${days} day${days > 1 ? 's' : ''}`;
-                }
-                
-                if (hours > 0) {
-                    if (minutes > 0) {
-                        return `${hours} hour${hours > 1 ? 's' : ''}, ${minutes} minute${minutes > 1 ? 's' : ''}`;
-                    }
-                    return `${hours} hour${hours > 1 ? 's' : ''}`;
-                }
-                
-                return `${minutes} minute${minutes > 1 ? 's' : ''}`;
-            }
-            
-            async checkTimeViolation() {
-                if (!this.gameId || !this.gameActive) {
-                    return;
-                }
-                
-                try {
-                    const response = await fetch(`http://localhost:8080/api/games/${this.encodeGameId(this.gameId)}/time-violation`);
-                    if (!response.ok) {
-                        if (response.status === 404) {
-                            // No violation found
-                            document.getElementById('claimTimeBtn').style.display = 'none';
-                            return;
-                        }
-                        throw new Error('Failed to check time violation');
-                    }
-                    
-                    const violation = await response.json();
-                    
-                    // Show claim time button if opponent has violated time control
-                    if (violation && violation.playerDid && violation.playerDid !== this.getMyDID()) {
-                        document.getElementById('claimTimeBtn').style.display = 'block';
-                        this.updateStatus('Opponent has exceeded time limit!', 'error');
-                    }
-                    
-                } catch (error) {
-                    console.error('Error checking time violation:', error);
-                }
-            }
-            
-            async claimTimeVictory() {
-                if (!this.gameId) {
-                    return;
-                }
-                
-                try {
-                    const response = await fetch(`http://localhost:8080/api/games/${this.encodeGameId(this.gameId)}/claim-time`, {
-                        method: 'POST',
-                        headers: {
-                            'Content-Type': 'application/json',
-                        }
-                    });
-                    
-                    if (!response.ok) {
-                        throw new Error('Failed to claim time victory');
-                    }
-                    
-                    this.gameActive = false;
-                    this.updateGameActionButtons();
-                    this.updateStatus('Time victory claimed!', 'info');
-                    this.stopTimeUpdates();
-                    
-                    // Hide claim button
-                    document.getElementById('claimTimeBtn').style.display = 'none';
-                    
-                } catch (error) {
-                    this.updateStatus(`Error claiming time victory: ${error.message}`, 'error');
-                }
-            }
-            
-            getMyDID() {
-                // In a real implementation, this would get the current user's DID
-                // For now, we'll assume player1
-                return 'did:plc:styupz2ghvg7hrq4optipm7s';
+            } catch (error) {
+                alert('Invalid move: ' + error.message);
             }
         }
         
-        // Global functions for inline onclick handlers
-        let chessUI;
-        
-        function toggleChallengeInbox() {
-            const inbox = document.getElementById('challengeInbox');
-            inbox.classList.toggle('collapsed');
+        // Create a new game
+        async function createGame(event) {
+            event.preventDefault();
+            
+            const opponentHandle = document.getElementById('opponentHandle').value;
+            const color = document.getElementById('colorChoice').value;
+            
+            try {
+                // First, resolve the handle to a DID
+                // For now, we'll create a challenge which will resolve the handle
+                const response = await fetch('http://localhost:8080/api/challenges', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        opponent_did: opponentHandle, // The API should handle resolution
+                        color: color,
+                        message: `Let's play chess! From @${currentUser.handle}`
+                    })
+                });
+                
+                if (!response.ok) {
+                    throw new Error('Failed to create challenge');
+                }
+                
+                const challenge = await response.json();
+                alert('Challenge sent to ' + opponentHandle);
+                
+                // Reset form
+                document.getElementById('opponentHandle').value = '';
+                document.getElementById('colorChoice').value = 'random';
+                
+            } catch (error) {
+                alert('Error creating game: ' + error.message);
+            }
         }
         
-        // Initialize the chess UI when the page loads
-        document.addEventListener('DOMContentLoaded', () => {
-            chessUI = new ChessUI();
-        });
+        // Load active games
+        async function loadActiveGames() {
+            // TODO: Implement endpoint to fetch user's active games
+            // For now, show empty state
+            document.getElementById('gamesList').innerHTML = '<div class="no-items">No active games</div>';
+        }
+        
+        // Load challenges
+        async function loadChallenges() {
+            try {
+                const response = await fetch('http://localhost:8080/api/challenge-notifications');
+                if (!response.ok) {
+                    throw new Error('Failed to fetch challenges');
+                }
+                
+                const challenges = await response.json();
+                displayChallenges(challenges);
+                
+            } catch (error) {
+                console.error('Error loading challenges:', error);
+            }
+        }
+        
+        // Display challenges
+        function displayChallenges(challenges) {
+            const container = document.getElementById('challengesList');
+            
+            if (!challenges || challenges.length === 0) {
+                container.innerHTML = '<div class="no-items">No pending challenges</div>';
+                return;
+            }
+            
+            container.innerHTML = challenges.map(challenge => `
+                <div class="challenge-item">
+                    <div class="challenge-from">From: @${challenge.ChallengerHandle || 'Unknown'}</div>
+                    <div class="challenge-details">
+                        Color: ${challenge.Color === 'white' ? 'White' : challenge.Color === 'black' ? 'Black' : 'Random'}
+                    </div>
+                    ${challenge.Message ? `<div class="challenge-details">"${challenge.Message}"</div>` : ''}
+                    <div class="challenge-actions">
+                        <button class="btn-accept" onclick="acceptChallenge('${challenge.URI}', '${challenge.Challenger}', '${challenge.Color}')">Accept</button>
+                        <button class="btn-decline" onclick="declineChallenge('${challenge.URI}')">Decline</button>
+                    </div>
+                </div>
+            `).join('');
+        }
+        
+        // Accept challenge
+        async function acceptChallenge(notificationUri, challengerDid, theirColor) {
+            try {
+                // Determine our color
+                let ourColor;
+                if (theirColor === 'white') {
+                    ourColor = 'black';
+                } else if (theirColor === 'black') {
+                    ourColor = 'white';
+                } else {
+                    ourColor = 'white';
+                }
+                
+                // Create game
+                const response = await fetch('http://localhost:8080/api/games', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        opponent_did: challengerDid,
+                        color: ourColor
+                    })
+                });
+                
+                if (!response.ok) {
+                    throw new Error('Failed to create game');
+                }
+                
+                const game = await response.json();
+                
+                // Delete notification
+                const uriParts = notificationUri.split('/');
+                const key = uriParts[uriParts.length - 1];
+                await fetch(`http://localhost:8080/api/challenge-notifications/${key}`, {
+                    method: 'DELETE'
+                });
+                
+                // Load the game
+                loadGame(btoa(game.id).replace(/[+/]/g, c => ({'+': '-', '/': '_'})[c]));
+                
+                // Refresh challenges
+                loadChallenges();
+                
+            } catch (error) {
+                alert('Error accepting challenge: ' + error.message);
+            }
+        }
+        
+        // Decline challenge
+        async function declineChallenge(notificationUri) {
+            try {
+                const uriParts = notificationUri.split('/');
+                const key = uriParts[uriParts.length - 1];
+                
+                await fetch(`http://localhost:8080/api/challenge-notifications/${key}`, {
+                    method: 'DELETE'
+                });
+                
+                loadChallenges();
+                
+            } catch (error) {
+                alert('Error declining challenge: ' + error.message);
+            }
+        }
+        
+        // Load a game
+        async function loadGame(encodedGameId) {
+            try {
+                const response = await fetch(`http://localhost:8080/api/games/${encodedGameId}`);
+                if (!response.ok) {
+                    throw new Error('Game not found');
+                }
+                
+                const game = await response.json();
+                currentGame = game;
+                currentFEN = game.fen || 'rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1';
+                
+                updateBoardFromFEN();
+                updateGameStatus();
+                
+                // Connect WebSocket for real-time updates
+                connectWebSocket();
+                
+                // Update URL
+                const url = new URL(window.location);
+                url.searchParams.set('game', encodedGameId);
+                window.history.pushState({}, '', url);
+                
+            } catch (error) {
+                alert('Error loading game: ' + error.message);
+            }
+        }
+        
+        // Update game status display
+        function updateGameStatus() {
+            if (!currentGame) {
+                document.getElementById('gameStatus').textContent = 'No active game';
+                document.getElementById('gameStatus').className = 'game-status waiting';
+                document.getElementById('currentTurn').textContent = '-';
+                document.getElementById('playingAs').textContent = '-';
+                document.getElementById('opponent').textContent = '-';
+                document.getElementById('gameActions').style.display = 'none';
+                return;
+            }
+            
+            const myColor = getMyColor();
+            const [, turn] = currentFEN.split(' ');
+            const isMyTurn = (turn === 'w' && myColor === 'white') || (turn === 'b' && myColor === 'black');
+            
+            document.getElementById('gameStatus').textContent = isMyTurn ? 'Your turn' : "Opponent's turn";
+            document.getElementById('gameStatus').className = 'game-status ' + (isMyTurn ? 'active' : 'waiting');
+            document.getElementById('currentTurn').textContent = turn === 'w' ? 'White' : 'Black';
+            document.getElementById('playingAs').textContent = myColor.charAt(0).toUpperCase() + myColor.slice(1);
+            
+            // TODO: Resolve opponent handle
+            const opponentDid = myColor === 'white' ? currentGame.black : currentGame.white;
+            document.getElementById('opponent').textContent = opponentDid.substring(0, 15) + '...';
+            
+            document.getElementById('gameActions').style.display = 'flex';
+        }
+        
+        // WebSocket connection
+        function connectWebSocket() {
+            if (!currentGame || ws) return;
+            
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = `${protocol}//localhost:8080/api/ws?gameId=${encodeURIComponent(currentGame.id)}`;
+            
+            ws = new WebSocket(wsUrl);
+            
+            ws.onopen = () => {
+                console.log('WebSocket connected');
+            };
+            
+            ws.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                handleWebSocketMessage(data);
+            };
+            
+            ws.onerror = (error) => {
+                console.error('WebSocket error:', error);
+            };
+            
+            ws.onclose = () => {
+                console.log('WebSocket disconnected');
+                ws = null;
+            };
+        }
+        
+        // Handle WebSocket messages
+        function handleWebSocketMessage(data) {
+            switch (data.type) {
+                case 'move':
+                    if (data.fen && data.fen !== currentFEN) {
+                        currentFEN = data.fen;
+                        updateBoardFromFEN();
+                        updateGameStatus();
+                    }
+                    break;
+                    
+                case 'draw_offer':
+                    if (confirm('Your opponent offers a draw. Accept?')) {
+                        // TODO: Implement draw acceptance
+                    }
+                    break;
+                    
+                case 'resignation':
+                    alert('Your opponent resigned. You win!');
+                    // TODO: Update game state
+                    break;
+            }
+        }
+        
+        // Game actions
+        function offerDraw() {
+            if (!currentGame) return;
+            // TODO: Implement draw offer
+            alert('Draw offer not yet implemented');
+        }
+        
+        function resignGame() {
+            if (!currentGame) return;
+            if (confirm('Are you sure you want to resign?')) {
+                // TODO: Implement resignation
+                alert('Resignation not yet implemented');
+            }
+        }
+        
+        // Initialize on load
+        window.addEventListener('DOMContentLoaded', init);
+        
+        // Refresh challenges periodically
+        setInterval(() => {
+            if (currentUser) {
+                loadChallenges();
+            }
+        }, 30000);
     </script>
 </body>
 </html>
