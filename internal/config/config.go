@@ -15,8 +15,9 @@ type Config struct {
 }
 
 type ServerConfig struct {
-	Host string `mapstructure:"host"`
-	Port int    `mapstructure:"port"`
+	Host    string `mapstructure:"host"`
+	Port    int    `mapstructure:"port"`
+	BaseURL string `mapstructure:"base_url"`
 }
 
 type ATProtoConfig struct {
@@ -51,6 +52,7 @@ func Load() (*Config, error) {
 	// This allows both ATCHESS_ prefixed and unprefixed versions
 	viper.BindEnv("server.host", "SERVER_HOST", "ATCHESS_SERVER_HOST")
 	viper.BindEnv("server.port", "SERVER_PORT", "ATCHESS_SERVER_PORT")
+	viper.BindEnv("server.base_url", "SERVER_BASE_URL", "ATCHESS_SERVER_BASE_URL")
 	viper.BindEnv("atproto.pds_url", "ATPROTO_PDS_URL", "ATCHESS_ATPROTO_PDS_URL")
 	viper.BindEnv("atproto.handle", "ATPROTO_HANDLE", "ATCHESS_ATPROTO_HANDLE")
 	viper.BindEnv("atproto.password", "ATPROTO_PASSWORD", "ATCHESS_ATPROTO_PASSWORD")

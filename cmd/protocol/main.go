@@ -58,6 +58,13 @@ func main() {
 	// Create service
 	service := web.NewService(client, cfg)
 	
+	// Initialize OAuth if base URL is configured
+	if cfg.Server.BaseURL != "" {
+		if err := web.InitializeOAuth(cfg.Server.BaseURL); err != nil {
+			log.Error().Err(err).Msg("Failed to initialize OAuth, falling back to password auth")
+		}
+	}
+	
 	// Create firehose processor
 	processor := firehose.NewEventProcessor(hub)
 	
@@ -87,7 +94,7 @@ func main() {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Access-Control-Allow-Origin", "*")
 			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Session-ID")
 			
 			if r.Method == "OPTIONS" {
 				w.WriteHeader(http.StatusOK)
@@ -106,6 +113,11 @@ func main() {
 	api.HandleFunc("/health", service.HealthHandler).Methods("GET")
 	api.HandleFunc("/auth/login", service.LoginHandler).Methods("POST")
 	api.HandleFunc("/auth/current", service.GetCurrentUserHandler).Methods("GET")
+	api.HandleFunc("/auth/oauth/login", service.OAuthLoginHandler).Methods("POST")
+	// OAuth callback is handled at root level, not under /api
+	router.HandleFunc("/callback", service.OAuthCallbackHandler).Methods("GET")
+	api.HandleFunc("/auth/session", service.GetSessionHandler).Methods("GET")
+	api.HandleFunc("/auth/logout", service.LogoutHandler).Methods("POST")
 	api.HandleFunc("/games", service.CreateGameHandler).Methods("POST")
 	api.HandleFunc("/games/{id:.*}", service.GetGameHandler).Methods("GET")
 	api.HandleFunc("/moves", service.MakeMoveHandler).Methods("POST")
@@ -136,6 +148,15 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 	}).Methods("OPTIONS")
 	api.HandleFunc("/auth/current", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}).Methods("OPTIONS")
+	api.HandleFunc("/auth/oauth/login", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}).Methods("OPTIONS")
+	api.HandleFunc("/auth/session", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}).Methods("OPTIONS")
+	api.HandleFunc("/auth/logout", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}).Methods("OPTIONS")
 	api.HandleFunc("/games", func(w http.ResponseWriter, r *http.Request) {

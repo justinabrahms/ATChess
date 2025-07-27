@@ -75,13 +75,16 @@ make run-web        # Runs on port 8081
 
 1. Open http://localhost:8081 in your browser
 2. Log in with your Bluesky account:
-   - Use your Bluesky handle (e.g., yourname.bsky.social)
-   - Create an app password at https://bsky.app/settings/app-passwords
+   - Enter your Bluesky handle (e.g., yourname.bsky.social)
+   - Click "Login with Bluesky"
+   - Authorize ATChess to access your account
 3. Create games by challenging other Bluesky users
 4. Accept challenges from the inbox
 5. Play chess with real-time move synchronization
 
-**Using with Bluesky:** ATChess works with your existing Bluesky account. The protocol service needs to be configured with valid AT Protocol credentials (see Configuration section).
+**OAuth Authentication:** ATChess uses AT Protocol OAuth for secure authentication. Users authorize ATChess to act on their behalf without sharing passwords. For production deployments, see [OAuth Setup Guide](docs/oauth-setup.md).
+
+**Password Authentication (Legacy):** If OAuth is not configured, ATChess falls back to app password authentication. Users can create app passwords at https://bsky.app/settings/app-passwords
 
 **Local Development:** For testing with a local PDS, see the [Local PDS Setup Guide](docs/local-pds-setup.md).
 

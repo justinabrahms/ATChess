@@ -576,24 +576,14 @@
                         required
                     />
                 </div>
-                <div class="form-group">
-                    <label for="password">App Password</label>
-                    <input 
-                        type="password" 
-                        id="password" 
-                        name="password" 
-                        placeholder="xxxx-xxxx-xxxx-xxxx"
-                        required
-                    />
-                </div>
                 <button type="submit" class="btn-primary" id="loginBtn">
                     Login with Bluesky
                 </button>
             </form>
             <div id="authMessage"></div>
             <div class="auth-help">
-                <p>Need an app password?</p>
-                <p><a href="https://bsky.app/settings/app-passwords" target="_blank">Create one in Bluesky Settings</a></p>
+                <p>Login with your Bluesky account</p>
+                <p>You'll be redirected to authorize ATChess</p>
             </div>
         </div>
     </div>
@@ -685,14 +675,69 @@
         let ws = null;
         
         // Initialize the app
-        function init() {
-            // Check if user is logged in
-            const savedAuth = localStorage.getItem('atchess_auth');
-            if (savedAuth) {
-                const auth = JSON.parse(savedAuth);
-                currentUser = auth;
-                showMainInterface();
+        async function init() {
+            // Check if we're returning from OAuth callback
+            const urlParams = new URLSearchParams(window.location.search);
+            const sessionId = urlParams.get('session');
+            
+            if (sessionId) {
+                // Store session and reload without query params
+                localStorage.setItem('atchess_session_id', sessionId);
+                window.history.replaceState({}, document.title, window.location.pathname);
+                await checkSessionWithServer();
             } else {
+                // Check for existing session
+                const existingSessionId = localStorage.getItem('atchess_session_id');
+                if (existingSessionId) {
+                    await checkSessionWithServer();
+                } else {
+                    // Check old auth format for backward compatibility
+                    const savedAuth = localStorage.getItem('atchess_auth');
+                    if (savedAuth) {
+                        const auth = JSON.parse(savedAuth);
+                        currentUser = auth;
+                        showMainInterface();
+                    } else {
+                        showAuthInterface();
+                    }
+                }
+            }
+        }
+        
+        // Check session with server
+        async function checkSessionWithServer() {
+            const sessionId = localStorage.getItem('atchess_session_id');
+            if (!sessionId) {
+                showAuthInterface();
+                return;
+            }
+            
+            try {
+                const response = await fetch('http://localhost:8080/api/auth/session', {
+                    headers: {
+                        'X-Session-ID': sessionId
+                    }
+                });
+                
+                if (response.ok) {
+                    const data = await response.json();
+                    // Store user data
+                    currentUser = {
+                        did: data.did,
+                        handle: data.handle,
+                        sessionId: sessionId
+                    };
+                    
+                    // Show main interface
+                    showMainInterface();
+                } else {
+                    // Session invalid, clear it
+                    localStorage.removeItem('atchess_session_id');
+                    showAuthInterface();
+                }
+            } catch (error) {
+                console.error('Failed to check session:', error);
+                localStorage.removeItem('atchess_session_id');
                 showAuthInterface();
             }
         }
@@ -728,51 +773,67 @@
             event.preventDefault();
             
             const handle = document.getElementById('handle').value;
-            const password = document.getElementById('password').value;
             const loginBtn = document.getElementById('loginBtn');
             const authMessage = document.getElementById('authMessage');
             
             // Show loading state
             loginBtn.disabled = true;
-            loginBtn.innerHTML = '<span class="loading"></span> Logging in...';
+            loginBtn.innerHTML = '<span class="loading"></span> Redirecting...';
             authMessage.innerHTML = '';
             
             try {
-                const response = await fetch('http://localhost:8080/api/auth/login', {
+                const response = await fetch('http://localhost:8080/api/auth/oauth/login', {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
                     },
-                    body: JSON.stringify({ handle, password })
+                    body: JSON.stringify({ handle })
                 });
                 
                 const data = await response.json();
                 
-                if (data.success) {
-                    // Save auth data
-                    currentUser = {
-                        did: data.did,
-                        handle: data.handle,
-                        accessToken: data.accessToken
-                    };
-                    localStorage.setItem('atchess_auth', JSON.stringify(currentUser));
+                if (data.authorization_url) {
+                    // Store handle for after OAuth callback
+                    sessionStorage.setItem('atchess_pending_handle', handle);
                     
-                    // Show main interface
-                    showMainInterface();
+                    // Redirect to AT Protocol OAuth authorization
+                    authMessage.innerHTML = `<div class="auth-message">Redirecting to Bluesky...</div>`;
+                    setTimeout(() => {
+                        window.location.href = data.authorization_url;
+                    }, 1000);
                 } else {
-                    authMessage.innerHTML = `<div class="auth-message error">${data.error || 'Login failed'}</div>`;
+                    authMessage.innerHTML = `<div class="auth-message error">Failed to start authentication</div>`;
+                    loginBtn.disabled = false;
+                    loginBtn.textContent = 'Login with Bluesky';
                 }
             } catch (error) {
                 authMessage.innerHTML = `<div class="auth-message error">Connection error. Please try again.</div>`;
-            } finally {
                 loginBtn.disabled = false;
                 loginBtn.textContent = 'Login with Bluesky';
             }
         }
         
         // Logout
-        function logout() {
+        async function logout() {
+            const sessionId = localStorage.getItem('atchess_session_id');
+            
+            // Call logout endpoint
+            if (sessionId) {
+                try {
+                    await fetch('http://localhost:8080/api/auth/logout', {
+                        method: 'POST',
+                        headers: {
+                            'X-Session-ID': sessionId
+                        }
+                    });
+                } catch (error) {
+                    console.error('Logout error:', error);
+                }
+            }
+            
+            // Clear local data
             localStorage.removeItem('atchess_auth');
+            localStorage.removeItem('atchess_session_id');
             currentUser = null;
             currentGame = null;
             if (ws) {

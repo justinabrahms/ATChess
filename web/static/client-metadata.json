@@ -1,0 +1,29 @@
+{
+  "client_id": "https://atchess.abrah.ms/client-metadata.json",
+  "client_name": "ATChess",
+  "client_uri": "https://atchess.abrah.ms",
+  "logo_uri": "https://atchess.abrah.ms/logo.png",
+  "tos_uri": "https://atchess.abrah.ms/terms",
+  "policy_uri": "https://atchess.abrah.ms/privacy",
+  "redirect_uris": ["https://atchess.abrah.ms/callback"],
+  "scope": "atproto transition:generic",
+  "grant_types": ["authorization_code", "refresh_token"],
+  "response_types": ["code"],
+  "token_endpoint_auth_method": "private_key_jwt",
+  "token_endpoint_auth_signing_alg": "ES256",
+  "application_type": "web",
+  "dpop_bound_access_tokens": true,
+  "jwks": {
+    "keys": [
+      {
+        "alg": "ES256",
+        "crv": "P-256",
+        "kid": "is4PQCqbnUs",
+        "kty": "EC",
+        "use": "sig",
+        "x": "t9ccGvC1M03pi641RNvwjtusEWvnJmlfzxTYs8CdEv0",
+        "y": "S7TMF1J59gU5JtcL-mPCwWMhD2QZVQ0VQ8Pf9VOOxu4"
+      }
+    ]
+  }
+}
