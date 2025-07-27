@@ -1,6 +1,7 @@
 {
   "client_id": "https://atchess.abrah.ms/client-metadata.json",
   "client_name": "ATChess",
+  "client_name#en": "ATChess - Decentralized Chess",
   "client_uri": "https://atchess.abrah.ms",
   "logo_uri": "https://atchess.abrah.ms/logo.png",
   "tos_uri": "https://atchess.abrah.ms/terms",

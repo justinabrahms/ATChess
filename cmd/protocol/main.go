@@ -108,14 +108,15 @@ func main() {
 	// Root level health endpoint for load balancers and monitoring
 	router.HandleFunc("/health", service.HealthHandler).Methods("GET")
 	
+	// OAuth callback must be registered before the catch-all static handler
+	router.HandleFunc("/callback", service.OAuthCallbackHandler).Methods("GET")
+	
 	// API routes
 	api := router.PathPrefix("/api").Subrouter()
 	api.HandleFunc("/health", service.HealthHandler).Methods("GET")
 	api.HandleFunc("/auth/login", service.LoginHandler).Methods("POST")
 	api.HandleFunc("/auth/current", service.GetCurrentUserHandler).Methods("GET")
 	api.HandleFunc("/auth/oauth/login", service.OAuthLoginHandler).Methods("POST")
-	// OAuth callback is handled at root level, not under /api
-	router.HandleFunc("/callback", service.OAuthCallbackHandler).Methods("GET")
 	api.HandleFunc("/auth/session", service.GetSessionHandler).Methods("GET")
 	api.HandleFunc("/auth/logout", service.LogoutHandler).Methods("POST")
 	api.HandleFunc("/games", service.CreateGameHandler).Methods("POST")
