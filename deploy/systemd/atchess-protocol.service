@@ -10,10 +10,7 @@ WorkingDirectory=/srv/atchess/app
 
 # Load environment variables from file
 EnvironmentFile=/etc/atchess/protocol.env
-
-# Ensure variables are exported properly by using a wrapper script
-ExecStartPre=/bin/bash -c 'set -a; source /etc/atchess/protocol.env; set +a'
-ExecStart=/bin/bash -c 'set -a; source /etc/atchess/protocol.env; set +a; exec /srv/atchess/app/atchess-protocol'
+ExecStart=/srv/atchess/app/atchess-protocol
 
 Restart=on-failure
 RestartSec=5
