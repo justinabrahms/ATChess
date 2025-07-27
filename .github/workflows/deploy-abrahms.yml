@@ -101,8 +101,9 @@ jobs:
           # Move the extracted files to the final location
           cd /srv/atchess/app
           mv /tmp/extract_static/static web/
-          # Fix ownership (use sudo if needed for www group)
-          sudo chown -R atchess:www web/static || chown -R atchess:atchess web/static
+          # Fix ownership - skip if we can't change it (files will be owned by atchess-deploy)
+          # The systemd services run as atchess user, so they should still have read access
+          chown -R atchess:atchess web/static 2>/dev/null || true
           # Clean up temp directory
           rm -rf /tmp/extract_static
           
