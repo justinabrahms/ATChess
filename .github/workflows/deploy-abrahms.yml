@@ -80,9 +80,17 @@ jobs:
           set -e
           
           # Stop services before updating binaries
-          sudo systemctl stop atchess-protocol atchess-web || true
+          echo "Stopping services..."
+          sudo systemctl stop atchess-protocol || true
+          sudo systemctl stop atchess-web || true
           
-          # Move binaries to app directory
+          # Wait for services to fully stop
+          sleep 2
+          
+          # Force remove old binaries if they exist
+          sudo rm -f /srv/atchess/app/atchess-protocol /srv/atchess/app/atchess-web
+          
+          # Move new binaries to app directory
           cp /tmp/atchess-protocol /tmp/atchess-web /srv/atchess/app/
           chmod +x /srv/atchess/app/atchess-*
           
