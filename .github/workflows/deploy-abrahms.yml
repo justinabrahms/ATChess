@@ -133,18 +133,15 @@ jobs:
         
         # Check health endpoints (fail on error)
         echo "Checking protocol service health..."
-        if ! curl -f -s -o /dev/null -w "Health check status: %{http_code}\n" https://$DEPLOY_HOST/api/health; then
+        if ! curl -f -s -o /dev/null -w "Health check status: %{http_code}\n" https://$DEPLOY_HOST/health; then
           echo "❌ Protocol service health check failed!"
           echo "Checking service status on server..."
           ssh -i ~/.ssh/deploy_key -p ${DEPLOY_PORT:-22} ${DEPLOY_USER:-atchess-deploy}@${DEPLOY_HOST:-abrah.ms} << 'ENDSSH'
-            echo "=== Service Status ==="
-            sudo systemctl status atchess-protocol --no-pager || true
-            sudo systemctl status atchess-web --no-pager || true
+            echo "=== Checking processes ==="
+            ps aux | grep atchess || true
             echo ""
-            echo "=== Recent Logs ==="
-            sudo journalctl -u atchess-protocol -n 20 --no-pager || true
-            echo ""
-            sudo journalctl -u atchess-web -n 20 --no-pager || true
+            echo "=== Checking ports ==="
+            netstat -tlnp 2>/dev/null | grep -E ':(8080|8081)' || ss -tlnp 2>/dev/null | grep -E ':(8080|8081)' || true
         ENDSSH
           exit 1
         fi
