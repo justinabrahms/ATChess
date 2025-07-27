@@ -32,11 +32,11 @@ jobs:
     
     - name: Build binaries
       run: |
-        # Build protocol service
-        go build -o atchess-protocol ./cmd/protocol
+        # Build protocol service with static linking
+        CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-w -s" -o atchess-protocol ./cmd/protocol
         
-        # Build web service
-        go build -o atchess-web ./cmd/web
+        # Build web service with static linking
+        CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-w -s" -o atchess-web ./cmd/web
         
         # Make binaries executable
         chmod +x atchess-protocol atchess-web
@@ -96,13 +96,28 @@ jobs:
         DEPLOY_HOST: ${{ secrets.DEPLOY_HOST || 'atchess.abrah.ms' }}
       run: |
         # Wait for services to start
-        sleep 5
+        echo "Waiting for services to start..."
+        sleep 10
         
-        # Check health endpoints
+        # Check health endpoints (fail on error)
         echo "Checking protocol service health..."
-        curl -f https://$DEPLOY_HOST/api/health || echo "Protocol health check failed"
+        if ! curl -f -s -o /dev/null -w "Health check status: %{http_code}\n" https://$DEPLOY_HOST/api/health; then
+          echo "❌ Protocol service health check failed!"
+          echo "Checking service status on server..."
+          ssh -i ~/.ssh/deploy_key -p ${DEPLOY_PORT:-22} ${DEPLOY_USER:-atchess-deploy}@${DEPLOY_HOST:-abrah.ms} << 'ENDSSH'
+            echo "=== Service Status ==="
+            sudo systemctl status atchess-protocol --no-pager || true
+            sudo systemctl status atchess-web --no-pager || true
+            echo ""
+            echo "=== Recent Logs ==="
+            sudo journalctl -u atchess-protocol -n 20 --no-pager || true
+            echo ""
+            sudo journalctl -u atchess-web -n 20 --no-pager || true
+        ENDSSH
+          exit 1
+        fi
         
-        echo "Deployment completed!"
+        echo "✅ Health check passed!"
         echo "ATChess is available at: https://$DEPLOY_HOST"
     
     - name: Clean up SSH

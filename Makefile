@@ -4,17 +4,24 @@
 build: protocol web
 
 protocol:
-	go build -o bin/atchess-protocol cmd/protocol/main.go
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-w -s" -o bin/atchess-protocol cmd/protocol/main.go
 
 web:
-	go build -o bin/atchess-web cmd/web/main.go
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-w -s" -o bin/atchess-web cmd/web/main.go
+
+# Local development builds (for macOS)
+protocol-local:
+	go build -o bin/atchess-protocol-local cmd/protocol/main.go
+
+web-local:
+	go build -o bin/atchess-web-local cmd/web/main.go
 
 # Development
-run-protocol: protocol
-	./bin/atchess-protocol
+run-protocol: protocol-local
+	./bin/atchess-protocol-local
 
-run-web: web
-	./bin/atchess-web
+run-web: web-local
+	./bin/atchess-web-local
 
 # Development with auto-reload
 dev-protocol:
