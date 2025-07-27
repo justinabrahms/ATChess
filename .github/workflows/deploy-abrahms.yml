@@ -131,10 +131,29 @@ jobs:
         echo "Waiting for services to start..."
         sleep 10
         
-        # Check health endpoints (warn but don't fail)
-        echo "Checking protocol service health..."
-        if ! curl -f -s -o /dev/null -w "Health check status: %{http_code}\n" https://$DEPLOY_HOST/health; then
-          echo "⚠️  Protocol service health check returned non-200 status"
+        # Check health endpoints
+        echo "Checking service health..."
+        HEALTH_OK=false
+        
+        # Try the protocol service health endpoint
+        if curl -f -s -o /dev/null -w "Protocol health check status: %{http_code}\n" https://$DEPLOY_HOST/health; then
+          echo "✅ Protocol service health check passed!"
+          HEALTH_OK=true
+        else
+          echo "⚠️  Protocol service health check failed"
+        fi
+        
+        # Try the web service directly
+        if curl -f -s -o /dev/null -w "Web service check status: %{http_code}\n" https://$DEPLOY_HOST/; then
+          echo "✅ Web service is responding!"
+          HEALTH_OK=true
+        else
+          echo "⚠️  Web service check failed"
+        fi
+        
+        if [ "$HEALTH_OK" = false ]; then
+          echo "❌ Both services failed health checks!"
+          # Still don't exit with error to allow diagnostics to run
         fi
         
         # Always check service status
@@ -155,8 +174,12 @@ jobs:
           systemctl status atchess-web --no-pager 2>&1 || true
         ENDSSH
         
-        echo "✅ Health check passed!"
+        echo ""
+        echo "🚀 Deployment complete!"
         echo "ATChess is available at: https://$DEPLOY_HOST"
+        echo ""
+        echo "Note: The protocol service may need additional configuration."
+        echo "Check the logs above for service status details."
     
     - name: Clean up SSH
       if: always()
