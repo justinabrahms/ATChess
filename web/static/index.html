@@ -42,6 +42,12 @@
             display: flex;
             align-items: center;
             gap: 10px;
+            text-decoration: none;
+            color: white;
+        }
+        
+        .logo:hover {
+            opacity: 0.9;
         }
         
         .logo img {
@@ -553,10 +559,10 @@
     <!-- Header -->
     <header class="header">
         <div class="header-content">
-            <div class="logo">
+            <a href="/" class="logo">
                 <img src="/logo.jpg" alt="ATChess">
                 <span>ATChess</span>
-            </div>
+            </a>
             <div class="user-info" id="userInfo" style="display: none;">
                 <span class="user-handle" id="userHandle"></span>
                 <button class="btn-logout" onclick="logout()">Logout</button>
