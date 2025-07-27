@@ -67,13 +67,7 @@ jobs:
           static.tar.gz \
           $DEPLOY_USER@$DEPLOY_HOST:/tmp/
         
-        # Copy systemd service files if they exist
-        if [ -d deploy/systemd ]; then
-          tar -czf systemd.tar.gz -C deploy systemd
-          scp -i ~/.ssh/deploy_key -P $DEPLOY_PORT \
-            systemd.tar.gz \
-            $DEPLOY_USER@$DEPLOY_HOST:/tmp/
-        fi
+        # Systemd service files are installed during initial setup only
         
         # Deploy and restart services
         ssh -i ~/.ssh/deploy_key -p $DEPLOY_PORT $DEPLOY_USER@$DEPLOY_HOST << 'ENDSSH'
@@ -87,8 +81,8 @@ jobs:
           # Wait for services to fully stop
           sleep 2
           
-          # Force remove old binaries if they exist
-          sudo rm -f /srv/atchess/app/atchess-protocol /srv/atchess/app/atchess-web
+          # Force remove old binaries if they exist (no sudo needed - we have write access)
+          rm -f /srv/atchess/app/atchess-protocol /srv/atchess/app/atchess-web
           
           # Move new binaries to app directory
           cp /tmp/atchess-protocol /tmp/atchess-web /srv/atchess/app/
@@ -103,13 +97,7 @@ jobs:
           # Clean up temporary files
           rm -f /tmp/atchess-* /tmp/static.tar.gz
           
-          # Extract and update systemd service files if provided
-          if [ -f /tmp/systemd.tar.gz ]; then
-            cd /tmp
-            tar -xzf systemd.tar.gz
-            sudo cp systemd/*.service /etc/systemd/system/
-            rm -rf /tmp/systemd /tmp/systemd.tar.gz
-          fi
+          # Systemd service files are managed by the setup script, not deployment
           
           # Restart services using sudo (allowed by sudoers)
           sudo systemctl daemon-reload
