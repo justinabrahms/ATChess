@@ -227,15 +227,23 @@ SERVER_PORT=8080
 ATPROTO_PDS_URL=https://bsky.social
 ATPROTO_HANDLE=your-handle.bsky.social
 ATPROTO_PASSWORD=your-app-password
-ATPROTO_USE_DPOP=true
+ATPROTO_USE_DPOP=false
 
 # Firehose (optional)
 FIREHOSE_ENABLED=false
 FIREHOSE_URL=wss://bsky.social/xrpc/com.atproto.sync.subscribeRepos
 
 # Development
-DEVELOPMENT_DEBUG=false
-DEVELOPMENT_LOG_LEVEL=info
+DEVELOPMENT_DEBUG=true
+DEVELOPMENT_LOG_LEVEL=debug
+
+# Add defaults to help with startup
+ATCHESS_SERVER_HOST=0.0.0.0
+ATCHESS_SERVER_PORT=8080
+ATCHESS_ATPROTO_PDS_URL=https://bsky.social
+ATCHESS_ATPROTO_HANDLE=test.bsky.social
+ATCHESS_ATPROTO_PASSWORD=test-password
+ATCHESS_DEVELOPMENT_DEBUG=true
 EOF
 
 cat > $CONFIG_DIR/web.env << 'EOF'
