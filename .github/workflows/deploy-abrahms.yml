@@ -107,8 +107,8 @@ jobs:
           # Clean up temp directory
           rm -rf /tmp/extract_static
           
-          # Clean up temporary files
-          rm -f /tmp/atchess-* /tmp/static.tar.gz
+          # Clean up temporary files (ignore errors for files we don't own)
+          rm -f /tmp/atchess-* /tmp/static.tar.gz 2>/dev/null || true
           
           # Systemd service files are managed by the setup script, not deployment
           
