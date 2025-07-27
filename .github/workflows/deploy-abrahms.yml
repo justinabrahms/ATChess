@@ -59,6 +59,13 @@ jobs:
           atchess-protocol atchess-web \
           $DEPLOY_USER@$DEPLOY_HOST:/tmp/
         
+        # Copy wrapper script if it exists
+        if [ -f deploy/scripts/atchess-protocol-wrapper.sh ]; then
+          scp -i ~/.ssh/deploy_key -P $DEPLOY_PORT \
+            deploy/scripts/atchess-protocol-wrapper.sh \
+            $DEPLOY_USER@$DEPLOY_HOST:/tmp/
+        fi
+        
         # Copy static files
         tar -czf static.tar.gz -C web static
         scp -i ~/.ssh/deploy_key -P $DEPLOY_PORT \
@@ -83,6 +90,12 @@ jobs:
           # Move binaries to app directory
           cp /tmp/atchess-protocol /tmp/atchess-web /srv/atchess/app/
           chmod +x /srv/atchess/app/atchess-*
+          
+          # Install wrapper script if provided
+          if [ -f /tmp/atchess-protocol-wrapper.sh ]; then
+            cp /tmp/atchess-protocol-wrapper.sh /srv/atchess/app/
+            chmod +x /srv/atchess/app/atchess-protocol-wrapper.sh
+          fi
           
           # Extract and move static files
           cd /srv/atchess/app
