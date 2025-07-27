@@ -65,6 +65,14 @@ jobs:
           static.tar.gz \
           $DEPLOY_USER@$DEPLOY_HOST:/tmp/
         
+        # Copy systemd service files if they exist
+        if [ -d deploy/systemd ]; then
+          tar -czf systemd.tar.gz -C deploy systemd
+          scp -i ~/.ssh/deploy_key -P $DEPLOY_PORT \
+            systemd.tar.gz \
+            $DEPLOY_USER@$DEPLOY_HOST:/tmp/
+        fi
+        
         # Deploy and restart services
         ssh -i ~/.ssh/deploy_key -p $DEPLOY_PORT $DEPLOY_USER@$DEPLOY_HOST << 'ENDSSH'
           set -e
@@ -79,6 +87,14 @@ jobs:
           
           # Clean up temporary files
           rm -f /tmp/atchess-* /tmp/static.tar.gz
+          
+          # Extract and update systemd service files if provided
+          if [ -f /tmp/systemd.tar.gz ]; then
+            cd /tmp
+            tar -xzf systemd.tar.gz
+            sudo cp systemd/*.service /etc/systemd/system/
+            rm -rf /tmp/systemd /tmp/systemd.tar.gz
+          fi
           
           # Restart services using sudo (allowed by sudoers)
           sudo systemctl daemon-reload

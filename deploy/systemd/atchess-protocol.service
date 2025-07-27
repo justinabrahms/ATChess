@@ -1,38 +1,49 @@
 [Unit]
 Description=ATChess Protocol Service
-Documentation=https://github.com/justinabrahms/atchess
 After=network.target
 
 [Service]
 Type=simple
 User=atchess
-Group=atchess
-WorkingDirectory=/opt/atchess
-ExecStart=/opt/atchess/bin/atchess-protocol
-Restart=always
-RestartSec=10
+Group=www
+WorkingDirectory=/srv/atchess/app
 
-# Environment variables
-Environment="ATCHESS_SERVER_HOST=0.0.0.0"
-Environment="ATCHESS_SERVER_PORT=8080"
-Environment="ATCHESS_DEVELOPMENT_LOG_LEVEL=info"
-EnvironmentFile=-/etc/atchess/protocol.env
+# Load environment variables from file
+EnvironmentFile=/etc/atchess/protocol.env
+
+# Ensure variables are exported properly by using a wrapper script
+ExecStartPre=/bin/bash -c 'set -a; source /etc/atchess/protocol.env; set +a'
+ExecStart=/bin/bash -c 'set -a; source /etc/atchess/protocol.env; set +a; exec /srv/atchess/app/atchess-protocol'
+
+Restart=on-failure
+RestartSec=5
+
+StandardOutput=append:/srv/atchess/logs/protocol.log
+StandardError=append:/srv/atchess/logs/protocol-error.log
 
 # Security hardening
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/opt/atchess/data
-ReadOnlyPaths=/opt/atchess/bin
+ReadWritePaths=/srv/atchess/data /srv/atchess/logs
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=true
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RemoveIPC=true
+PrivateMounts=true
 
 # Resource limits
-LimitNOFILE=65536
-MemoryLimit=512M
+LimitNOFILE=1024
+MemoryLimit=256M
+CPUQuota=50%
 
 # Logging
-StandardOutput=journal
-StandardError=journal
 SyslogIdentifier=atchess-protocol
 
 [Install]
