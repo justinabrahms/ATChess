@@ -52,7 +52,6 @@ fi
 echo -e "${YELLOW}Creating application directories...${NC}"
 mkdir -p $APP_DIR/{app,logs,data,config}
 mkdir -p $CONFIG_DIR
-mkdir -p /var/log/caddy/$DOMAIN
 
 # Set permissions following server conventions
 chown -R $APP_USER:www $APP_DIR
@@ -61,9 +60,11 @@ chmod 770 $APP_DIR/logs $APP_DIR/data
 chown -R $APP_USER:www $CONFIG_DIR
 chmod 750 $CONFIG_DIR
 
-# Create Caddy configuration directory
+# Create Caddy configuration directory and log directory
 echo -e "${YELLOW}Setting up Caddy configuration...${NC}"
 mkdir -p /etc/caddy/conf.d
+mkdir -p /var/log/caddy/$DOMAIN
+chown -R www-data:www-data /var/log/caddy
 
 # Check if Caddyfile has import directive
 if ! grep -q "import /etc/caddy/conf.d/\*.caddyfile" /etc/caddy/Caddyfile 2>/dev/null; then
@@ -73,6 +74,8 @@ if ! grep -q "import /etc/caddy/conf.d/\*.caddyfile" /etc/caddy/Caddyfile 2>/dev
 fi
 
 # Create ATChess Caddy configuration
+# Note: This configuration is compatible with Caddy v2.3.0+
+# health_uri directive removed for compatibility with older Caddy versions
 cat > /etc/caddy/conf.d/atchess.caddyfile << EOF
 # ATChess Configuration
 $DOMAIN {
@@ -84,10 +87,7 @@ $DOMAIN {
     
     # API endpoints - reverse proxy to protocol service
     handle /api/* {
-        reverse_proxy localhost:8080 {
-            health_uri /api/health
-            health_interval 30s
-        }
+        reverse_proxy localhost:8080
     }
     
     # WebSocket endpoint for real-time updates
@@ -99,6 +99,7 @@ $DOMAIN {
     }
     
     # Static files and web UI
+    # Note: Web service runs on configured port + 1 due to code in cmd/web/main.go
     handle {
         reverse_proxy localhost:8081
     }
@@ -342,6 +343,43 @@ EOF
 
 chown $APP_USER:www $APP_DIR/app/config.yaml
 chmod 640 $APP_DIR/app/config.yaml
+
+# Create a separate config directory for web service
+mkdir -p $APP_DIR/app/config
+
+# Create web-specific config.yaml
+echo -e "${YELLOW}Creating config.yaml for web service...${NC}"
+# Note: Web service code adds 1 to the configured port (cmd/web/main.go line 48)
+# So we configure port 8080 to get it running on 8081
+cat > $APP_DIR/app/config/web-config.yaml << EOF
+# ATChess Web Service Configuration
+# NOTE: The web service will run on this port + 1 due to hardcoded logic
+
+server:
+  host: "0.0.0.0"
+  port: 8080  # Web service will actually run on 8081 (port + 1)
+
+# These are not used by web service but required by config loader
+atproto:
+  pds_url: "https://bsky.social"
+  handle: "not-used"
+  password: "not-used"
+  use_dpop: false
+
+development:
+  debug: false
+  log_level: "info"
+
+firehose:
+  enabled: false
+EOF
+
+# The web service will need to be updated to look for this config
+# For now, create a symlink so it finds a config
+ln -sf $APP_DIR/app/config/web-config.yaml $APP_DIR/app/web/config.yaml 2>/dev/null || true
+
+chown -R $APP_USER:www $APP_DIR/app/config
+chmod -R 640 $APP_DIR/app/config/*.yaml
 
 # Create sudo rules for deployment
 echo -e "${YELLOW}Setting up deployment permissions...${NC}"

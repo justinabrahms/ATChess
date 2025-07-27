@@ -135,8 +135,8 @@ jobs:
         echo "Checking service health..."
         HEALTH_OK=false
         
-        # Try the protocol service health endpoint
-        if curl -f -s -o /dev/null -w "Protocol health check status: %{http_code}\n" https://$DEPLOY_HOST/health; then
+        # Try the protocol service health endpoint via API path
+        if curl -f -s -o /dev/null -w "Protocol health check status: %{http_code}\n" https://$DEPLOY_HOST/api/health; then
           echo "✅ Protocol service health check passed!"
           HEALTH_OK=true
         else
