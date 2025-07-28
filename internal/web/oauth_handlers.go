@@ -160,7 +160,7 @@ func (s *Service) OAuthCallbackHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	
 	// Exchange code for tokens
-	tokens, err := oauthClient.ExchangeCodeForTokens(tokenEndpoint, code, authReq.CodeVerifier, authReq.DPoPKey)
+	tokens, err := oauthClient.ExchangeCodeForTokens(tokenEndpoint, iss, code, authReq.CodeVerifier, authReq.DPoPKey)
 	if err != nil {
 		log.Error().
 			Err(err).

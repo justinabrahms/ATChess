@@ -90,12 +90,12 @@ func (c *OAuthClient) BuildAuthorizationURL(authEndpoint, handle, state, codeCha
 }
 
 // CreateClientAssertion creates a JWT client assertion for token requests
-func (c *OAuthClient) CreateClientAssertion(tokenEndpoint string) (string, error) {
+func (c *OAuthClient) CreateClientAssertion(issuer string) (string, error) {
 	now := time.Now()
 	claims := jwt.MapClaims{
 		"iss": c.clientID,
 		"sub": c.clientID,
-		"aud": tokenEndpoint,
+		"aud": issuer, // AT Protocol expects the issuer URL, not the token endpoint
 		"iat": now.Unix(),
 		"exp": now.Add(5 * time.Minute).Unix(),
 		"jti": generateJTI(),
@@ -113,9 +113,9 @@ func (c *OAuthClient) CreateClientAssertion(tokenEndpoint string) (string, error
 }
 
 // ExchangeCodeForTokens exchanges an authorization code for tokens
-func (c *OAuthClient) ExchangeCodeForTokens(tokenEndpoint, code, codeVerifier string, dpopKey *ecdsa.PrivateKey) (*TokenResponse, error) {
+func (c *OAuthClient) ExchangeCodeForTokens(tokenEndpoint, issuer, code, codeVerifier string, dpopKey *ecdsa.PrivateKey) (*TokenResponse, error) {
 	// Create client assertion
-	clientAssertion, err := c.CreateClientAssertion(tokenEndpoint)
+	clientAssertion, err := c.CreateClientAssertion(issuer)
 	if err != nil {
 		return nil, err
 	}
