@@ -84,11 +84,9 @@ make run-web        # Runs on port 8081
 
 **OAuth Authentication:** ATChess uses AT Protocol OAuth for secure authentication. Users authorize ATChess to act on their behalf without sharing passwords. Client metadata is served dynamically at `/client-metadata.json` with automatic key management.
 
-**⚠️ Production Limitation:** AT Protocol OAuth for third-party production domains is still in limited rollout. Production deployments will receive a "redirect_uris must use localhost" error. **Use password authentication for production deployments** until OAuth is publicly available. See [OAuth Production Setup](docs/oauth-production-setup.md) for details.
-
 **⚠️ IMPORTANT: You MUST generate your own OAuth keys!** See [OAuth Key Setup](docs/oauth-key-setup.md) for instructions. The deployment script will generate keys automatically if they don't exist.
 
-**Password Authentication (Recommended for Production):** If OAuth is not configured, ATChess falls back to app password authentication. Users can create app passwords at https://bsky.app/settings/app-passwords
+**Password Authentication (Legacy):** If OAuth is not configured, ATChess falls back to app password authentication. Users can create app passwords at https://bsky.app/settings/app-passwords
 
 **Local Development:** For testing with a local PDS, see the [Local PDS Setup Guide](docs/local-pds-setup.md).
 
