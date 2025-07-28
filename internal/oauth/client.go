@@ -120,50 +120,73 @@ func (c *OAuthClient) ExchangeCodeForTokens(tokenEndpoint, code, codeVerifier st
 		return nil, err
 	}
 	
-	// Prepare request
-	data := url.Values{}
-	data.Set("grant_type", "authorization_code")
-	data.Set("code", code)
-	data.Set("redirect_uri", c.redirectURI)
-	data.Set("code_verifier", codeVerifier)
-	data.Set("client_id", c.clientID)
-	data.Set("client_assertion_type", "urn:ietf:params:oauth:client-assertion-type:jwt-bearer")
-	data.Set("client_assertion", clientAssertion)
-	
-	req, err := http.NewRequest("POST", tokenEndpoint, strings.NewReader(data.Encode()))
-	if err != nil {
-		return nil, err
-	}
-	
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	
-	// Add DPoP header if key provided
-	if dpopKey != nil {
-		dpopToken, err := createDPoPToken(dpopKey, "POST", tokenEndpoint, "")
+	// Try up to 2 times (initial + 1 retry with nonce)
+	var nonce string
+	for attempt := 0; attempt < 2; attempt++ {
+		// Prepare request
+		data := url.Values{}
+		data.Set("grant_type", "authorization_code")
+		data.Set("code", code)
+		data.Set("redirect_uri", c.redirectURI)
+		data.Set("code_verifier", codeVerifier)
+		data.Set("client_id", c.clientID)
+		data.Set("client_assertion_type", "urn:ietf:params:oauth:client-assertion-type:jwt-bearer")
+		data.Set("client_assertion", clientAssertion)
+		
+		req, err := http.NewRequest("POST", tokenEndpoint, strings.NewReader(data.Encode()))
 		if err != nil {
 			return nil, err
 		}
-		req.Header.Set("DPoP", dpopToken)
+		
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		
+		// Add DPoP header if key provided
+		if dpopKey != nil {
+			dpopToken, err := createDPoPToken(dpopKey, "POST", tokenEndpoint, "", nonce)
+			if err != nil {
+				return nil, err
+			}
+			req.Header.Set("DPoP", dpopToken)
+		}
+		
+		resp, err := c.httpClient.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		defer resp.Body.Close()
+		
+		// Check for DPoP nonce requirement
+		if resp.StatusCode == http.StatusBadRequest {
+			body, _ := io.ReadAll(resp.Body)
+			var errorResp struct {
+				Error string `json:"error"`
+				ErrorDescription string `json:"error_description"`
+			}
+			if err := json.Unmarshal(body, &errorResp); err == nil && errorResp.Error == "use_dpop_nonce" {
+				// Extract nonce from DPoP-Nonce header and retry
+				if newNonce := resp.Header.Get("DPoP-Nonce"); newNonce != "" && attempt == 0 {
+					nonce = newNonce
+					continue // Retry with nonce
+				}
+			}
+			return nil, fmt.Errorf("token exchange failed: HTTP %d - %s", resp.StatusCode, string(body))
+		}
+		
+		if resp.StatusCode != http.StatusOK {
+			// Read error response
+			body, _ := io.ReadAll(resp.Body)
+			return nil, fmt.Errorf("token exchange failed: HTTP %d - %s", resp.StatusCode, string(body))
+		}
+		
+		var tokenResp TokenResponse
+		if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
+			return nil, err
+		}
+		
+		return &tokenResp, nil
 	}
 	
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	
-	if resp.StatusCode != http.StatusOK {
-		// Read error response
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("token exchange failed: HTTP %d - %s", resp.StatusCode, string(body))
-	}
-	
-	var tokenResp TokenResponse
-	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
-		return nil, err
-	}
-	
-	return &tokenResp, nil
+	return nil, fmt.Errorf("token exchange failed after retries")
 }
 
 // TokenResponse represents the OAuth token response
@@ -192,7 +215,7 @@ func generateJTI() string {
 	return base64.RawURLEncoding.EncodeToString(b)
 }
 
-func createDPoPToken(privateKey *ecdsa.PrivateKey, method, uri, accessToken string) (string, error) {
+func createDPoPToken(privateKey *ecdsa.PrivateKey, method, uri, accessToken string, nonce string) (string, error) {
 	now := time.Now()
 	
 	// Create DPoP JWT
@@ -202,6 +225,11 @@ func createDPoPToken(privateKey *ecdsa.PrivateKey, method, uri, accessToken stri
 		"htu": uri,
 		"iat": now.Unix(),
 		"exp": now.Add(5 * time.Minute).Unix(),
+	}
+	
+	// Add nonce if provided (required by some servers)
+	if nonce != "" {
+		claims["nonce"] = nonce
 	}
 	
 	// Add access token hash if provided
