@@ -20,10 +20,18 @@ Server setup script for the atchess.abrah.ms deployment. This script:
 ```bash
 # Run from anywhere - downloads pre-built binaries
 wget https://raw.githubusercontent.com/justinabrahms/atchess/main/deploy/scripts/setup-atchess-abrahms.sh
+
+# Install latest stable release (default)
 sudo bash ./setup-atchess-abrahms.sh
 
-# To install a specific version:
+# Install latest development build from main branch
+USE_LATEST_BUILD=true sudo bash ./setup-atchess-abrahms.sh
+
+# Install a specific version
 ATCHESS_VERSION=v1.0.0 sudo bash ./setup-atchess-abrahms.sh
+
+# Install a specific development build
+ATCHESS_VERSION=main-a1b2c3d4 sudo bash ./setup-atchess-abrahms.sh
 ```
 
 **Security features:**
@@ -44,10 +52,13 @@ To create a deployment script for your own domain:
 ## Binary Releases
 
 ATChess uses GitHub Actions to build and release binaries automatically:
-- Triggered on git tags (e.g., `v1.0.0`)
+- **Every push to main**: Creates a pre-release with format `main-XXXXXXXX`
+- **Git tags**: Creates stable releases (e.g., `v1.0.0`)
 - Builds Linux AMD64 binaries with CGO disabled (fully static)
 - Creates GitHub releases with downloadable artifacts
 - No build tools needed on production servers
+
+This enables continuous deployment - every commit to main is deployable!
 
 ## OAuth Key Management
 

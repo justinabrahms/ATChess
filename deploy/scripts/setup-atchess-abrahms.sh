@@ -39,12 +39,21 @@ mkdir -p "/var/log/atchess"
 chown root:"$ATCHESS_USER" "$KEY_DIR"
 chmod 750 "$KEY_DIR"
 
-# Get the latest release version if not specified
+# Get the version to install
 if [ -z "${ATCHESS_VERSION:-}" ]; then
-    echo "🔍 Finding latest release..."
-    ATCHESS_VERSION=$(curl -s https://api.github.com/repos/justinabrahms/atchess/releases/latest | grep '"tag_name"' | cut -d'"' -f4)
+    if [ "${USE_LATEST_BUILD:-false}" = "true" ]; then
+        # Get the most recent build (including pre-releases from main branch)
+        echo "🔍 Finding latest build (including development builds)..."
+        ATCHESS_VERSION=$(curl -s https://api.github.com/repos/justinabrahms/atchess/releases | jq -r '.[0].tag_name // empty')
+    else
+        # Get the latest stable release (default behavior)
+        echo "🔍 Finding latest stable release..."
+        ATCHESS_VERSION=$(curl -s https://api.github.com/repos/justinabrahms/atchess/releases/latest | grep '"tag_name"' | cut -d'"' -f4)
+    fi
+    
     if [ -z "$ATCHESS_VERSION" ]; then
-        echo "❌ Could not determine latest version. Please specify ATCHESS_VERSION environment variable."
+        echo "❌ Could not determine version. Please specify ATCHESS_VERSION environment variable."
+        echo "   Or use USE_LATEST_BUILD=true to get the latest development build."
         exit 1
     fi
 fi

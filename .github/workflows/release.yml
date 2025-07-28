@@ -2,6 +2,8 @@ name: Build and Release
 
 on:
   push:
+    branches:
+      - main
     tags:
       - 'v*'
   workflow_dispatch:
@@ -29,11 +31,23 @@ jobs:
       run: |
         if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
           VERSION="${{ github.event.inputs.tag }}"
-        else
+        elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
           VERSION="${GITHUB_REF#refs/tags/}"
+        else
+          # For pushes to main, use commit SHA
+          VERSION="main-${GITHUB_SHA::8}"
         fi
         echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
         echo "Building version: ${VERSION}"
+        
+        # Determine if this is a release or pre-release
+        if [[ "$VERSION" == v* ]]; then
+          echo "IS_RELEASE=true" >> $GITHUB_OUTPUT
+          echo "PRERELEASE=false" >> $GITHUB_OUTPUT
+        else
+          echo "IS_RELEASE=true" >> $GITHUB_OUTPUT
+          echo "PRERELEASE=true" >> $GITHUB_OUTPUT
+        fi
     
     - name: Build binaries
       run: |
@@ -98,7 +112,7 @@ jobs:
           ## What's Changed
           See the [commit history](https://github.com/justinabrahms/atchess/commits/${{ steps.version.outputs.VERSION }}) for details.
         draft: false
-        prerelease: false
+        prerelease: ${{ steps.version.outputs.PRERELEASE == 'true' }}
     
     - name: Upload Release Asset
       uses: actions/upload-release-asset@v1
