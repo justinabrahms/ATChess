@@ -81,29 +81,29 @@ jobs:
           # Wait for services to fully stop
           sleep 2
           
-          # Force remove old binaries if they exist (no sudo needed - we have write access)
-          rm -f /srv/atchess/app/atchess-protocol /srv/atchess/app/atchess-web
+          # Remove old binaries with sudo (they're owned by atchess user)
+          sudo rm -f /srv/atchess/app/atchess-protocol /srv/atchess/app/atchess-web
           
-          # Move new binaries to app directory
-          cp /tmp/atchess-protocol /tmp/atchess-web /srv/atchess/app/
-          chmod +x /srv/atchess/app/atchess-*
+          # Copy new binaries to app directory
+          sudo cp /tmp/atchess-protocol /tmp/atchess-web /srv/atchess/app/
+          sudo chmod +x /srv/atchess/app/atchess-*
+          sudo chown atchess:atchess /srv/atchess/app/atchess-*
           
           # No wrapper script needed - environment is handled by systemd
           
           # Extract static files with proper ownership
           cd /srv/atchess/app
-          rm -rf web/static
-          mkdir -p web
-          # Extract to temp directory first to avoid permission issues
+          sudo rm -rf web/static
+          sudo mkdir -p web
+          # Extract to temp directory first
           mkdir -p /tmp/extract_static
           cd /tmp/extract_static
           tar xzf /tmp/static.tar.gz
-          # Move the extracted files to the final location
+          # Move the extracted files to the final location with sudo
           cd /srv/atchess/app
-          mv /tmp/extract_static/static web/
-          # Fix ownership - skip if we can't change it (files will be owned by atchess-deploy)
-          # The systemd services run as atchess user, so they should still have read access
-          chown -R atchess:atchess web/static 2>/dev/null || true
+          sudo mv /tmp/extract_static/static web/
+          # Fix ownership
+          sudo chown -R atchess:atchess web/static
           # Clean up temp directory
           rm -rf /tmp/extract_static
           
