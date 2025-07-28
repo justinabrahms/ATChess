@@ -1,0 +1,17 @@
+# ATChess Caddy Configuration
+# Include this in your Caddyfile for the ATChess domain
+
+# OAuth client metadata - MUST be accessible at root path
+handle_path /client-metadata.json {
+    reverse_proxy localhost:8080
+}
+
+# API routes (including OAuth callbacks)
+handle_path /api/* {
+    reverse_proxy localhost:8080
+}
+
+# Web interface (must be last to catch all other routes)
+handle {
+    reverse_proxy localhost:8081
+}

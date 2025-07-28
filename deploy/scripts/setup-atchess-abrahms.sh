@@ -59,7 +59,6 @@ mkdir -p "$ATCHESS_DIR"
 mkdir -p "/etc/atchess"
 mkdir -p "$KEY_DIR"
 mkdir -p "/var/log/atchess"
-mkdir -p "/etc/atchess/nginx"
 
 # Set proper permissions on key directory
 chown root:"$ATCHESS_USER" "$KEY_DIR"
@@ -325,69 +324,34 @@ echo "   - View logs: journalctl -u $SERVICE_NAME -f"
 echo "   - Restart: systemctl restart $SERVICE_NAME"
 echo "   - Stop: systemctl stop $SERVICE_NAME atchess-web"
 echo ""
-echo "🔧 IMPORTANT: Nginx Configuration Required!"
-echo "   ==========================================="
+echo "🔧 IMPORTANT: Caddy Configuration Required!"
+echo "   ========================================"
 echo ""
-echo "   The OAuth callback error indicates nginx is not routing /client-metadata.json correctly."
+echo "   The OAuth callback error indicates Caddy is not routing /client-metadata.json correctly."
 echo ""
-echo "   Option 1: Include the provided nginx config snippet"
-echo "   -------------------------------------------------"
-echo "   A sample nginx configuration has been created at:"
-echo "   /etc/atchess/nginx/atchess.conf"
+echo "   Add this to your Caddyfile for $DOMAIN:"
 echo ""
-echo "   Add this line to your nginx server block for $DOMAIN:"
-echo "   include /etc/atchess/nginx/atchess.conf;"
+echo "   $DOMAIN {"
+echo "       # OAuth client metadata - MUST be accessible at root path"
+echo "       handle_path /client-metadata.json {"
+echo "           reverse_proxy localhost:8080"
+echo "       }"
 echo ""
-echo "   Option 2: Manual configuration"
-echo "   ------------------------------"
-echo "   Or add these location blocks to your nginx config:"
+echo "       # API routes (including OAuth callbacks)"
+echo "       handle_path /api/* {"
+echo "           reverse_proxy localhost:8080"
+echo "       }"
 echo ""
-cat > /etc/atchess/nginx/atchess.conf << 'EOF'
-# OAuth client metadata - MUST be accessible at root path
-location = /client-metadata.json {
-    proxy_pass http://localhost:8080/client-metadata.json;
-    proxy_set_header Host $host;
-    proxy_set_header X-Real-IP $remote_addr;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto $scheme;
-    
-    # CORS headers for OAuth metadata
-    add_header Access-Control-Allow-Origin "*";
-    add_header Access-Control-Allow-Methods "GET";
-}
-
-# API routes (including OAuth callbacks)
-location /api/ {
-    proxy_pass http://localhost:8080/api/;
-    proxy_set_header Host $host;
-    proxy_set_header X-Real-IP $remote_addr;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto $scheme;
-    
-    # WebSocket support for real-time updates
-    proxy_set_header Upgrade $http_upgrade;
-    proxy_set_header Connection "upgrade";
-    proxy_read_timeout 86400;
-    
-    # Increase buffer sizes for OAuth callbacks
-    proxy_buffer_size 8k;
-    proxy_buffers 8 8k;
-}
-
-# Web interface (must be last to catch all other routes)
-location / {
-    proxy_pass http://localhost:8081/;
-    proxy_set_header Host $host;
-    proxy_set_header X-Real-IP $remote_addr;
-    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-    proxy_set_header X-Forwarded-Proto $scheme;
-}
-EOF
-chmod 644 /etc/atchess/nginx/atchess.conf
-echo "   cat /etc/atchess/nginx/atchess.conf"
+echo "       # Web interface (must be last to catch all other routes)"
+echo "       handle {"
+echo "           reverse_proxy localhost:8081"
+echo "       }"
 echo ""
-echo "   After updating nginx config, reload it:"
-echo "   sudo nginx -t && sudo nginx -s reload"
+echo "       # Your existing TLS and logging config..."
+echo "   }"
+echo ""
+echo "   After updating Caddyfile, reload it:"
+echo "   sudo systemctl reload caddy"
 echo ""
 
 # Check for missing required environment variables
