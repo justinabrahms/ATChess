@@ -255,48 +255,55 @@ systemctl daemon-reload
 # Enable services if not already enabled
 systemctl enable $SERVICE_NAME atchess-web 2>/dev/null || true
 
-# Restart services
-echo "🚀 Restarting services..."
-systemctl restart $SERVICE_NAME atchess-web
-
-# Wait for services to start
-sleep 3
-
-# Check service status
-if systemctl is-active --quiet $SERVICE_NAME; then
-    echo "✅ Protocol service is running"
+# Only restart services if binaries exist
+if [ -f "$ATCHESS_DIR/bin/atchess-protocol" ] && [ -f "$ATCHESS_DIR/bin/atchess-web" ]; then
+    echo "🚀 Restarting services..."
+    systemctl restart $SERVICE_NAME atchess-web
+    
+    # Wait for services to start
+    sleep 3
+    
+    # Check service status
+    if systemctl is-active --quiet $SERVICE_NAME; then
+        echo "✅ Protocol service is running"
+    else
+        echo "❌ Protocol service failed to start"
+        journalctl -u $SERVICE_NAME -n 50
+        exit 1
+    fi
+    
+    if systemctl is-active --quiet atchess-web; then
+        echo "✅ Web service is running"
+    else
+        echo "❌ Web service failed to start"
+        journalctl -u atchess-web -n 50
+        exit 1
+    fi
 else
-    echo "❌ Protocol service failed to start"
-    journalctl -u $SERVICE_NAME -n 50
-    exit 1
+    echo "⚠️  Binaries not found - skipping service restart"
+    echo "   Services will start automatically after first deployment"
 fi
 
-if systemctl is-active --quiet atchess-web; then
-    echo "✅ Web service is running"
-else
-    echo "❌ Web service failed to start"
-    journalctl -u atchess-web -n 50
-    exit 1
-fi
-
-# Test endpoints
-echo "🧪 Testing endpoints..."
-if curl -f http://localhost:8080/api/health &> /dev/null; then
-    echo "✅ Protocol API is responding"
-else
-    echo "❌ Protocol API is not responding"
-fi
-
-if curl -f http://localhost:8081 &> /dev/null; then
-    echo "✅ Web interface is responding"
-else
-    echo "❌ Web interface is not responding"
-fi
-
-if curl -f http://localhost:8080/client-metadata.json &> /dev/null; then
-    echo "✅ OAuth client metadata is accessible"
-else
-    echo "❌ OAuth client metadata is not accessible"
+# Test endpoints only if services are running
+if [ -f "$ATCHESS_DIR/bin/atchess-protocol" ] && [ -f "$ATCHESS_DIR/bin/atchess-web" ]; then
+    echo "🧪 Testing endpoints..."
+    if curl -f http://localhost:8080/api/health &> /dev/null; then
+        echo "✅ Protocol API is responding"
+    else
+        echo "❌ Protocol API is not responding"
+    fi
+    
+    if curl -f http://localhost:8081 &> /dev/null; then
+        echo "✅ Web interface is responding"
+    else
+        echo "❌ Web interface is not responding"
+    fi
+    
+    if curl -f http://localhost:8080/client-metadata.json &> /dev/null; then
+        echo "✅ OAuth client metadata is accessible"
+    else
+        echo "❌ OAuth client metadata is not accessible"
+    fi
 fi
 
 echo ""

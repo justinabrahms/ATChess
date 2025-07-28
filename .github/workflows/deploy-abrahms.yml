@@ -89,17 +89,18 @@ jobs:
           cp /tmp/atchess-protocol /tmp/atchess-web "$STAGING_DIR/"
           chmod +x "$STAGING_DIR"/atchess-*
           
-          # Move binaries from staging to app directory
+          # Move binaries from staging to app bin directory
           # Since we're in the atchess group, we should be able to write if permissions are correct
-          mv -f "$STAGING_DIR"/atchess-protocol /srv/atchess/app/ || {
-            echo "ERROR: Cannot write to /srv/atchess/app/"
+          mkdir -p /srv/atchess/app/bin
+          mv -f "$STAGING_DIR"/atchess-protocol /srv/atchess/app/bin/ || {
+            echo "ERROR: Cannot write to /srv/atchess/app/bin/"
             echo "Directory permissions:"
-            ls -ld /srv/atchess/app/
+            ls -ld /srv/atchess/app/ /srv/atchess/app/bin/
             echo "Current user groups:"
             id
             exit 1
           }
-          mv -f "$STAGING_DIR"/atchess-web /srv/atchess/app/
+          mv -f "$STAGING_DIR"/atchess-web /srv/atchess/app/bin/
           
           # Clean up staging
           rmdir "$STAGING_DIR" 2>/dev/null || true
@@ -171,7 +172,7 @@ jobs:
           netstat -tlnp 2>/dev/null | grep -E ':(8080|8081)' || ss -tlnp 2>/dev/null | grep -E ':(8080|8081)' || true
           echo ""
           echo "=== Checking binaries ==="
-          ls -la /srv/atchess/app/atchess-* || true
+          ls -la /srv/atchess/app/bin/atchess-* || true
           echo ""
           echo "=== Checking systemd services (without sudo) ==="
           systemctl status atchess-protocol --no-pager 2>&1 || true
