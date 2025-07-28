@@ -29,6 +29,30 @@ if ! id -u "$ATCHESS_USER" >/dev/null 2>&1; then
     useradd -r -s /bin/false -d /var/lib/atchess -m "$ATCHESS_USER"
 fi
 
+# Create deploy user if doesn't exist (for GitHub Actions)
+DEPLOY_USER="atchess-deploy"
+if ! id -u "$DEPLOY_USER" >/dev/null 2>&1; then
+    echo "👤 Creating deploy user..."
+    useradd -r -s /bin/bash -d /home/atchess-deploy -m "$DEPLOY_USER"
+fi
+
+# Add deploy user to atchess group for file access
+usermod -a -G "$ATCHESS_USER" "$DEPLOY_USER"
+
+# Set up minimal sudoers for deploy user (only for systemctl)
+echo "🔐 Configuring deploy user permissions..."
+cat > /etc/sudoers.d/atchess-deploy <<EOF
+# Allow atchess-deploy to manage ATChess services only
+$DEPLOY_USER ALL=(root) NOPASSWD: /bin/systemctl stop atchess-protocol
+$DEPLOY_USER ALL=(root) NOPASSWD: /bin/systemctl stop atchess-web
+$DEPLOY_USER ALL=(root) NOPASSWD: /bin/systemctl restart atchess-protocol
+$DEPLOY_USER ALL=(root) NOPASSWD: /bin/systemctl restart atchess-web
+$DEPLOY_USER ALL=(root) NOPASSWD: /bin/systemctl daemon-reload
+$DEPLOY_USER ALL=(root) NOPASSWD: /bin/systemctl status atchess-protocol
+$DEPLOY_USER ALL=(root) NOPASSWD: /bin/systemctl status atchess-web
+EOF
+chmod 440 /etc/sudoers.d/atchess-deploy
+
 # Create directory structure
 echo "📁 Setting up directories..."
 mkdir -p "$ATCHESS_DIR"
@@ -48,11 +72,21 @@ echo "📁 Setting up directory structure..."
 mkdir -p "$ATCHESS_DIR/bin"
 mkdir -p "$ATCHESS_DIR/web/static"
 mkdir -p "$ATCHESS_DIR/lexicons"
+mkdir -p "/srv/atchess/staging"
 
 # OAuth key generator is not needed on the server - generate keys locally
 
-# Ensure ownership is correct
+# Ensure ownership and permissions for deployment
+# Set group ownership to allow deploy user to write
 chown -R "$ATCHESS_USER:$ATCHESS_USER" "$ATCHESS_DIR"
+# Add group write permissions for deployment
+chmod -R g+w "$ATCHESS_DIR"
+# Ensure directories have group execute permission
+find "$ATCHESS_DIR" -type d -exec chmod g+x {} \;
+
+# Set up staging directory permissions
+chown "$ATCHESS_USER:$ATCHESS_USER" /srv/atchess/staging
+chmod 775 /srv/atchess/staging
 
 echo "✅ Directory structure ready for auto-deployment"
 

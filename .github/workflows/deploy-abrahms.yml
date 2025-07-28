@@ -73,7 +73,7 @@ jobs:
         ssh -i ~/.ssh/deploy_key -p $DEPLOY_PORT $DEPLOY_USER@$DEPLOY_HOST << 'ENDSSH'
           set -e
           
-          # Stop services before updating binaries
+          # Stop services before updating binaries (using sudo - allowed in sudoers)
           echo "Stopping services..."
           sudo systemctl stop atchess-protocol || true
           sudo systemctl stop atchess-web || true
@@ -81,36 +81,41 @@ jobs:
           # Wait for services to fully stop
           sleep 2
           
-          # Remove old binaries with sudo (they're owned by atchess user)
-          sudo rm -f /srv/atchess/app/atchess-protocol /srv/atchess/app/atchess-web
+          # Move binaries to a staging area with group permissions
+          STAGING_DIR="/srv/atchess/staging"
+          mkdir -p "$STAGING_DIR"
           
-          # Copy new binaries to app directory
-          sudo cp /tmp/atchess-protocol /tmp/atchess-web /srv/atchess/app/
-          sudo chmod +x /srv/atchess/app/atchess-*
-          sudo chown atchess:atchess /srv/atchess/app/atchess-*
+          # Copy new binaries to staging (we can write here)
+          cp /tmp/atchess-protocol /tmp/atchess-web "$STAGING_DIR/"
+          chmod +x "$STAGING_DIR"/atchess-*
           
-          # No wrapper script needed - environment is handled by systemd
+          # Move binaries from staging to app directory
+          # Since we're in the atchess group, we should be able to write if permissions are correct
+          mv -f "$STAGING_DIR"/atchess-protocol /srv/atchess/app/ || {
+            echo "ERROR: Cannot write to /srv/atchess/app/"
+            echo "Directory permissions:"
+            ls -ld /srv/atchess/app/
+            echo "Current user groups:"
+            id
+            exit 1
+          }
+          mv -f "$STAGING_DIR"/atchess-web /srv/atchess/app/
           
-          # Extract static files with proper ownership
+          # Clean up staging
+          rmdir "$STAGING_DIR" 2>/dev/null || true
+          
+          # Extract static files
           cd /srv/atchess/app
-          sudo rm -rf web/static
-          sudo mkdir -p web
-          # Extract to temp directory first
-          mkdir -p /tmp/extract_static
-          cd /tmp/extract_static
+          rm -rf web/static 2>/dev/null || true
+          mkdir -p web
+          
+          # Extract directly to web directory
+          cd web
           tar xzf /tmp/static.tar.gz
-          # Move the extracted files to the final location with sudo
-          cd /srv/atchess/app
-          sudo mv /tmp/extract_static/static web/
-          # Fix ownership
-          sudo chown -R atchess:atchess web/static
-          # Clean up temp directory
-          rm -rf /tmp/extract_static
+          cd ..
           
-          # Clean up temporary files (ignore errors for files we don't own)
+          # Clean up temporary files
           rm -f /tmp/atchess-* /tmp/static.tar.gz 2>/dev/null || true
-          
-          # Systemd service files are managed by the setup script, not deployment
           
           # Restart services using sudo (allowed by sudoers)
           sudo systemctl daemon-reload
