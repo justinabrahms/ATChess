@@ -448,7 +448,10 @@ func (s *Service) GetCurrentUserHandler(w http.ResponseWriter, r *http.Request) 
 func (s *Service) ClientMetadataHandler(w http.ResponseWriter, r *http.Request) {
 	// Get the host from the request to build proper URLs
 	scheme := "https"
-	if r.TLS == nil {
+	// Check X-Forwarded-Proto header first (set by reverse proxies like Caddy/nginx)
+	if proto := r.Header.Get("X-Forwarded-Proto"); proto != "" {
+		scheme = proto
+	} else if r.TLS == nil {
 		scheme = "http"
 	}
 	host := r.Host
