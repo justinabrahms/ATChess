@@ -6,7 +6,8 @@
 set -euo pipefail
 
 # Configuration for atchess.abrah.ms deployment
-ATCHESS_DIR="/opt/atchess"
+# Match the paths used by the auto-deploy workflow
+ATCHESS_DIR="/srv/atchess/app"
 ATCHESS_USER="atchess"
 KEY_DIR="/etc/atchess/keys"
 OAUTH_KEY_PATH="$KEY_DIR/oauth-private-key.pem"
@@ -39,68 +40,47 @@ mkdir -p "/var/log/atchess"
 chown root:"$ATCHESS_USER" "$KEY_DIR"
 chmod 750 "$KEY_DIR"
 
-# Get the version to install
-if [ -z "${ATCHESS_VERSION:-}" ]; then
-    if [ "${USE_LATEST_BUILD:-false}" = "true" ]; then
-        # Get the most recent build (including pre-releases from main branch)
-        echo "🔍 Finding latest build (including development builds)..."
-        ATCHESS_VERSION=$(curl -s https://api.github.com/repos/justinabrahms/atchess/releases | jq -r '.[0].tag_name // empty')
-    else
-        # Get the latest stable release (default behavior)
-        echo "🔍 Finding latest stable release..."
-        ATCHESS_VERSION=$(curl -s https://api.github.com/repos/justinabrahms/atchess/releases/latest | grep '"tag_name"' | cut -d'"' -f4)
-    fi
-    
-    if [ -z "$ATCHESS_VERSION" ]; then
-        echo "❌ Could not determine version. Please specify ATCHESS_VERSION environment variable."
-        echo "   Or use USE_LATEST_BUILD=true to get the latest development build."
-        exit 1
-    fi
-fi
+# Note: This setup script assumes your auto-deploy workflow handles binary deployment
+# We only need to ensure directories exist and download the key generator if needed
 
-echo "📦 Installing ATChess $ATCHESS_VERSION..."
-
-# Download and extract binaries
-TEMP_DIR=$(mktemp -d)
-cd "$TEMP_DIR"
-
-echo "📥 Downloading release package..."
-DOWNLOAD_URL="https://github.com/justinabrahms/atchess/releases/download/${ATCHESS_VERSION}/atchess-${ATCHESS_VERSION}-linux-amd64.tar.gz"
-
-if ! wget -q "$DOWNLOAD_URL"; then
-    echo "❌ Failed to download release from: $DOWNLOAD_URL"
-    echo "   Please check that version $ATCHESS_VERSION exists"
-    rm -rf "$TEMP_DIR"
-    exit 1
-fi
-
-echo "📦 Extracting files..."
-tar -xzf "atchess-${ATCHESS_VERSION}-linux-amd64.tar.gz"
-
-# Create directories
+# Create required directories
+echo "📁 Setting up directory structure..."
 mkdir -p "$ATCHESS_DIR/bin"
 mkdir -p "$ATCHESS_DIR/web/static"
 mkdir -p "$ATCHESS_DIR/lexicons"
 
-# Copy binaries
-cp atchess-protocol atchess-web generate-oauth-keys "$ATCHESS_DIR/bin/"
-chmod +x "$ATCHESS_DIR/bin/"*
-
-# Copy static files
-cp -r web-static/* "$ATCHESS_DIR/web/static/"
-cp -r lexicons/* "$ATCHESS_DIR/lexicons/"
-
-# Copy version file
-cp VERSION "$ATCHESS_DIR/"
+# Download just the OAuth key generator if it doesn't exist
+if [ ! -f "$ATCHESS_DIR/bin/generate-oauth-keys" ]; then
+    echo "📥 Downloading OAuth key generator..."
+    TEMP_DIR=$(mktemp -d)
+    cd "$TEMP_DIR"
+    
+    # Download the key generator from the latest build
+    if ! wget -q "https://github.com/justinabrahms/atchess/releases/latest/download/generate-oauth-keys" -O generate-oauth-keys; then
+        echo "⚠️  Could not download key generator, will build it locally..."
+        # Fallback: download just the source for the key generator
+        wget -q "https://raw.githubusercontent.com/justinabrahms/atchess/main/cmd/generate-oauth-keys/main.go" -O main.go
+        if command -v go &> /dev/null; then
+            go build -o generate-oauth-keys main.go
+        else
+            echo "❌ Go is not installed and key generator download failed"
+            echo "   Please install Go or manually create OAuth keys"
+            rm -rf "$TEMP_DIR"
+            exit 1
+        fi
+    fi
+    
+    # Install the key generator
+    cp generate-oauth-keys "$ATCHESS_DIR/bin/"
+    chmod +x "$ATCHESS_DIR/bin/generate-oauth-keys"
+    cd /
+    rm -rf "$TEMP_DIR"
+fi
 
 # Ensure ownership is correct
 chown -R "$ATCHESS_USER:$ATCHESS_USER" "$ATCHESS_DIR"
 
-# Cleanup
-cd /
-rm -rf "$TEMP_DIR"
-
-echo "✅ Installed ATChess $ATCHESS_VERSION"
+echo "✅ Directory structure ready for auto-deployment"
 
 # Handle OAuth key
 echo "🔐 Setting up OAuth authentication..."
@@ -132,17 +112,21 @@ else
     chmod 400 "$OAUTH_KEY_PATH"
 fi
 
-# Create environment file
+# Create environment files (matching existing deployment structure)
 echo "📝 Creating environment configuration..."
 
-# Check if environment file exists and preserve existing values
-if [ -f /etc/atchess/environment ]; then
-    echo "📋 Preserving existing environment configuration..."
-    source /etc/atchess/environment
+# Create protocol.env for protocol service
+PROTOCOL_ENV="/etc/atchess/protocol.env"
+if [ -f "$PROTOCOL_ENV" ]; then
+    echo "📋 Preserving existing protocol environment configuration..."
+    # Load existing values
+    source "$PROTOCOL_ENV" 2>/dev/null || true
 fi
 
-cat > /etc/atchess/environment <<EOF
-# ATChess Environment Configuration
+# Only create/update if it doesn't exist or is missing required vars
+if [ ! -f "$PROTOCOL_ENV" ] || ! grep -q "SERVER_BASE_URL" "$PROTOCOL_ENV" 2>/dev/null; then
+    cat > "$PROTOCOL_ENV" <<EOF
+# ATChess Protocol Service Environment Configuration
 OAUTH_PRIVATE_KEY_PATH=$OAUTH_KEY_PATH
 ATPROTO_PDS_URL=${ATPROTO_PDS_URL:-https://bsky.social}
 ATPROTO_HANDLE=${ATPROTO_HANDLE:-}
@@ -152,9 +136,22 @@ SERVER_BASE_URL=https://$DOMAIN
 SERVER_HOST=0.0.0.0
 SERVER_PORT=8080
 EOF
+    chmod 644 "$PROTOCOL_ENV"
+    echo "✅ Created/updated protocol.env"
+else
+    echo "✅ protocol.env already exists with required configuration"
+fi
 
-# Set secure permissions on environment file
-chmod 644 /etc/atchess/environment
+# Create web.env for web service (if needed)
+WEB_ENV="/etc/atchess/web.env"
+if [ ! -f "$WEB_ENV" ]; then
+    cat > "$WEB_ENV" <<EOF
+# ATChess Web Service Environment Configuration
+SERVER_HOST=0.0.0.0
+SERVER_PORT=8081
+EOF
+    chmod 644 "$WEB_ENV"
+fi
 
 # Create systemd service file
 echo "🔧 Creating systemd service..."
@@ -175,7 +172,7 @@ Restart=always
 RestartSec=10
 StandardOutput=append:/var/log/atchess/protocol.log
 StandardError=append:/var/log/atchess/protocol-error.log
-EnvironmentFile=/etc/atchess/environment
+EnvironmentFile=/etc/atchess/protocol.env
 
 # Security hardening
 NoNewPrivileges=true
@@ -206,6 +203,7 @@ Restart=always
 RestartSec=10
 StandardOutput=append:/var/log/atchess/web.log
 StandardError=append:/var/log/atchess/web-error.log
+EnvironmentFile=/etc/atchess/web.env
 
 # Security hardening
 NoNewPrivileges=true

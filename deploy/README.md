@@ -6,33 +6,29 @@ This directory contains deployment scripts and configurations for ATChess instan
 
 ### `scripts/setup-atchess-abrahms.sh`
 
-Server setup script for the atchess.abrah.ms deployment. This script:
+Server setup script for the atchess.abrah.ms deployment. This script handles the **server configuration only** - binaries are deployed automatically by GitHub Actions on every push to main.
 
-- Downloads pre-built binaries from GitHub releases (no source code needed)
+**What this script does:**
 - Creates the `atchess` service user
-- Sets up directory structure with secure permissions
+- Sets up directory structure at `/srv/atchess/app`
 - Generates OAuth keys (if they don't exist)
 - Configures systemd services
 - Sets up log rotation
-- No Go compiler or build tools required on the server
+- Creates environment configuration files
+
+**What this script does NOT do:**
+- Does not download or build binaries (handled by auto-deploy)
+- Does not clone source code
+- Does not require Go compiler
 
 **Usage:**
 ```bash
-# Run from anywhere - downloads pre-built binaries
+# Run from anywhere to set up or update server configuration
 wget https://raw.githubusercontent.com/justinabrahms/atchess/main/deploy/scripts/setup-atchess-abrahms.sh
-
-# Install latest stable release (default)
 sudo bash ./setup-atchess-abrahms.sh
-
-# Install latest development build from main branch
-USE_LATEST_BUILD=true sudo bash ./setup-atchess-abrahms.sh
-
-# Install a specific version
-ATCHESS_VERSION=v1.0.0 sudo bash ./setup-atchess-abrahms.sh
-
-# Install a specific development build
-ATCHESS_VERSION=main-a1b2c3d4 sudo bash ./setup-atchess-abrahms.sh
 ```
+
+The script is idempotent - safe to run multiple times. It preserves existing OAuth keys and environment configurations.
 
 **Security features:**
 - OAuth keys stored in `/etc/atchess/keys/` with read-only permissions
@@ -49,16 +45,22 @@ To create a deployment script for your own domain:
 3. Adjust any other deployment-specific settings
 4. Run with sudo on your server
 
-## Binary Releases
+## Deployment Architecture
 
-ATChess uses GitHub Actions to build and release binaries automatically:
-- **Every push to main**: Creates a pre-release with format `main-XXXXXXXX`
-- **Git tags**: Creates stable releases (e.g., `v1.0.0`)
-- Builds Linux AMD64 binaries with CGO disabled (fully static)
-- Creates GitHub releases with downloadable artifacts
-- No build tools needed on production servers
+ATChess uses a two-part deployment system:
 
-This enables continuous deployment - every commit to main is deployable!
+1. **Auto-deployment** (`.github/workflows/deploy-abrahms.yml`):
+   - Triggers on every push to main
+   - Builds binaries with GitHub Actions
+   - Deploys via SSH to `/srv/atchess/app`
+   - Restarts services automatically
+   - No manual intervention needed
+
+2. **Server setup** (this script):
+   - Run manually when needed
+   - Sets up systemd, users, directories
+   - Manages OAuth keys and environment
+   - Safe to run multiple times
 
 ## OAuth Key Management
 
