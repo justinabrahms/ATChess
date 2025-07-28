@@ -49,33 +49,7 @@ mkdir -p "$ATCHESS_DIR/bin"
 mkdir -p "$ATCHESS_DIR/web/static"
 mkdir -p "$ATCHESS_DIR/lexicons"
 
-# Download just the OAuth key generator if it doesn't exist
-if [ ! -f "$ATCHESS_DIR/bin/generate-oauth-keys" ]; then
-    echo "📥 Downloading OAuth key generator..."
-    TEMP_DIR=$(mktemp -d)
-    cd "$TEMP_DIR"
-    
-    # Download the key generator from the latest build
-    if ! wget -q "https://github.com/justinabrahms/atchess/releases/latest/download/generate-oauth-keys" -O generate-oauth-keys; then
-        echo "⚠️  Could not download key generator, will build it locally..."
-        # Fallback: download just the source for the key generator
-        wget -q "https://raw.githubusercontent.com/justinabrahms/atchess/main/cmd/generate-oauth-keys/main.go" -O main.go
-        if command -v go &> /dev/null; then
-            go build -o generate-oauth-keys main.go
-        else
-            echo "❌ Go is not installed and key generator download failed"
-            echo "   Please install Go or manually create OAuth keys"
-            rm -rf "$TEMP_DIR"
-            exit 1
-        fi
-    fi
-    
-    # Install the key generator
-    cp generate-oauth-keys "$ATCHESS_DIR/bin/"
-    chmod +x "$ATCHESS_DIR/bin/generate-oauth-keys"
-    cd /
-    rm -rf "$TEMP_DIR"
-fi
+# OAuth key generator is not needed on the server - generate keys locally
 
 # Ensure ownership is correct
 chown -R "$ATCHESS_USER:$ATCHESS_USER" "$ATCHESS_DIR"
@@ -83,31 +57,32 @@ chown -R "$ATCHESS_USER:$ATCHESS_USER" "$ATCHESS_DIR"
 echo "✅ Directory structure ready for auto-deployment"
 
 # Handle OAuth key
-echo "🔐 Setting up OAuth authentication..."
+echo "🔐 Checking OAuth authentication..."
 if [ ! -f "$OAUTH_KEY_PATH" ]; then
-    echo "⚠️  No OAuth private key found. Generating new key pair..."
-    
-    # Use the pre-built key generator
-    cd "$ATCHESS_DIR"
-    
-    # Generate key with restricted umask for security
-    TEMP_KEY=$(mktemp)
-    sudo -u "$ATCHESS_USER" "$ATCHESS_DIR/bin/generate-oauth-keys" > "$TEMP_KEY"
-    
-    # Extract private key with proper permissions from the start
-    (umask 077 && sed -n '/-----BEGIN EC PRIVATE KEY-----/,/-----END EC PRIVATE KEY-----/p' "$TEMP_KEY" > "$OAUTH_KEY_PATH")
-    
-    # Set ownership and read-only permissions
-    chown "$ATCHESS_USER:$ATCHESS_USER" "$OAUTH_KEY_PATH"
-    chmod 400 "$OAUTH_KEY_PATH"
-    
-    # Clean up
-    rm -f "$TEMP_KEY"
-    
-    echo "✅ New OAuth key generated and saved with secure permissions"
+    echo "⚠️  No OAuth private key found at $OAUTH_KEY_PATH"
+    echo ""
+    echo "To generate an OAuth key:"
+    echo "1. On your LOCAL machine, run:"
+    echo "   go run github.com/justinabrahms/atchess/cmd/generate-oauth-keys@main"
+    echo ""
+    echo "2. Copy the private key (between -----BEGIN EC PRIVATE KEY----- and -----END EC PRIVATE KEY-----)"
+    echo ""
+    echo "3. On this server, create the key file:"
+    echo "   sudo mkdir -p $KEY_DIR"
+    echo "   sudo chown root:$ATCHESS_USER $KEY_DIR"
+    echo "   sudo chmod 750 $KEY_DIR"
+    echo "   sudo nano $OAUTH_KEY_PATH"
+    echo "   (paste the private key and save)"
+    echo "   sudo chown $ATCHESS_USER:$ATCHESS_USER $OAUTH_KEY_PATH"
+    echo "   sudo chmod 400 $OAUTH_KEY_PATH"
+    echo ""
+    echo "4. Run this setup script again"
+    echo ""
+    echo "❌ Exiting - OAuth key required"
+    exit 1
 else
-    echo "✅ OAuth key already exists, preserving it"
-    # Ensure permissions are correct even for existing keys
+    echo "✅ OAuth key exists at $OAUTH_KEY_PATH"
+    # Ensure permissions are correct
     chown "$ATCHESS_USER:$ATCHESS_USER" "$OAUTH_KEY_PATH"
     chmod 400 "$OAUTH_KEY_PATH"
 fi
