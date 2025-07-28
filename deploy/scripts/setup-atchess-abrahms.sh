@@ -39,9 +39,22 @@ mkdir -p "/var/log/atchess"
 chown root:"$ATCHESS_USER" "$KEY_DIR"
 chmod 750 "$KEY_DIR"
 
-# Copy application files
-echo "📦 Copying application files..."
-cp -r cmd internal lexicons web scripts Makefile go.mod go.sum "$ATCHESS_DIR/"
+# Get or update source code
+echo "📦 Getting application files..."
+if [ -d "$ATCHESS_DIR/.git" ]; then
+    echo "📥 Updating existing installation..."
+    cd "$ATCHESS_DIR"
+    sudo -u "$ATCHESS_USER" git fetch origin
+    sudo -u "$ATCHESS_USER" git reset --hard origin/main
+else
+    echo "📥 Cloning ATChess repository..."
+    cd /opt
+    rm -rf "$ATCHESS_DIR"
+    sudo -u "$ATCHESS_USER" git clone https://github.com/justinabrahms/atchess.git "$ATCHESS_DIR"
+    cd "$ATCHESS_DIR"
+fi
+
+# Ensure ownership is correct
 chown -R "$ATCHESS_USER:$ATCHESS_USER" "$ATCHESS_DIR"
 
 # Build the application

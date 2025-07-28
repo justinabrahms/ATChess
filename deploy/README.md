@@ -16,7 +16,9 @@ Server setup script for the atchess.abrah.ms deployment. This script:
 
 **Usage:**
 ```bash
-sudo ./deploy/scripts/setup-atchess-abrahms.sh
+# Run from anywhere - the script will clone/update the repository
+wget https://raw.githubusercontent.com/justinabrahms/atchess/main/deploy/scripts/setup-atchess-abrahms.sh
+sudo bash ./setup-atchess-abrahms.sh
 ```
 
 **Security features:**
