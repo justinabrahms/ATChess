@@ -8,19 +8,30 @@ import (
 	"encoding/pem"
 	"fmt"
 	"math/big"
+	"os"
 )
 
-// HardcodedPrivateKeyPEM is the private key that matches the public key in client-metadata.json
-// In production, this should be loaded from a secure key store
-const HardcodedPrivateKeyPEM = `-----BEGIN EC PRIVATE KEY-----
-MHcCAQEEIERqaaHFAOyCFycC43305X979BXxIriGXx2Du1aGTZGBoAoGCCqGSM49
-AwEHoUQDQgAECEpzKqfuY+lCAj07Hmu2i0Wu6GLnf7jis90IyHFVc87voqatfq3a
-P83bH8pcquaxIT0cTwtY3O7u7wTYw3NSog==
------END EC PRIVATE KEY-----`
-
-// LoadHardcodedKey loads the hardcoded private key
-func LoadHardcodedKey() (*ecdsa.PrivateKey, error) {
-	block, _ := pem.Decode([]byte(HardcodedPrivateKeyPEM))
+// LoadPrivateKey loads the private key from file or environment
+func LoadPrivateKey() (*ecdsa.PrivateKey, error) {
+	// Try environment variable first
+	keyPEM := os.Getenv("OAUTH_PRIVATE_KEY")
+	
+	// If not in env, try file
+	if keyPEM == "" {
+		keyPath := os.Getenv("OAUTH_PRIVATE_KEY_PATH")
+		if keyPath == "" {
+			keyPath = "oauth-private-key.pem"
+		}
+		
+		keyBytes, err := os.ReadFile(keyPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read private key file: %w", err)
+		}
+		keyPEM = string(keyBytes)
+	}
+	
+	// Parse the PEM
+	block, _ := pem.Decode([]byte(keyPEM))
 	if block == nil {
 		return nil, fmt.Errorf("failed to parse PEM block")
 	}

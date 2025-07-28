@@ -16,8 +16,14 @@ import (
 )
 
 type Service struct {
-	client *atproto.Client
-	config *config.Config
+	client      *atproto.Client
+	config      *config.Config
+	oauthClient OAuthClientInterface
+}
+
+// OAuthClientInterface defines the methods we need from the OAuth client
+type OAuthClientInterface interface {
+	GetPublicKeyJWK() map[string]interface{}
 }
 
 func NewService(client *atproto.Client, config *config.Config) *Service {
@@ -25,6 +31,11 @@ func NewService(client *atproto.Client, config *config.Config) *Service {
 		client: client,
 		config: config,
 	}
+}
+
+// SetOAuthClient sets the OAuth client for the service
+func (s *Service) SetOAuthClient(oauthClient OAuthClientInterface) {
+	s.oauthClient = oauthClient
 }
 
 func (s *Service) decodeGameID(encodedGameID string) (string, error) {
@@ -431,4 +442,55 @@ func (s *Service) GetCurrentUserHandler(w http.ResponseWriter, r *http.Request) 
 		"handle": s.client.GetHandle(),
 		"authenticated": true,
 	})
+}
+
+// ClientMetadataHandler serves the OAuth client metadata dynamically
+func (s *Service) ClientMetadataHandler(w http.ResponseWriter, r *http.Request) {
+	// Get the host from the request to build proper URLs
+	scheme := "https"
+	if r.TLS == nil {
+		scheme = "http"
+	}
+	host := r.Host
+	
+	// Build the client metadata dynamically
+	metadata := map[string]interface{}{
+		"client_id": fmt.Sprintf("%s://%s/client-metadata.json", scheme, host),
+		"client_name": "ATChess",
+		"client_name#en": "ATChess - Decentralized Chess", 
+		"logo_uri": "https://cdn.bsky.app/img/avatar_thumbnail/plain/did:plc:7qz7m34ck7gtzrcnailvljp5/bafkreif33s7ziwwrcctx5n4mpb63g2sphjz2p6xkn7ddx6sszq3x2s3v7m@jpeg",
+		"redirect_uris": []string{
+			fmt.Sprintf("%s://%s/api/callback", scheme, host),
+		},
+		"scope": "atproto transition:generic",
+		"grant_types": []string{"authorization_code", "refresh_token"},
+		"response_types": []string{"code"},
+		"token_endpoint_auth_method": "private_key_jwt",
+		"token_endpoint_auth_signing_alg": "ES256",
+		"dpop_bound_access_tokens": true,
+		"jwks": s.getJWKS(),
+	}
+	
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "public, max-age=3600") // Cache for 1 hour
+	if err := json.NewEncoder(w).Encode(metadata); err != nil {
+		log.Error().Err(err).Msg("Failed to encode client metadata")
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
+	}
+}
+
+// getJWKS returns the JSON Web Key Set for the OAuth client
+func (s *Service) getJWKS() map[string]interface{} {
+	// Get public key from OAuth service if available
+	if s.oauthClient != nil {
+		publicKeyJWK := s.oauthClient.GetPublicKeyJWK()
+		return map[string]interface{}{
+			"keys": []interface{}{publicKeyJWK},
+		}
+	}
+	
+	// Fallback to empty key set
+	return map[string]interface{}{
+		"keys": []interface{}{},
+	}
 }

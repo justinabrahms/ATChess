@@ -82,7 +82,9 @@ make run-web        # Runs on port 8081
 4. Accept challenges from the inbox
 5. Play chess with real-time move synchronization
 
-**OAuth Authentication:** ATChess uses AT Protocol OAuth for secure authentication. Users authorize ATChess to act on their behalf without sharing passwords. For production deployments, see [OAuth Setup Guide](docs/oauth-setup.md).
+**OAuth Authentication:** ATChess uses AT Protocol OAuth for secure authentication. Users authorize ATChess to act on their behalf without sharing passwords. Client metadata is served dynamically at `/client-metadata.json` with automatic key management.
+
+**⚠️ IMPORTANT: You MUST generate your own OAuth keys!** See [OAuth Key Setup](docs/oauth-key-setup.md) for instructions. The deployment script will generate keys automatically if they don't exist.
 
 **Password Authentication (Legacy):** If OAuth is not configured, ATChess falls back to app password authentication. Users can create app passwords at https://bsky.app/settings/app-passwords
 

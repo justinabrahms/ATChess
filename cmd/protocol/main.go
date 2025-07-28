@@ -62,6 +62,9 @@ func main() {
 	if cfg.Server.BaseURL != "" {
 		if err := web.InitializeOAuth(cfg.Server.BaseURL); err != nil {
 			log.Error().Err(err).Msg("Failed to initialize OAuth, falling back to password auth")
+		} else {
+			// Pass OAuth client to service for dynamic metadata
+			service.SetOAuthClient(web.GetOAuthClient())
 		}
 	}
 	
@@ -108,6 +111,8 @@ func main() {
 	// Root level health endpoint for load balancers and monitoring
 	router.HandleFunc("/health", service.HealthHandler).Methods("GET")
 	
+	// OAuth client metadata endpoint (must be before static file handler)
+	router.HandleFunc("/client-metadata.json", service.ClientMetadataHandler).Methods("GET")
 	
 	// API routes
 	api := router.PathPrefix("/api").Subrouter()

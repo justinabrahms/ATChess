@@ -40,10 +40,14 @@ func InitializeOAuth(baseURL string) error {
 	// Start session cleanup routine
 	sessionStore.StartCleanupRoutine()
 	
-	// Update client metadata with our public key
-	updateClientMetadata(client.GetPublicKeyJWK())
+	// Don't update static client metadata anymore since we're serving it dynamically
 	
 	return nil
+}
+
+// GetOAuthClient returns the global OAuth client
+func GetOAuthClient() *oauth.OAuthClient {
+	return oauthClient
 }
 
 // updateClientMetadata updates the static client metadata with our public key
@@ -55,6 +59,13 @@ func updateClientMetadata(publicKeyJWK map[string]interface{}) {
 
 // OAuthLoginHandler initiates the OAuth flow
 func (s *Service) OAuthLoginHandler(w http.ResponseWriter, r *http.Request) {
+	// Check if OAuth is initialized
+	if oauthClient == nil || authStore == nil || sessionStore == nil {
+		log.Error().Msg("OAuth not initialized - SERVER_BASE_URL may not be set")
+		http.Error(w, "OAuth not configured. Please ensure SERVER_BASE_URL is set.", http.StatusServiceUnavailable)
+		return
+	}
+	
 	var req struct {
 		Handle string `json:"handle"`
 	}
@@ -115,6 +126,13 @@ func (s *Service) OAuthLoginHandler(w http.ResponseWriter, r *http.Request) {
 
 // OAuthCallbackHandler handles the OAuth callback
 func (s *Service) OAuthCallbackHandler(w http.ResponseWriter, r *http.Request) {
+	// Check if OAuth is initialized
+	if oauthClient == nil || authStore == nil || sessionStore == nil {
+		log.Error().Msg("OAuth not initialized - SERVER_BASE_URL may not be set")
+		http.Error(w, "OAuth not configured. Please ensure SERVER_BASE_URL is set.", http.StatusServiceUnavailable)
+		return
+	}
+	
 	// Get parameters from query
 	code := r.URL.Query().Get("code")
 	state := r.URL.Query().Get("state")

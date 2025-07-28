@@ -28,8 +28,8 @@ type OAuthClient struct {
 
 // NewOAuthClient creates a new OAuth client for AT Protocol
 func NewOAuthClient(clientID, redirectURI string) (*OAuthClient, error) {
-	// Load the hardcoded private key that matches our client metadata
-	privateKey, err := LoadHardcodedKey()
+	// Load the private key from file or environment
+	privateKey, err := LoadPrivateKey()
 	if err != nil {
 		return nil, fmt.Errorf("failed to load private key: %w", err)
 	}
