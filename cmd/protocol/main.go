@@ -217,7 +217,11 @@ func main() {
 	}).Methods("OPTIONS")
 	
 	// Serve static files
-	router.PathPrefix("/").Handler(http.FileServer(http.Dir("./web/static/")))
+	staticDir := os.Getenv("ATCHESS_STATIC_DIR")
+	if staticDir == "" {
+		staticDir = "./web/static/"
+	}
+	router.PathPrefix("/").Handler(http.FileServer(http.Dir(staticDir)))
 	
 	// Create server
 	srv := &http.Server{

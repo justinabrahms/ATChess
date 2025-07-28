@@ -1,0 +1,111 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to create release for (e.g., v1.0.0)'
+        required: true
+        default: 'v1.0.0'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.21'
+    
+    - name: Get version
+      id: version
+      run: |
+        if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          VERSION="${{ github.event.inputs.tag }}"
+        else
+          VERSION="${GITHUB_REF#refs/tags/}"
+        fi
+        echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
+        echo "Building version: ${VERSION}"
+    
+    - name: Build binaries
+      run: |
+        VERSION="${{ steps.version.outputs.VERSION }}"
+        
+        # Build protocol service
+        echo "Building atchess-protocol..."
+        CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+          -ldflags="-X main.Version=${VERSION} -s -w" \
+          -o atchess-protocol \
+          ./cmd/protocol
+        
+        # Build web service
+        echo "Building atchess-web..."
+        CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+          -ldflags="-X main.Version=${VERSION} -s -w" \
+          -o atchess-web \
+          ./cmd/web
+        
+        # Build OAuth key generator
+        echo "Building generate-oauth-keys..."
+        CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+          -ldflags="-s -w" \
+          -o generate-oauth-keys \
+          ./cmd/generate-oauth-keys
+        
+        # Create deployment package
+        echo "Creating deployment package..."
+        mkdir -p dist
+        cp atchess-protocol atchess-web generate-oauth-keys dist/
+        
+        # Copy required static files
+        cp -r web/static dist/web-static
+        cp -r lexicons dist/
+        
+        # Create version file
+        echo "${VERSION}" > dist/VERSION
+        
+        # Create tarball
+        tar -czf atchess-${VERSION}-linux-amd64.tar.gz -C dist .
+    
+    - name: Create Release
+      id: create_release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ steps.version.outputs.VERSION }}
+        release_name: ATChess ${{ steps.version.outputs.VERSION }}
+        body: |
+          ATChess Release ${{ steps.version.outputs.VERSION }}
+          
+          ## Installation
+          
+          Download the binary package and use the deployment script:
+          ```bash
+          wget https://github.com/justinabrahms/atchess/releases/download/${{ steps.version.outputs.VERSION }}/atchess-${{ steps.version.outputs.VERSION }}-linux-amd64.tar.gz
+          wget https://raw.githubusercontent.com/justinabrahms/atchess/main/deploy/scripts/setup-atchess-abrahms.sh
+          sudo bash ./setup-atchess-abrahms.sh
+          ```
+          
+          ## What's Changed
+          See the [commit history](https://github.com/justinabrahms/atchess/commits/${{ steps.version.outputs.VERSION }}) for details.
+        draft: false
+        prerelease: false
+    
+    - name: Upload Release Asset
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: ./atchess-${{ steps.version.outputs.VERSION }}-linux-amd64.tar.gz
+        asset_name: atchess-${{ steps.version.outputs.VERSION }}-linux-amd64.tar.gz
+        asset_content_type: application/gzip

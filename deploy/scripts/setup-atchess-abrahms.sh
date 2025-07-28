@@ -39,41 +39,71 @@ mkdir -p "/var/log/atchess"
 chown root:"$ATCHESS_USER" "$KEY_DIR"
 chmod 750 "$KEY_DIR"
 
-# Get or update source code
-echo "📦 Getting application files..."
-if [ -d "$ATCHESS_DIR/.git" ]; then
-    echo "📥 Updating existing installation..."
-    cd "$ATCHESS_DIR"
-    sudo -u "$ATCHESS_USER" git fetch origin
-    sudo -u "$ATCHESS_USER" git reset --hard origin/main
-else
-    echo "📥 Cloning ATChess repository..."
-    cd /opt
-    rm -rf "$ATCHESS_DIR"
-    sudo -u "$ATCHESS_USER" git clone https://github.com/justinabrahms/atchess.git "$ATCHESS_DIR"
-    cd "$ATCHESS_DIR"
+# Get the latest release version if not specified
+if [ -z "${ATCHESS_VERSION:-}" ]; then
+    echo "🔍 Finding latest release..."
+    ATCHESS_VERSION=$(curl -s https://api.github.com/repos/justinabrahms/atchess/releases/latest | grep '"tag_name"' | cut -d'"' -f4)
+    if [ -z "$ATCHESS_VERSION" ]; then
+        echo "❌ Could not determine latest version. Please specify ATCHESS_VERSION environment variable."
+        exit 1
+    fi
 fi
+
+echo "📦 Installing ATChess $ATCHESS_VERSION..."
+
+# Download and extract binaries
+TEMP_DIR=$(mktemp -d)
+cd "$TEMP_DIR"
+
+echo "📥 Downloading release package..."
+DOWNLOAD_URL="https://github.com/justinabrahms/atchess/releases/download/${ATCHESS_VERSION}/atchess-${ATCHESS_VERSION}-linux-amd64.tar.gz"
+
+if ! wget -q "$DOWNLOAD_URL"; then
+    echo "❌ Failed to download release from: $DOWNLOAD_URL"
+    echo "   Please check that version $ATCHESS_VERSION exists"
+    rm -rf "$TEMP_DIR"
+    exit 1
+fi
+
+echo "📦 Extracting files..."
+tar -xzf "atchess-${ATCHESS_VERSION}-linux-amd64.tar.gz"
+
+# Create directories
+mkdir -p "$ATCHESS_DIR/bin"
+mkdir -p "$ATCHESS_DIR/web/static"
+mkdir -p "$ATCHESS_DIR/lexicons"
+
+# Copy binaries
+cp atchess-protocol atchess-web generate-oauth-keys "$ATCHESS_DIR/bin/"
+chmod +x "$ATCHESS_DIR/bin/"*
+
+# Copy static files
+cp -r web-static/* "$ATCHESS_DIR/web/static/"
+cp -r lexicons/* "$ATCHESS_DIR/lexicons/"
+
+# Copy version file
+cp VERSION "$ATCHESS_DIR/"
 
 # Ensure ownership is correct
 chown -R "$ATCHESS_USER:$ATCHESS_USER" "$ATCHESS_DIR"
 
-# Build the application
-echo "🔨 Building ATChess..."
-cd "$ATCHESS_DIR"
-sudo -u "$ATCHESS_USER" make build
+# Cleanup
+cd /
+rm -rf "$TEMP_DIR"
+
+echo "✅ Installed ATChess $ATCHESS_VERSION"
 
 # Handle OAuth key
 echo "🔐 Setting up OAuth authentication..."
 if [ ! -f "$OAUTH_KEY_PATH" ]; then
     echo "⚠️  No OAuth private key found. Generating new key pair..."
     
-    # Build key generator as the service user
+    # Use the pre-built key generator
     cd "$ATCHESS_DIR"
-    sudo -u "$ATCHESS_USER" go build -o generate-oauth-keys cmd/generate-oauth-keys/main.go
     
     # Generate key with restricted umask for security
     TEMP_KEY=$(mktemp)
-    sudo -u "$ATCHESS_USER" ./generate-oauth-keys > "$TEMP_KEY"
+    sudo -u "$ATCHESS_USER" "$ATCHESS_DIR/bin/generate-oauth-keys" > "$TEMP_KEY"
     
     # Extract private key with proper permissions from the start
     (umask 077 && sed -n '/-----BEGIN EC PRIVATE KEY-----/,/-----END EC PRIVATE KEY-----/p' "$TEMP_KEY" > "$OAUTH_KEY_PATH")
@@ -83,7 +113,7 @@ if [ ! -f "$OAUTH_KEY_PATH" ]; then
     chmod 400 "$OAUTH_KEY_PATH"
     
     # Clean up
-    rm -f "$TEMP_KEY" generate-oauth-keys
+    rm -f "$TEMP_KEY"
     
     echo "✅ New OAuth key generated and saved with secure permissions"
 else
@@ -130,6 +160,8 @@ User=$ATCHESS_USER
 Group=$ATCHESS_USER
 WorkingDirectory=$ATCHESS_DIR
 ExecStart=$ATCHESS_DIR/bin/atchess-protocol
+Environment="ATCHESS_STATIC_DIR=$ATCHESS_DIR/web/static"
+Environment="ATCHESS_LEXICONS_DIR=$ATCHESS_DIR/lexicons"
 Restart=always
 RestartSec=10
 StandardOutput=append:/var/log/atchess/protocol.log
@@ -160,6 +192,7 @@ User=$ATCHESS_USER
 Group=$ATCHESS_USER
 WorkingDirectory=$ATCHESS_DIR
 ExecStart=$ATCHESS_DIR/bin/atchess-web
+Environment="ATCHESS_STATIC_DIR=$ATCHESS_DIR/web/static"
 Restart=always
 RestartSec=10
 StandardOutput=append:/var/log/atchess/web.log
