@@ -123,3 +123,24 @@ scripts/         # Development and setup scripts
 - **Configuration**: Uses `github.com/spf13/viper v1.18.2` for config management
 - **Logging**: Uses `github.com/rs/zerolog v1.31.0` for structured logging
 - **AT Protocol**: Direct HTTP calls, no external AT Protocol library dependencies
+
+## Deployment and Infrastructure
+
+### Production Deployment
+- **Server**: Uses Caddy web server (not nginx) for reverse proxy and SSL termination
+- **Auto-deploy**: GitHub Actions automatically deploys on push to main
+- **File Structure**: Binaries deployed to `/srv/atchess/app/bin/`
+- **Services**: Managed by systemd (atchess-protocol and atchess-web)
+- **Permissions**: Deploy user needs group membership, not sudo
+
+### OAuth Configuration
+- **Client Metadata**: Served dynamically at `/client-metadata.json`
+- **Key Generation**: Run `go run github.com/justinabrahms/atchess/cmd/generate-oauth-keys@main` locally
+- **Reverse Proxy**: Service respects `X-Forwarded-Proto` header for correct HTTPS URLs
+- **Caddy Config**: Must include routes for `/client-metadata.json`, `/api/*`, and `/`
+
+### Common Deployment Issues
+1. **OAuth "missing code or state" error**: Usually means `/client-metadata.json` is not properly routed
+2. **HTTP vs HTTPS mismatch**: Service must detect HTTPS via `X-Forwarded-Proto` header
+3. **Binary permissions**: Deploy user needs write access via group membership
+4. **Setup script**: Only handles configuration, not binary deployment (that's done by CI/CD)
