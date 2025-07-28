@@ -102,7 +102,7 @@ func (c *OAuthClient) CreateClientAssertion(tokenEndpoint string) (string, error
 	}
 	
 	token := jwt.NewWithClaims(jwt.SigningMethodES256, claims)
-	token.Header["kid"] = "atchess-key-1"
+	token.Header["kid"] = "is4PQCqbnUs" // Must match the kid in our JWKS
 	
 	signedToken, err := token.SignedString(c.privateKey)
 	if err != nil {
