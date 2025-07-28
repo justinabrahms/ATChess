@@ -17,13 +17,13 @@
   "jwks": {
     "keys": [
       {
-        "alg": "ES256",
-        "crv": "P-256",
-        "kid": "is4PQCqbnUs",
         "kty": "EC",
+        "crv": "P-256",
+        "x": "CEpzKqfuY-lCAj07Hmu2i0Wu6GLnf7jis90IyHFVc84",
+        "y": "76KmrX6t2j_N2x_KXKrmsSE9HE8LWNzu7u8E2MNzUqI",
         "use": "sig",
-        "x": "t9ccGvC1M03pi641RNvwjtusEWvnJmlfzxTYs8CdEv0",
-        "y": "S7TMF1J59gU5JtcL-mPCwWMhD2QZVQ0VQ8Pf9VOOxu4"
+        "alg": "ES256",
+        "kid": "atchess-key-1"
       }
     ]
   }

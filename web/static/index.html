@@ -761,6 +761,12 @@
             document.getElementById('authContainer').style.display = 'flex';
             document.getElementById('mainContainer').style.display = 'none';
             document.getElementById('userInfo').style.display = 'none';
+            
+            // Pre-fill handle if remembered
+            const rememberedHandle = localStorage.getItem('atchess_handle');
+            if (rememberedHandle) {
+                document.getElementById('handle').value = rememberedHandle;
+            }
         }
         
         // Show main interface
@@ -809,6 +815,9 @@
                 if (data.authorization_url) {
                     // Store handle for after OAuth callback
                     sessionStorage.setItem('atchess_pending_handle', handle);
+                    
+                    // Remember the handle for next time
+                    localStorage.setItem('atchess_handle', handle);
                     
                     // Redirect to AT Protocol OAuth authorization
                     authMessage.innerHTML = `<div class="auth-message">Redirecting to Bluesky...</div>`;

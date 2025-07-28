@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -27,22 +28,14 @@ type OAuthClient struct {
 
 // NewOAuthClient creates a new OAuth client for AT Protocol
 func NewOAuthClient(clientID, redirectURI string) (*OAuthClient, error) {
-	// Generate ECDSA key pair for ES256
-	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	// Load the hardcoded private key that matches our client metadata
+	privateKey, err := LoadHardcodedKey()
 	if err != nil {
-		return nil, fmt.Errorf("failed to generate private key: %w", err)
+		return nil, fmt.Errorf("failed to load private key: %w", err)
 	}
 
 	// Create JWK representation of public key
-	publicKeyJWK := map[string]interface{}{
-		"kty": "EC",
-		"crv": "P-256",
-		"x":   base64.RawURLEncoding.EncodeToString(privateKey.PublicKey.X.Bytes()),
-		"y":   base64.RawURLEncoding.EncodeToString(privateKey.PublicKey.Y.Bytes()),
-		"use": "sig",
-		"alg": "ES256",
-		"kid": generateKID(&privateKey.PublicKey),
-	}
+	publicKeyJWK := GetPublicKeyJWK(privateKey)
 
 	return &OAuthClient{
 		clientID:     clientID,
@@ -110,7 +103,7 @@ func (c *OAuthClient) CreateClientAssertion(tokenEndpoint string) (string, error
 	}
 	
 	token := jwt.NewWithClaims(jwt.SigningMethodES256, claims)
-	token.Header["kid"] = c.publicKeyJWK["kid"]
+	token.Header["kid"] = "atchess-key-1"
 	
 	signedToken, err := token.SignedString(c.privateKey)
 	if err != nil {
@@ -161,7 +154,9 @@ func (c *OAuthClient) ExchangeCodeForTokens(tokenEndpoint, code, codeVerifier st
 	defer resp.Body.Close()
 	
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("token exchange failed: HTTP %d", resp.StatusCode)
+		// Read error response
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("token exchange failed: HTTP %d - %s", resp.StatusCode, string(body))
 	}
 	
 	var tokenResp TokenResponse

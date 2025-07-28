@@ -144,8 +144,13 @@ func (s *Service) OAuthCallbackHandler(w http.ResponseWriter, r *http.Request) {
 	// Exchange code for tokens
 	tokens, err := oauthClient.ExchangeCodeForTokens(tokenEndpoint, code, authReq.CodeVerifier, authReq.DPoPKey)
 	if err != nil {
-		log.Error().Err(err).Msg("Failed to exchange code for tokens")
-		http.Error(w, "Failed to exchange authorization code", http.StatusInternalServerError)
+		log.Error().
+			Err(err).
+			Str("tokenEndpoint", tokenEndpoint).
+			Str("code", code[:10]+"...").
+			Str("iss", iss).
+			Msg("Failed to exchange code for tokens")
+		http.Error(w, fmt.Sprintf("Failed to exchange authorization code: %v", err), http.StatusInternalServerError)
 		return
 	}
 	
