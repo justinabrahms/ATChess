@@ -113,22 +113,33 @@ func (s *Service) MakeMoveHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
 		return
 	}
-	
+
 	// Game ID must be provided in request body
 	gameID := req.GameID
 	if gameID == "" {
 		http.Error(w, "game_id is required in request body", http.StatusBadRequest)
 		return
 	}
-	
-	// Log for debugging
-	log.Info().Str("gameID", gameID).Str("from", req.From).Str("to", req.To).Str("fen", req.FEN).Str("path", r.URL.Path).Msg("MakeMoveHandler called")
-	
-	// Create chess engine from current position
-	engine, err := chess.NewEngineFromFEN(req.FEN)
+
+	// Fetch authoritative game state from AT Protocol — never trust client-supplied FEN.
+	// This closes the race window where two players could submit moves based on a
+	// stale board position.
+	game, err := s.client.GetGame(context.Background(), gameID)
 	if err != nil {
-		log.Error().Err(err).Str("fen", req.FEN).Msg("Invalid FEN")
-		http.Error(w, "Invalid FEN", http.StatusBadRequest)
+		log.Error().Err(err).Str("gameID", gameID).Msg("Failed to fetch game for move validation")
+		http.Error(w, "Failed to fetch game state", http.StatusInternalServerError)
+		return
+	}
+	serverFEN := game.FEN
+
+	// Log for debugging
+	log.Info().Str("gameID", gameID).Str("from", req.From).Str("to", req.To).Str("serverFEN", serverFEN).Str("clientFEN", req.FEN).Str("path", r.URL.Path).Msg("MakeMoveHandler called")
+
+	// Create chess engine from server-authoritative position
+	engine, err := chess.NewEngineFromFEN(serverFEN)
+	if err != nil {
+		log.Error().Err(err).Str("fen", serverFEN).Msg("Invalid FEN from game record")
+		http.Error(w, "Invalid game state", http.StatusInternalServerError)
 		return
 	}
 	
