@@ -252,8 +252,8 @@ func (c *Client) listen() error {
 
 func (c *Client) processMessage(data []byte) error {
 	// The AT Protocol firehose uses a specific message format
-	// For testing purposes, we'll handle both test format and real format
-	
+	// We handle both test format and real AT Protocol CBOR format
+
 	// First try to parse as our test format (with 4-byte header length prefix)
 	if len(data) >= 4 {
 		headerLen := int(data[0])<<24 | int(data[1])<<16 | int(data[2])<<8 | int(data[3])
@@ -262,18 +262,172 @@ func (c *Client) processMessage(data []byte) error {
 			return c.processTestMessage(data)
 		}
 	}
-	
-	// Otherwise, try to parse as actual AT Protocol format
-	// The real format is more complex with CBOR encoding
-	// For now, we'll log and skip
-	c.logger.Debug().Int("len", len(data)).Msg("Received firehose message")
-	
-	// TODO: Implement real AT Protocol firehose message parsing
-	// This would involve:
-	// 1. Parsing the DAG-CBOR encoded message
-	// 2. Extracting the commit information
-	// 3. Processing the CAR blocks
-	
+
+	// Parse as real AT Protocol CBOR format
+	// Each message contains two concatenated CBOR items: header + body
+	return c.processCBORMessage(data)
+}
+
+func (c *Client) processCBORMessage(data []byte) error {
+	// AT Protocol firehose messages contain two concatenated CBOR items.
+	// dagcbor.Decode rejects trailing data, so we split them first.
+	boundary, err := scanCBORItem(data, 0)
+	if err != nil || boundary >= len(data) {
+		c.logger.Debug().Int("len", len(data)).Msg("Failed to find CBOR boundary")
+		return nil
+	}
+
+	// Decode CBOR header: {op: int, t: string}
+	headerBuilder := basicnode.Prototype.Any.NewBuilder()
+	if err := dagcbor.Decode(headerBuilder, bytes.NewReader(data[:boundary])); err != nil {
+		c.logger.Debug().Err(err).Int("len", len(data)).Msg("Failed to decode CBOR header")
+		return nil // Skip malformed messages
+	}
+	headerNode := headerBuilder.Build()
+
+	// Extract op field
+	opNode, err := headerNode.LookupByString("op")
+	if err != nil {
+		return nil
+	}
+	op, err := opNode.AsInt()
+	if err != nil {
+		return nil
+	}
+
+	// Extract t field
+	tNode, err := headerNode.LookupByString("t")
+	if err != nil {
+		return nil
+	}
+	msgType, err := tNode.AsString()
+	if err != nil {
+		return nil
+	}
+
+	// We only care about commit events
+	if op != 1 || msgType != "#commit" {
+		return nil
+	}
+
+	// Decode CBOR body
+	bodyBuilder := basicnode.Prototype.Any.NewBuilder()
+	if err := dagcbor.Decode(bodyBuilder, bytes.NewReader(data[boundary:])); err != nil {
+		c.logger.Debug().Err(err).Msg("Failed to decode CBOR body")
+		return nil
+	}
+	bodyNode := bodyBuilder.Build()
+
+	// Extract sequence number
+	if seqNode, err := bodyNode.LookupByString("seq"); err == nil {
+		if seq, err := seqNode.AsInt(); err == nil && seq > 0 {
+			c.lastSequence = seq
+		}
+	}
+
+	// Extract repo (DID)
+	repoNode, err := bodyNode.LookupByString("repo")
+	if err != nil {
+		return nil
+	}
+	repo, err := repoNode.AsString()
+	if err != nil {
+		return nil
+	}
+
+	// Extract ops array
+	opsNode, err := bodyNode.LookupByString("ops")
+	if err != nil {
+		return nil
+	}
+
+	// Check if any ops are chess-related before extracting blocks
+	hasChessOps := false
+	iter := opsNode.ListIterator()
+	for !iter.Done() {
+		_, opEntry, err := iter.Next()
+		if err != nil {
+			break
+		}
+		pathNode, err := opEntry.LookupByString("path")
+		if err != nil {
+			continue
+		}
+		path, err := pathNode.AsString()
+		if err != nil {
+			continue
+		}
+		if isChessRecord(path) {
+			hasChessOps = true
+			break
+		}
+	}
+
+	if !hasChessOps {
+		return nil
+	}
+
+	// Extract blocks (CAR data) for record extraction
+	var blocksData []byte
+	if blocksNode, err := bodyNode.LookupByString("blocks"); err == nil {
+		blocksData, _ = blocksNode.AsBytes()
+	}
+
+	// Process each chess-related operation
+	iter = opsNode.ListIterator()
+	for !iter.Done() {
+		_, opEntry, err := iter.Next()
+		if err != nil {
+			break
+		}
+
+		pathNode, err := opEntry.LookupByString("path")
+		if err != nil {
+			continue
+		}
+		path, err := pathNode.AsString()
+		if err != nil {
+			continue
+		}
+
+		if !isChessRecord(path) {
+			continue
+		}
+
+		// Extract CID string from the op
+		var cidStr string
+		if cidNode, err := opEntry.LookupByString("cid"); err == nil {
+			// CID may be encoded as a CBOR link (tag 42) or a string
+			if link, err := cidNode.AsLink(); err == nil {
+				cidStr = link.String()
+			} else if s, err := cidNode.AsString(); err == nil {
+				cidStr = s
+			}
+		}
+
+		// Try to extract the record from CAR blocks
+		var record interface{}
+		if len(blocksData) > 0 && cidStr != "" {
+			record, _ = c.extractRecord(blocksData, cidStr)
+		}
+		if record == nil {
+			record = map[string]interface{}{}
+		}
+
+		event := Event{
+			Type:      getEventType(path),
+			Repo:      repo,
+			Path:      path,
+			CID:       cidStr,
+			Timestamp: time.Now(),
+			Record:    record,
+		}
+
+		if err := c.handler(event); err != nil {
+			c.logger.Error().Err(err).Msg("Event handler error")
+		}
+	}
+
 	return nil
 }
 
@@ -479,6 +633,100 @@ func (c *Client) handleReconnect() {
 	select {
 	case <-time.After(delay):
 	case <-c.ctx.Done():
+	}
+}
+
+// scanCBORItem scans one CBOR item starting at offset and returns the
+// offset immediately after it. CBOR is self-delimiting so we can find
+// item boundaries without fully decoding.
+func scanCBORItem(data []byte, offset int) (int, error) {
+	if offset >= len(data) {
+		return 0, fmt.Errorf("unexpected end of CBOR data")
+	}
+
+	initial := data[offset]
+	major := initial >> 5
+	addInfo := initial & 0x1f
+	offset++
+
+	// Get the argument value
+	var argVal uint64
+	switch {
+	case addInfo < 24:
+		argVal = uint64(addInfo)
+	case addInfo == 24:
+		if offset >= len(data) {
+			return 0, fmt.Errorf("unexpected end")
+		}
+		argVal = uint64(data[offset])
+		offset++
+	case addInfo == 25:
+		if offset+2 > len(data) {
+			return 0, fmt.Errorf("unexpected end")
+		}
+		argVal = uint64(data[offset])<<8 | uint64(data[offset+1])
+		offset += 2
+	case addInfo == 26:
+		if offset+4 > len(data) {
+			return 0, fmt.Errorf("unexpected end")
+		}
+		argVal = uint64(data[offset])<<24 | uint64(data[offset+1])<<16 | uint64(data[offset+2])<<8 | uint64(data[offset+3])
+		offset += 4
+	case addInfo == 27:
+		if offset+8 > len(data) {
+			return 0, fmt.Errorf("unexpected end")
+		}
+		argVal = uint64(data[offset])<<56 | uint64(data[offset+1])<<48 | uint64(data[offset+2])<<40 | uint64(data[offset+3])<<32 |
+			uint64(data[offset+4])<<24 | uint64(data[offset+5])<<16 | uint64(data[offset+6])<<8 | uint64(data[offset+7])
+		offset += 8
+	case addInfo == 31:
+		// Indefinite length — scan until break code (0xff)
+		for {
+			if offset >= len(data) {
+				return 0, fmt.Errorf("unexpected end in indefinite item")
+			}
+			if data[offset] == 0xff {
+				return offset + 1, nil
+			}
+			var err error
+			offset, err = scanCBORItem(data, offset)
+			if err != nil {
+				return 0, err
+			}
+		}
+	default:
+		return 0, fmt.Errorf("unsupported additional info: %d", addInfo)
+	}
+
+	switch major {
+	case 0, 1: // unsigned int, negative int
+		return offset, nil
+	case 2, 3: // byte string, text string
+		return offset + int(argVal), nil
+	case 4: // array — scan argVal child items
+		for i := uint64(0); i < argVal; i++ {
+			var err error
+			offset, err = scanCBORItem(data, offset)
+			if err != nil {
+				return 0, err
+			}
+		}
+		return offset, nil
+	case 5: // map — scan argVal*2 items (key + value pairs)
+		for i := uint64(0); i < argVal*2; i++ {
+			var err error
+			offset, err = scanCBORItem(data, offset)
+			if err != nil {
+				return 0, err
+			}
+		}
+		return offset, nil
+	case 6: // tag — scan the tagged item
+		return scanCBORItem(data, offset)
+	case 7: // float, simple, break
+		return offset, nil
+	default:
+		return 0, fmt.Errorf("unknown CBOR major type: %d", major)
 	}
 }
 
