@@ -181,11 +181,38 @@ func (s *Service) CheckAbandonmentHandler(w http.ResponseWriter, r *http.Request
 
 // ClaimAbandonedGameHandler allows a player to claim victory in an abandoned game
 func (s *Service) ClaimAbandonedGameHandler(w http.ResponseWriter, r *http.Request) {
-	// TODO: Implement claim logic that:
-	// 1. Get gameID from request: vars := mux.Vars(r); gameID := vars["id"]
-	// 2. Verifies abandonment
-	// 3. Updates game status to winner
-	// 4. Creates a system move or note about abandonment
-	
-	http.Error(w, "Not implemented", http.StatusNotImplemented)
+	vars := mux.Vars(r)
+	gameID := vars["id"]
+
+	if gameID == "" {
+		http.Error(w, "Missing game ID", http.StatusBadRequest)
+		return
+	}
+
+	// Verify the authenticated user is a player in the game
+	authedDID := AuthenticatedDID(r)
+	game, err := s.client.GetGame(context.Background(), gameID)
+	if err != nil {
+		log.Error().Err(err).Str("gameID", gameID).Msg("Failed to fetch game for abandonment claim")
+		http.Error(w, "Game not found", http.StatusNotFound)
+		return
+	}
+
+	if authedDID != game.White && authedDID != game.Black {
+		http.Error(w, "You are not a player in this game", http.StatusForbidden)
+		return
+	}
+
+	err = s.client.ClaimAbandonment(context.Background(), gameID)
+	if err != nil {
+		log.Error().Err(err).Str("gameID", gameID).Msg("Failed to claim abandonment")
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"gameId":  gameID,
+	})
 }
