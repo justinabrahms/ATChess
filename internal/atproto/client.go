@@ -263,6 +263,9 @@ func (c *Client) RecordMove(ctx context.Context, gameURI string, move *chess.Mov
 	if move.Checkmate {
 		moveRecord["checkmate"] = true
 	}
+	if move.Draw {
+		moveRecord["draw"] = true
+	}
 	
 	// Create move record
 	createReq := map[string]interface{}{
@@ -447,6 +450,74 @@ func (c *Client) getGameRecord(ctx context.Context, gameURI string) (string, map
 	return getResp.CID, getResp.Value, nil
 }
 
+type moveRecord struct {
+	FEN       string
+	Checkmate bool
+	Draw      bool
+	CreatedAt time.Time
+}
+
+// getLatestMoveForGame fetches moves from both players' repos and returns
+// the latest move for the given game. This is the source of truth for game state.
+func (c *Client) getLatestMoveForGame(ctx context.Context, gameURI string, whiteDID, blackDID string) (*moveRecord, error) {
+	var latest *moveRecord
+
+	for _, playerDID := range []string{whiteDID, blackDID} {
+		if playerDID == "" {
+			continue
+		}
+		url := fmt.Sprintf("%s/xrpc/com.atproto.repo.listRecords?repo=%s&collection=app.atchess.move&limit=100",
+			c.pdsURL, playerDID)
+		resp, err := c.makeRequest("GET", url, nil)
+		if err != nil {
+			continue
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			continue
+		}
+
+		var listResp struct {
+			Records []struct {
+				Value struct {
+					Game struct {
+						URI string `json:"uri"`
+					} `json:"game"`
+					FEN       string `json:"fen"`
+					Checkmate bool   `json:"checkmate"`
+					Draw      bool   `json:"draw"`
+					CreatedAt string `json:"createdAt"`
+				} `json:"value"`
+			} `json:"records"`
+		}
+
+		if err := json.NewDecoder(resp.Body).Decode(&listResp); err != nil {
+			continue
+		}
+
+		for _, record := range listResp.Records {
+			if record.Value.Game.URI != gameURI {
+				continue
+			}
+			t, err := time.Parse(time.RFC3339, record.Value.CreatedAt)
+			if err != nil {
+				continue
+			}
+			if latest == nil || t.After(latest.CreatedAt) {
+				latest = &moveRecord{
+					FEN:       record.Value.FEN,
+					Checkmate: record.Value.Checkmate,
+					Draw:      record.Value.Draw,
+					CreatedAt: t,
+				}
+			}
+		}
+	}
+
+	return latest, nil
+}
+
 func (c *Client) GetGame(ctx context.Context, gameURI string) (*chess.Game, error) {
 	// Parse the AT Protocol URI to extract repo and rkey
 	// Example URI: at://did:plc:example/app.atchess.game/3k2uv5...
@@ -506,7 +577,7 @@ func (c *Client) GetGame(ctx context.Context, gameURI string) (*chess.Game, erro
 		}
 	}
 	
-	return &chess.Game{
+	game := &chess.Game{
 		ID:          gameURI,
 		White:       getResp.Value.White,
 		Black:       getResp.Value.Black,
@@ -515,7 +586,27 @@ func (c *Client) GetGame(ctx context.Context, gameURI string) (*chess.Game, erro
 		PGN:         getResp.Value.PGN,
 		TimeControl: timeControl,
 		CreatedAt:   getResp.Value.CreatedAt,
-	}, nil
+	}
+
+	// Reconstruct current state from move records across both players' repos.
+	// The game record is a denormalized cache that may be stale (e.g. when the
+	// opponent made the last move and couldn't update this repo's record).
+	latestMove, err := c.getLatestMoveForGame(ctx, gameURI, game.White, game.Black)
+	if err == nil && latestMove != nil {
+		game.FEN = latestMove.FEN
+		if latestMove.Checkmate {
+			fenParts := strings.Split(latestMove.FEN, " ")
+			if len(fenParts) > 1 && fenParts[1] == "w" {
+				game.Status = chess.StatusBlackWon
+			} else {
+				game.Status = chess.StatusWhiteWon
+			}
+		} else if latestMove.Draw {
+			game.Status = chess.StatusDraw
+		}
+	}
+
+	return game, nil
 }
 
 func (c *Client) GetHandle() string {
