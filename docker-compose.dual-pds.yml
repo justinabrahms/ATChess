@@ -1,16 +1,23 @@
+# Dual PDS setup for local E2E testing
+# Two independent PDS instances, each hosting one test player.
+# Uses HTTP (no SSL) for simplicity in local development.
+#
+# Usage: docker compose -f docker-compose.dual-pds.yml up -d
+#        ./scripts/test-local.sh
+
 services:
-  pds-user3:
+  pds-alice:
     image: ghcr.io/bluesky-social/pds:latest
     ports:
-      - "3002:3000"
+      - "${PDS_PORT_ALICE:-2583}:3000"
     environment:
       - PDS_HOSTNAME=localhost
       - PDS_PORT=3000
-      - PDS_JWT_SECRET=atchess-dev-jwt-secret-user3-change-in-production
-      - PDS_ADMIN_PASSWORD=admin3
+      - PDS_JWT_SECRET=atchess-test-jwt-alice
+      - PDS_ADMIN_PASSWORD=admin-alice
       - PDS_INVITE_REQUIRED=false
       - PDS_EMAIL_SMTP_URL=smtp://fake
-      - PDS_EMAIL_FROM_ADDRESS=noreply@user3.localhost
+      - PDS_EMAIL_FROM_ADDRESS=noreply@alice.localhost
       - PDS_DATA_DIRECTORY=/pds
       - PDS_BLOBSTORE_DISK_LOCATION=/pds/blocks
       - PDS_DID_PLC_URL=https://plc.directory
@@ -18,42 +25,33 @@ services:
       - PDS_BSKY_APP_VIEW_DID=did:web:api.bsky.app
       - PDS_CRAWLERS=https://bsky.network
       - LOG_ENABLED=true
-      # Required security keys for PDS operation (different from PDS 2)
       - PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX=1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef
       - PDS_REPO_SIGNING_KEY_K256_PRIVATE_KEY_HEX=abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890
-      # Service DID for local development
-      - PDS_SERVICE_DID=did:web:localhost%3A3002
-      # Development mode and SSL configuration
+      - PDS_SERVICE_DID=did:web:localhost%3A2583
       - PDS_DEV_MODE=true
-      - PDS_HTTPS_ENABLED=true
-      - PDS_SSL_CERT_PATH=/certs/localhost.crt
-      - PDS_SSL_KEY_PATH=/certs/localhost.key
-      # Allow self-signed certificates for local development
-      - NODE_TLS_REJECT_UNAUTHORIZED=0
     volumes:
-      - pds-user3-data:/pds
-      - ./certs:/certs:ro
+      - pds-alice-data:/pds
     healthcheck:
-      test: ["CMD-SHELL", "curl -k -f https://localhost:3000/_health || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 30s
-    restart: unless-stopped
-    container_name: pds-user3
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:3000/xrpc/_health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    restart: "no"
+    container_name: atchess-pds-alice
 
-  pds-user4:
+  pds-bob:
     image: ghcr.io/bluesky-social/pds:latest
     ports:
-      - "3003:3000"
+      - "${PDS_PORT_BOB:-2584}:3000"
     environment:
       - PDS_HOSTNAME=localhost
       - PDS_PORT=3000
-      - PDS_JWT_SECRET=atchess-dev-jwt-secret-user4-change-in-production
-      - PDS_ADMIN_PASSWORD=admin4
+      - PDS_JWT_SECRET=atchess-test-jwt-bob
+      - PDS_ADMIN_PASSWORD=admin-bob
       - PDS_INVITE_REQUIRED=false
       - PDS_EMAIL_SMTP_URL=smtp://fake
-      - PDS_EMAIL_FROM_ADDRESS=noreply@user4.localhost
+      - PDS_EMAIL_FROM_ADDRESS=noreply@bob.localhost
       - PDS_DATA_DIRECTORY=/pds
       - PDS_BLOBSTORE_DISK_LOCATION=/pds/blocks
       - PDS_DID_PLC_URL=https://plc.directory
@@ -61,32 +59,23 @@ services:
       - PDS_BSKY_APP_VIEW_DID=did:web:api.bsky.app
       - PDS_CRAWLERS=https://bsky.network
       - LOG_ENABLED=true
-      # Required security keys for PDS operation (different from PDS 1)
       - PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX=fedcba0987654321fedcba0987654321fedcba0987654321fedcba0987654321
       - PDS_REPO_SIGNING_KEY_K256_PRIVATE_KEY_HEX=0987654321fedcba0987654321fedcba0987654321fedcba0987654321fedcba
-      # Service DID for local development
-      - PDS_SERVICE_DID=did:web:localhost%3A3003
-      # Development mode and SSL configuration
+      - PDS_SERVICE_DID=did:web:localhost%3A2584
       - PDS_DEV_MODE=true
-      - PDS_HTTPS_ENABLED=true
-      - PDS_SSL_CERT_PATH=/certs/localhost.crt
-      - PDS_SSL_KEY_PATH=/certs/localhost.key
-      # Allow self-signed certificates for local development
-      - NODE_TLS_REJECT_UNAUTHORIZED=0
     volumes:
-      - pds-user4-data:/pds
-      - ./certs:/certs:ro
+      - pds-bob-data:/pds
     healthcheck:
-      test: ["CMD-SHELL", "curl -k -f https://localhost:3000/_health || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 30s
-    restart: unless-stopped
-    container_name: pds-user4
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:3000/xrpc/_health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    restart: "no"
+    container_name: atchess-pds-bob
 
 volumes:
-  pds-user3-data:
+  pds-alice-data:
     driver: local
-  pds-user4-data:
+  pds-bob-data:
     driver: local

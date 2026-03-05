@@ -1,4 +1,4 @@
-.PHONY: build protocol web run-protocol run-web dev-protocol dev-web dev test test-protocol test-web test-integration test-e2e lint fmt clean
+.PHONY: build protocol web run-protocol run-web dev-protocol dev-web dev test test-protocol test-web test-integration test-e2e test-local test-local-up test-local-down lint fmt clean
 
 # Build commands
 build: protocol web
@@ -55,6 +55,15 @@ test-integration:
 
 test-e2e:
 	./scripts/run-e2e-tests.sh
+
+test-local:
+	./scripts/test-local.sh
+
+test-local-up:
+	./scripts/test-local.sh --up
+
+test-local-down:
+	./scripts/test-local.sh --down
 
 # Code quality
 lint:
