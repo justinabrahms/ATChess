@@ -101,7 +101,8 @@ jobs:
             exit 1
           }
           mv -f "$STAGING_DIR"/atchess-web /srv/atchess/app/bin/
-          
+          chmod g+w /srv/atchess/app/bin/atchess-*
+
           # Clean up staging
           rmdir "$STAGING_DIR" 2>/dev/null || true
           
@@ -109,10 +110,11 @@ jobs:
           cd /srv/atchess/app
           rm -rf web/static 2>/dev/null || true
           mkdir -p web
-          
+
           # Extract directly to web directory
           cd web
           tar xzf /tmp/static.tar.gz
+          chmod -R g+w static
           cd ..
           
           # Clean up temporary files
