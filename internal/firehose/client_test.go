@@ -1,6 +1,7 @@
 package firehose
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -10,6 +11,8 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/ipld/go-ipld-prime/codec/dagcbor"
+	"github.com/ipld/go-ipld-prime/node/basicnode"
 	"github.com/rs/zerolog"
 )
 
@@ -324,6 +327,134 @@ func createTestMessage(seq int64, recordPath string, recordData map[string]inter
 	// For testing, we'll skip that part since the extraction would fail anyway
 	
 	return message
+}
+
+func TestClient_ProcessCBORMessage(t *testing.T) {
+	// Create a CBOR-encoded firehose message with chess ops
+	messages := [][]byte{
+		createCBORTestMessage(t, 42, "did:plc:cboruser", "app.atchess.move"),
+	}
+
+	server := newMockWebSocketServer(messages)
+	defer server.Close()
+
+	url := "ws" + strings.TrimPrefix(server.URL, "http")
+
+	events := make([]Event, 0)
+	var mu sync.Mutex
+
+	handler := func(event Event) error {
+		mu.Lock()
+		events = append(events, event)
+		mu.Unlock()
+		return nil
+	}
+
+	logger := zerolog.New(zerolog.NewTestWriter(t))
+	client := NewClient(handler, WithURL(url), WithLogger(logger))
+
+	err := client.Start()
+	if err != nil {
+		t.Fatalf("Failed to start client: %v", err)
+	}
+	defer client.Stop()
+
+	// Wait for events to be processed
+	time.Sleep(200 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if len(events) != 1 {
+		t.Fatalf("Expected 1 event, got %d", len(events))
+	}
+
+	if events[0].Type != EventTypeMove {
+		t.Errorf("Expected event type move, got %s", events[0].Type)
+	}
+	if events[0].Repo != "did:plc:cboruser" {
+		t.Errorf("Expected repo did:plc:cboruser, got %s", events[0].Repo)
+	}
+	if events[0].Path != "app.atchess.move" {
+		t.Errorf("Expected path app.atchess.move, got %s", events[0].Path)
+	}
+}
+
+func TestClient_CBORSkipsNonChessEvents(t *testing.T) {
+	messages := [][]byte{
+		createCBORTestMessage(t, 1, "did:plc:someone", "app.bsky.feed.post"),
+	}
+
+	server := newMockWebSocketServer(messages)
+	defer server.Close()
+
+	url := "ws" + strings.TrimPrefix(server.URL, "http")
+
+	var eventCount int
+	handler := func(event Event) error {
+		eventCount++
+		return nil
+	}
+
+	client := NewClient(handler, WithURL(url))
+	err := client.Start()
+	if err != nil {
+		t.Fatalf("Failed to start client: %v", err)
+	}
+	defer client.Stop()
+
+	time.Sleep(200 * time.Millisecond)
+
+	if eventCount != 0 {
+		t.Errorf("Expected 0 events for non-chess records, got %d", eventCount)
+	}
+}
+
+// createCBORTestMessage creates a real CBOR-encoded AT Protocol firehose message
+func createCBORTestMessage(t *testing.T, seq int64, repo string, path string) []byte {
+	t.Helper()
+
+	var buf bytes.Buffer
+
+	// Encode CBOR header: {op: 1, t: "#commit"}
+	headerBuilder := basicnode.Prototype.Map.NewBuilder()
+	ma, _ := headerBuilder.BeginMap(2)
+	ma.AssembleKey().AssignString("op")
+	ma.AssembleValue().AssignInt(1)
+	ma.AssembleKey().AssignString("t")
+	ma.AssembleValue().AssignString("#commit")
+	ma.Finish()
+	if err := dagcbor.Encode(headerBuilder.Build(), &buf); err != nil {
+		t.Fatalf("Failed to encode CBOR header: %v", err)
+	}
+
+	// Encode CBOR body with repo, seq, ops (no blocks for this test)
+	bodyBuilder := basicnode.Prototype.Map.NewBuilder()
+	bma, _ := bodyBuilder.BeginMap(3)
+	bma.AssembleKey().AssignString("seq")
+	bma.AssembleValue().AssignInt(seq)
+	bma.AssembleKey().AssignString("repo")
+	bma.AssembleValue().AssignString(repo)
+
+	// ops: [{action: "create", path: path, cid: "testcid"}]
+	bma.AssembleKey().AssignString("ops")
+	la, _ := bma.AssembleValue().BeginList(1)
+	opma, _ := la.AssembleValue().BeginMap(3)
+	opma.AssembleKey().AssignString("action")
+	opma.AssembleValue().AssignString("create")
+	opma.AssembleKey().AssignString("path")
+	opma.AssembleValue().AssignString(path)
+	opma.AssembleKey().AssignString("cid")
+	opma.AssembleValue().AssignString("testcid")
+	opma.Finish()
+	la.Finish()
+
+	bma.Finish()
+	if err := dagcbor.Encode(bodyBuilder.Build(), &buf); err != nil {
+		t.Fatalf("Failed to encode CBOR body: %v", err)
+	}
+
+	return buf.Bytes()
 }
 
 func TestIsChessRecord(t *testing.T) {
