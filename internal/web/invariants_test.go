@@ -26,56 +26,65 @@ type ATProtoInterface interface {
 }
 
 // TestCORSHeadersAlwaysPresentOnPreflightRequests ensures that CORS headers
-// are properly set on OPTIONS requests from browsers
+// are properly set on OPTIONS requests from allowed origins
 func TestCORSHeadersAlwaysPresentOnPreflightRequests(t *testing.T) {
+	checker := NewOriginChecker([]string{"http://localhost:8081"})
 	router := mux.NewRouter()
-	
-	// Add CORS middleware (same as in main.go)
-	router.Use(func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Access-Control-Allow-Origin", "*")
-			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-			
-			if r.Method == "OPTIONS" {
-				w.WriteHeader(http.StatusOK)
-				return
-			}
-			
-			next.ServeHTTP(w, r)
-		})
-	})
-	
+
+	router.Use(checker.CORSMiddleware)
+
 	// Add explicit OPTIONS handlers
 	api := router.PathPrefix("/api").Subrouter()
 	api.HandleFunc("/moves", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}).Methods("OPTIONS")
-	
-	// Test CORS preflight request
+
+	// Test CORS preflight request from allowed origin
 	req := httptest.NewRequest("OPTIONS", "/api/moves", nil)
 	req.Header.Set("Origin", "http://localhost:8081")
 	req.Header.Set("Access-Control-Request-Method", "POST")
 	req.Header.Set("Access-Control-Request-Headers", "content-type")
-	
+
 	w := httptest.NewRecorder()
 	router.ServeHTTP(w, req)
-	
-	// Verify CORS headers are present
+
 	if w.Code != http.StatusOK {
 		t.Errorf("Expected status 200, got %d", w.Code)
 	}
-	
-	if w.Header().Get("Access-Control-Allow-Origin") != "*" {
-		t.Errorf("Expected Access-Control-Allow-Origin: *, got %s", w.Header().Get("Access-Control-Allow-Origin"))
+
+	if w.Header().Get("Access-Control-Allow-Origin") != "http://localhost:8081" {
+		t.Errorf("Expected Access-Control-Allow-Origin: http://localhost:8081, got %s", w.Header().Get("Access-Control-Allow-Origin"))
 	}
-	
+
 	if !strings.Contains(w.Header().Get("Access-Control-Allow-Methods"), "POST") {
 		t.Errorf("Expected Access-Control-Allow-Methods to contain POST, got %s", w.Header().Get("Access-Control-Allow-Methods"))
 	}
-	
+
 	if !strings.Contains(w.Header().Get("Access-Control-Allow-Headers"), "Content-Type") {
 		t.Errorf("Expected Access-Control-Allow-Headers to contain Content-Type, got %s", w.Header().Get("Access-Control-Allow-Headers"))
+	}
+}
+
+// TestCORSRejectsDisallowedOrigins ensures disallowed origins don't get CORS headers
+func TestCORSRejectsDisallowedOrigins(t *testing.T) {
+	checker := NewOriginChecker([]string{"https://atchess.example.com"})
+	router := mux.NewRouter()
+	router.Use(checker.CORSMiddleware)
+
+	api := router.PathPrefix("/api").Subrouter()
+	api.HandleFunc("/moves", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}).Methods("OPTIONS")
+
+	req := httptest.NewRequest("OPTIONS", "/api/moves", nil)
+	req.Header.Set("Origin", "http://evil.example.com")
+	req.Header.Set("Access-Control-Request-Method", "POST")
+
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, req)
+
+	if w.Header().Get("Access-Control-Allow-Origin") != "" {
+		t.Errorf("Expected no Access-Control-Allow-Origin for disallowed origin, got %s", w.Header().Get("Access-Control-Allow-Origin"))
 	}
 }
 
@@ -255,23 +264,10 @@ func TestCompleteGameWorkflowPreservesDataIntegrity(t *testing.T) {
 	service := NewTestService(client, cfg)
 	
 	// Create router with CORS and routes
+	checker := NewOriginChecker([]string{"http://localhost:8081"})
 	router := mux.NewRouter()
-	
-	// Add CORS middleware
-	router.Use(func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Access-Control-Allow-Origin", "*")
-			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
-			
-			if r.Method == "OPTIONS" {
-				w.WriteHeader(http.StatusOK)
-				return
-			}
-			
-			next.ServeHTTP(w, r)
-		})
-	})
+
+	router.Use(checker.CORSMiddleware)
 	
 	// Add routes
 	api := router.PathPrefix("/api").Subrouter()

@@ -22,6 +22,7 @@ type Service struct {
 	config         *config.Config
 	oauthClient    OAuthClientInterface
 	challengeStore *challenge.Store
+	originChecker  *OriginChecker
 }
 
 // OAuthClientInterface defines the methods we need from the OAuth client
@@ -29,12 +30,22 @@ type OAuthClientInterface interface {
 	GetPublicKeyJWK() map[string]interface{}
 }
 
-func NewService(client *atproto.Client, config *config.Config, challengeStore *challenge.Store) *Service {
+func NewService(client *atproto.Client, cfg *config.Config, challengeStore *challenge.Store) *Service {
+	origins := cfg.Server.AllowedOrigins
+	if len(origins) == 0 {
+		origins = AllowedOriginsFromBaseURL(cfg.Server.BaseURL)
+	}
 	return &Service{
 		client:         client,
-		config:         config,
+		config:         cfg,
 		challengeStore: challengeStore,
+		originChecker:  NewOriginChecker(origins),
 	}
+}
+
+// GetOriginChecker returns the service's origin checker for use in middleware.
+func (s *Service) GetOriginChecker() *OriginChecker {
+	return s.originChecker
 }
 
 // SetOAuthClient sets the OAuth client for the service
