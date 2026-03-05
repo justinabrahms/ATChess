@@ -96,21 +96,8 @@ func main() {
 	// Setup routes
 	router := mux.NewRouter()
 	
-	// Add CORS middleware
-	router.Use(func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Access-Control-Allow-Origin", "*")
-			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Session-ID")
-			
-			if r.Method == "OPTIONS" {
-				w.WriteHeader(http.StatusOK)
-				return
-			}
-			
-			next.ServeHTTP(w, r)
-		})
-	})
+	// Add CORS middleware with origin allowlist
+	router.Use(service.GetOriginChecker().CORSMiddleware)
 	
 	// Root level health endpoint for load balancers and monitoring
 	router.HandleFunc("/health", service.HealthHandler).Methods("GET")

@@ -11,14 +11,13 @@ import (
 	"github.com/rs/zerolog/log"
 )
 
-// WebSocket upgrader with reasonable settings
-var upgrader = websocket.Upgrader{
-	ReadBufferSize:  1024,
-	WriteBufferSize: 1024,
-	CheckOrigin: func(r *http.Request) bool {
-		// Allow all origins for now, tighten in production
-		return true
-	},
+// newUpgrader creates a WebSocket upgrader that validates origins against the allowlist.
+func newUpgrader(checker *OriginChecker) websocket.Upgrader {
+	return websocket.Upgrader{
+		ReadBufferSize:  1024,
+		WriteBufferSize: 1024,
+		CheckOrigin:     checker.CheckWebSocketOrigin,
+	}
 }
 
 // Hub maintains active WebSocket connections
@@ -140,6 +139,7 @@ func (h *Hub) BroadcastGameUpdate(update GameUpdate) {
 
 // WebSocketHandler handles WebSocket upgrade requests
 func (s *Service) WebSocketHandler(hub *Hub) http.HandlerFunc {
+	wsUpgrader := newUpgrader(s.originChecker)
 	return func(w http.ResponseWriter, r *http.Request) {
 		// Get game ID from query params
 		gameID := r.URL.Query().Get("gameId")
@@ -147,12 +147,12 @@ func (s *Service) WebSocketHandler(hub *Hub) http.HandlerFunc {
 			http.Error(w, "Missing gameId parameter", http.StatusBadRequest)
 			return
 		}
-		
+
 		// TODO: Get user ID from session/auth
 		userID := "anonymous"
-		
+
 		// Upgrade connection
-		conn, err := upgrader.Upgrade(w, r, nil)
+		conn, err := wsUpgrader.Upgrade(w, r, nil)
 		if err != nil {
 			log.Error().Err(err).Msg("Failed to upgrade WebSocket connection")
 			return
