@@ -55,7 +55,7 @@ echo "🚀 Running end-to-end tests..."
 echo ""
 
 # Run with verbose output and race detection
-go test -v -race -timeout 60s ./test/e2e/...
+go test -v -race -tags=e2e -timeout 60s ./test/e2e/...
 
 echo ""
 echo "🎉 All end-to-end tests completed successfully!"
