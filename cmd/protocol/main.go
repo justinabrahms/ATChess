@@ -116,37 +116,43 @@ func main() {
 	
 	// API routes
 	api := router.PathPrefix("/api").Subrouter()
+
+	// Public endpoints (no auth required)
 	api.HandleFunc("/health", service.HealthHandler).Methods("GET")
 	api.HandleFunc("/auth/login", service.LoginHandler).Methods("POST")
-	api.HandleFunc("/auth/current", service.GetCurrentUserHandler).Methods("GET")
 	api.HandleFunc("/auth/oauth/login", service.OAuthLoginHandler).Methods("POST")
 	api.HandleFunc("/callback", service.OAuthCallbackHandler).Methods("GET")
 	api.HandleFunc("/auth/session", service.GetSessionHandler).Methods("GET")
 	api.HandleFunc("/auth/logout", service.LogoutHandler).Methods("POST")
-	api.HandleFunc("/games", service.CreateGameHandler).Methods("POST")
 	api.HandleFunc("/games/{id:.*}", service.GetGameHandler).Methods("GET")
-	api.HandleFunc("/moves", service.MakeMoveHandler).Methods("POST")
-	api.HandleFunc("/challenges", service.CreateChallengeHandler).Methods("POST")
-	api.HandleFunc("/challenge-notifications", service.GetChallengeNotificationsHandler).Methods("GET")
-	api.HandleFunc("/challenge-notifications/{key}", service.DeleteChallengeNotificationHandler).Methods("DELETE")
-	api.HandleFunc("/draw-offers", service.OfferDrawHandler).Methods("POST")
-	api.HandleFunc("/draw-offers/respond", service.RespondToDrawHandler).Methods("POST")
-	api.HandleFunc("/resign", service.ResignGameHandler).Methods("POST")
-	
-	// Spectator endpoints
+
+	// Spectator endpoints (public, read-only)
 	api.HandleFunc("/spectator/games", service.GetActiveGamesHandler).Methods("GET")
 	api.HandleFunc("/spectator/games/{id:.*}", service.GetSpectatorGameHandler).Methods("GET")
 	api.HandleFunc("/spectator/games/{id:.*}/count", service.UpdateSpectatorCountHandler(hub)).Methods("POST")
 	api.HandleFunc("/spectator/games/{id:.*}/abandonment", service.CheckAbandonmentHandler).Methods("GET")
-	api.HandleFunc("/spectator/games/{id:.*}/claim-abandonment", service.ClaimAbandonedGameHandler).Methods("POST")
-	
-	// Time control endpoints
+
+	// Time control read endpoints (public)
 	api.HandleFunc("/games/{id:.*}/time-violation", service.CheckTimeViolationHandler).Methods("GET")
-	api.HandleFunc("/games/{id:.*}/claim-time", service.ClaimTimeVictoryHandler).Methods("POST")
 	api.HandleFunc("/games/{id:.*}/time-remaining", service.GetTimeRemainingHandler).Methods("GET")
-	
+
 	// WebSocket endpoint for real-time updates
 	api.HandleFunc("/ws", service.WebSocketHandler(hub))
+
+	// Authenticated endpoints (require valid session)
+	authed := api.PathPrefix("").Subrouter()
+	authed.Use(web.AuthMiddleware)
+	authed.HandleFunc("/auth/current", service.GetCurrentUserHandler).Methods("GET")
+	authed.HandleFunc("/games", service.CreateGameHandler).Methods("POST")
+	authed.HandleFunc("/moves", service.MakeMoveHandler).Methods("POST")
+	authed.HandleFunc("/challenges", service.CreateChallengeHandler).Methods("POST")
+	authed.HandleFunc("/challenge-notifications", service.GetChallengeNotificationsHandler).Methods("GET")
+	authed.HandleFunc("/challenge-notifications/{key}", service.DeleteChallengeNotificationHandler).Methods("DELETE")
+	authed.HandleFunc("/draw-offers", service.OfferDrawHandler).Methods("POST")
+	authed.HandleFunc("/draw-offers/respond", service.RespondToDrawHandler).Methods("POST")
+	authed.HandleFunc("/resign", service.ResignGameHandler).Methods("POST")
+	authed.HandleFunc("/spectator/games/{id:.*}/claim-abandonment", service.ClaimAbandonedGameHandler).Methods("POST")
+	authed.HandleFunc("/games/{id:.*}/claim-time", service.ClaimTimeVictoryHandler).Methods("POST")
 	
 	// Explicit OPTIONS handlers for CORS preflight requests
 	api.HandleFunc("/auth/login", func(w http.ResponseWriter, r *http.Request) {

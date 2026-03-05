@@ -36,3 +36,8 @@ docker-compose.override.yml
 .atchess-test-pids
 protocol.log
 web.log
+
+# Gas Town (added by gt)
+.runtime/
+.claude/commands/
+.logs/

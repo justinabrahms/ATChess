@@ -434,12 +434,10 @@ func (s *Service) LoginHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Service) GetCurrentUserHandler(w http.ResponseWriter, r *http.Request) {
-	// For now, return the service's configured user
-	// In a real implementation, this would validate the session token
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"did":    s.client.GetDID(),
-		"handle": s.client.GetHandle(),
+		"did":           AuthenticatedDID(r),
+		"handle":        AuthenticatedHandle(r),
 		"authenticated": true,
 	})
 }
