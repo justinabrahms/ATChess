@@ -14,6 +14,7 @@ import (
 	"github.com/justinabrahms/atchess/internal/challenge"
 	"github.com/justinabrahms/atchess/internal/chess"
 	"github.com/justinabrahms/atchess/internal/config"
+	"github.com/justinabrahms/atchess/internal/oauth"
 	"github.com/rs/zerolog/log"
 )
 
@@ -102,17 +103,33 @@ func (s *Service) MakeMoveHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
 		return
 	}
-	
+
 	// Game ID must be provided in request body
 	gameID := req.GameID
 	if gameID == "" {
 		http.Error(w, "game_id is required in request body", http.StatusBadRequest)
 		return
 	}
-	
+
 	// Log for debugging
 	log.Info().Str("gameID", gameID).Str("from", req.From).Str("to", req.To).Str("fen", req.FEN).Str("path", r.URL.Path).Msg("MakeMoveHandler called")
-	
+
+	// Fetch the game to validate player identity and turn
+	game, err := s.client.GetGame(context.Background(), gameID)
+	if err != nil {
+		log.Error().Err(err).Str("gameID", gameID).Msg("Failed to fetch game for validation")
+		http.Error(w, "Game not found", http.StatusNotFound)
+		return
+	}
+
+	// Verify the authenticated user is a player in this game
+	authedDID := AuthenticatedDID(r)
+	if authedDID != game.White && authedDID != game.Black {
+		log.Warn().Str("did", authedDID).Str("gameID", gameID).Msg("User is not a player in this game")
+		http.Error(w, "You are not a player in this game", http.StatusForbidden)
+		return
+	}
+
 	// Create chess engine from current position
 	engine, err := chess.NewEngineFromFEN(req.FEN)
 	if err != nil {
@@ -120,10 +137,18 @@ func (s *Service) MakeMoveHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Invalid FEN", http.StatusBadRequest)
 		return
 	}
-	
+
+	// Verify it's the authenticated user's turn
+	activeColor := engine.GetActiveColor()
+	if (activeColor == "white" && authedDID != game.White) || (activeColor == "black" && authedDID != game.Black) {
+		log.Warn().Str("did", authedDID).Str("activeColor", activeColor).Str("gameID", gameID).Msg("Not this player's turn")
+		http.Error(w, "It is not your turn", http.StatusForbidden)
+		return
+	}
+
 	// Parse promotion
 	promotion := chess.ParsePromotion(req.Promotion)
-	
+
 	// Make move
 	moveResult, err := engine.MakeMove(req.From, req.To, promotion)
 	if err != nil {
@@ -427,7 +452,7 @@ func (s *Service) LoginHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
 		return
 	}
-	
+
 	// Validate input
 	if req.Handle == "" || req.Password == "" {
 		w.Header().Set("Content-Type", "application/json")
@@ -437,7 +462,7 @@ func (s *Service) LoginHandler(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	
+
 	// Create a new AT Protocol client for this user
 	userClient, err := atproto.NewClientWithDPoP(
 		s.config.ATProto.PDSURL,
@@ -454,15 +479,26 @@ func (s *Service) LoginHandler(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
-	
-	// Return success with user info
-	// Note: In production, you'd want to create a session token instead of returning the raw JWT
+
+	// Ensure session store is initialized for password auth
+	if sessionStore == nil {
+		sessionStore = oauth.NewSessionStore()
+	}
+
+	// Create a proper session so auth middleware works
+	session := &oauth.Session{
+		DID:       userClient.GetDID(),
+		Handle:    userClient.GetHandle(),
+		ExpiresAt: time.Now().Add(24 * time.Hour),
+	}
+	sessionID := sessionStore.CreateSession(session)
+
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(AuthResponse{
 		Success:     true,
 		DID:         userClient.GetDID(),
 		Handle:      userClient.GetHandle(),
-		AccessToken: "session_" + base64.URLEncoding.EncodeToString([]byte(userClient.GetDID())),
+		AccessToken: sessionID,
 	})
 }
 
