@@ -236,13 +236,63 @@ func (c *Client) createGame(ctx context.Context, opponentDID, color string, rkey
 }
 
 func (c *Client) RecordMove(ctx context.Context, gameURI string, move *chess.MoveResult) error {
-	// First, fetch the game record to get its CID and current value
+	// Fetch the game record to get its CID and current value
 	gameCID, gameValue, err := c.getGameRecord(ctx, gameURI)
 	if err != nil {
 		return fmt.Errorf("failed to get game record: %w", err)
 	}
-	
-	// Create move record
+
+	// Parse the game URI to get repo and rkey
+	parts := strings.Split(gameURI, "/")
+	if len(parts) < 5 || !strings.HasPrefix(gameURI, "at://") {
+		return fmt.Errorf("invalid game URI format: %s", gameURI)
+	}
+
+	repo := parts[2] // The DID
+	rkey := parts[4] // The record key
+
+	// Update game record FIRST (CAS-protected) to prevent race conditions.
+	// Only the game owner can update the game record; if it belongs to the
+	// opponent we still create the move record (the game record is a
+	// denormalized cache that gets reconstructed from move records).
+	if repo == c.did {
+		gameValue["fen"] = move.FEN
+		if move.Checkmate || move.Draw {
+			if move.Checkmate {
+				fenParts := strings.Split(move.FEN, " ")
+				if len(fenParts) > 1 && fenParts[1] == "w" {
+					gameValue["status"] = "black_won"
+				} else {
+					gameValue["status"] = "white_won"
+				}
+			} else if move.Draw {
+				gameValue["status"] = "draw"
+			}
+		}
+		gameValue["updatedAt"] = time.Now().Format(time.RFC3339)
+
+		putReq := map[string]interface{}{
+			"repo":       repo,
+			"collection": "app.atchess.game",
+			"rkey":       rkey,
+			"record":     gameValue,
+			"swapCid":    gameCID, // Optimistic concurrency control
+		}
+
+		putReqBody, _ := json.Marshal(putReq)
+		putResp, err := c.makeRequest("POST", c.pdsURL+"/xrpc/com.atproto.repo.putRecord", putReqBody)
+		if err != nil {
+			return fmt.Errorf("failed to update game record: %w", err)
+		}
+		defer putResp.Body.Close()
+
+		if putResp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(putResp.Body)
+			return fmt.Errorf("failed to update game record (conflict — another move may have been played): HTTP %d, body: %s", putResp.StatusCode, string(body))
+		}
+	}
+
+	// CAS succeeded (or game is in opponent's repo) — now create the move record.
 	moveRecord := map[string]interface{}{
 		"$type":     "app.atchess.move",
 		"createdAt": time.Now().Format(time.RFC3339),
@@ -256,7 +306,7 @@ func (c *Client) RecordMove(ctx context.Context, gameURI string, move *chess.Mov
 		"san":    move.SAN,
 		"fen":    move.FEN,
 	}
-	
+
 	if move.Check {
 		moveRecord["check"] = true
 	}
@@ -266,79 +316,24 @@ func (c *Client) RecordMove(ctx context.Context, gameURI string, move *chess.Mov
 	if move.Draw {
 		moveRecord["draw"] = true
 	}
-	
-	// Create move record
+
 	createReq := map[string]interface{}{
 		"repo":       c.did,
 		"collection": "app.atchess.move",
 		"record":     moveRecord,
 	}
-	
+
 	reqBody, _ := json.Marshal(createReq)
 	resp, err := c.makeRequest("POST", c.pdsURL+"/xrpc/com.atproto.repo.createRecord", reqBody)
 	if err != nil {
 		return fmt.Errorf("failed to create move record: %w", err)
 	}
 	defer resp.Body.Close()
-	
+
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("failed to create move record: HTTP %d", resp.StatusCode)
 	}
-	
-	// Update game record with new FEN only if it's in our repository
-	// Parse the game URI to get repo and rkey
-	parts := strings.Split(gameURI, "/")
-	if len(parts) < 5 || !strings.HasPrefix(gameURI, "at://") {
-		return fmt.Errorf("invalid game URI format: %s", gameURI)
-	}
-	
-	repo := parts[2] // The DID
-	rkey := parts[4] // The record key
-	
-	// Only update the game record if it belongs to the current user
-	if repo != c.did {
-		// Game belongs to another user, we can't update it
-		return nil
-	}
-	
-	// Update the game record with new FEN and status
-	gameValue["fen"] = move.FEN
-	if move.Checkmate || move.Draw {
-		if move.Checkmate {
-			// Determine winner based on whose turn it was
-			fenParts := strings.Split(move.FEN, " ")
-			if len(fenParts) > 1 && fenParts[1] == "w" {
-				gameValue["status"] = "black_won"
-			} else {
-				gameValue["status"] = "white_won"
-			}
-		} else if move.Draw {
-			gameValue["status"] = "draw"
-		}
-	}
-	gameValue["updatedAt"] = time.Now().Format(time.RFC3339)
-	
-	// Use com.atproto.repo.putRecord to update the game
-	putReq := map[string]interface{}{
-		"repo":       repo,
-		"collection": "app.atchess.game",
-		"rkey":       rkey,
-		"record":     gameValue,
-		"swapCid":    gameCID, // Optimistic concurrency control
-	}
-	
-	putReqBody, _ := json.Marshal(putReq)
-	putResp, err := c.makeRequest("POST", c.pdsURL+"/xrpc/com.atproto.repo.putRecord", putReqBody)
-	if err != nil {
-		return fmt.Errorf("failed to update game record: %w", err)
-	}
-	defer putResp.Body.Close()
-	
-	if putResp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(putResp.Body)
-		return fmt.Errorf("failed to update game record: HTTP %d, body: %s", putResp.StatusCode, string(body))
-	}
-	
+
 	return nil
 }
 
