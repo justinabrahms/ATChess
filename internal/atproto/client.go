@@ -1613,6 +1613,106 @@ func (c *Client) ClaimTimeVictory(ctx context.Context, gameID string) error {
 	return nil
 }
 
+// ClaimAbandonment claims victory due to opponent abandoning the game.
+// It verifies the game is active, the claiming player is a participant,
+// and the game meets the abandonment threshold (3x time control).
+func (c *Client) ClaimAbandonment(ctx context.Context, gameID string) error {
+	// Get the game record
+	gameCID, gameValue, err := c.getGameRecord(ctx, gameID)
+	if err != nil {
+		return fmt.Errorf("failed to get game record: %w", err)
+	}
+
+	// Verify the game is active
+	if status, ok := gameValue["status"].(string); ok && status != "active" {
+		return fmt.Errorf("game is not active, status: %s", status)
+	}
+
+	// Verify the claiming player is part of the game
+	whiteDID, _ := gameValue["white"].(string)
+	blackDID, _ := gameValue["black"].(string)
+	if c.did != whiteDID && c.did != blackDID {
+		return fmt.Errorf("you are not a player in this game")
+	}
+
+	// Check last activity to verify abandonment
+	// Default abandonment timeout: 3 days for correspondence (3x the move time)
+	createdAt, _ := gameValue["createdAt"].(string)
+	lastActivityTime, err := time.Parse(time.RFC3339, createdAt)
+	if err != nil {
+		return fmt.Errorf("failed to parse game creation timestamp: %w", err)
+	}
+
+	// Check for more recent moves
+	fen, _ := gameValue["fen"].(string)
+	fenParts := strings.Split(fen, " ")
+	if len(fenParts) >= 2 {
+		var currentPlayerDID string
+		if fenParts[1] == "w" {
+			currentPlayerDID = whiteDID
+		} else {
+			currentPlayerDID = blackDID
+		}
+
+		lastMove, err := c.getLastMove(ctx, gameID, currentPlayerDID)
+		if err == nil && lastMove != nil {
+			if moveTime, err := time.Parse(time.RFC3339, lastMove.CreatedAt); err == nil {
+				lastActivityTime = moveTime
+			}
+		}
+	}
+
+	// Default: 3 days abandonment threshold
+	abandonmentTimeout := 3 * 24 * time.Hour
+	if time.Since(lastActivityTime) <= abandonmentTimeout {
+		return fmt.Errorf("game has not been abandoned (last activity: %s ago)", time.Since(lastActivityTime).Truncate(time.Minute))
+	}
+
+	// Determine whose turn it is — the abandoning player is the one who hasn't moved
+	var newStatus string
+	if len(fenParts) >= 2 {
+		if fenParts[1] == "w" {
+			// White's turn, white abandoned → black wins
+			newStatus = "black_won"
+		} else {
+			// Black's turn, black abandoned → white wins
+			newStatus = "white_won"
+		}
+	} else {
+		return fmt.Errorf("invalid FEN format in game record")
+	}
+
+	// Update the game record if we own it
+	parts := strings.Split(gameID, "/")
+	if len(parts) >= 5 && parts[2] == c.did {
+		gameValue["status"] = newStatus
+		gameValue["updatedAt"] = time.Now().Format(time.RFC3339)
+
+		rkey := parts[4]
+		updateReq := map[string]interface{}{
+			"repo":       c.did,
+			"collection": "app.atchess.game",
+			"rkey":       rkey,
+			"record":     gameValue,
+			"swapCid":    gameCID,
+		}
+
+		updateReqBody, _ := json.Marshal(updateReq)
+		updateResp, err := c.makeRequest("POST", c.pdsURL+"/xrpc/com.atproto.repo.putRecord", updateReqBody)
+		if err != nil {
+			return fmt.Errorf("failed to update game record: %w", err)
+		}
+		defer updateResp.Body.Close()
+
+		if updateResp.StatusCode != http.StatusOK {
+			body, _ := io.ReadAll(updateResp.Body)
+			return fmt.Errorf("failed to update game record: HTTP %d - %s", updateResp.StatusCode, string(body))
+		}
+	}
+
+	return nil
+}
+
 // GetTimeRemaining calculates time remaining for the current player in a game
 func (c *Client) GetTimeRemaining(ctx context.Context, gameID string) (time.Duration, error) {
 	// Get the game record
