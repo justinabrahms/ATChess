@@ -613,6 +613,10 @@ func (c *Client) GetHandle() string {
 	return c.handle
 }
 
+func (c *Client) GetPDSURL() string {
+	return c.pdsURL
+}
+
 // ResolveHandle resolves a handle to a DID
 func (c *Client) ResolveHandle(ctx context.Context, handle string) (string, error) {
 	// If it's already a DID, return it
