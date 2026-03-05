@@ -7,18 +7,21 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/gorilla/mux"
 	"github.com/justinabrahms/atchess/internal/atproto"
+	"github.com/justinabrahms/atchess/internal/challenge"
 	"github.com/justinabrahms/atchess/internal/chess"
 	"github.com/justinabrahms/atchess/internal/config"
 	"github.com/rs/zerolog/log"
 )
 
 type Service struct {
-	client      *atproto.Client
-	config      *config.Config
-	oauthClient OAuthClientInterface
+	client         *atproto.Client
+	config         *config.Config
+	oauthClient    OAuthClientInterface
+	challengeStore *challenge.Store
 }
 
 // OAuthClientInterface defines the methods we need from the OAuth client
@@ -26,10 +29,11 @@ type OAuthClientInterface interface {
 	GetPublicKeyJWK() map[string]interface{}
 }
 
-func NewService(client *atproto.Client, config *config.Config) *Service {
+func NewService(client *atproto.Client, config *config.Config, challengeStore *challenge.Store) *Service {
 	return &Service{
-		client: client,
-		config: config,
+		client:         client,
+		config:         config,
+		challengeStore: challengeStore,
 	}
 }
 
@@ -198,25 +202,54 @@ func (s *Service) CreateChallengeHandler(w http.ResponseWriter, r *http.Request)
 		opponentDID = resolvedDID
 	}
 	
-	challenge, err := s.client.CreateChallenge(context.Background(), opponentDID, req.Color, req.Message)
+	ch, err := s.client.CreateChallenge(context.Background(), opponentDID, req.Color, req.Message)
 	if err != nil {
 		log.Error().Err(err).Msg("Failed to create challenge")
 		http.Error(w, "Failed to create challenge", http.StatusInternalServerError)
 		return
 	}
-	
+
+	// Index the challenge locally so the challenged player can discover it
+	if s.challengeStore != nil {
+		createdAt, _ := time.Parse(time.RFC3339, ch.CreatedAt)
+		expiresAt, _ := time.Parse(time.RFC3339, ch.ExpiresAt)
+		s.challengeStore.Add(&challenge.PendingChallenge{
+			ChallengeURI:     ch.ID,
+			ChallengerDID:    ch.Challenger,
+			ChallengerHandle: s.client.GetHandle(),
+			ChallengedDID:    ch.Challenged,
+			Color:            ch.Color,
+			Message:          ch.Message,
+			ProposedGameID:   ch.ProposedGameId,
+			CreatedAt:        createdAt,
+			ExpiresAt:        expiresAt,
+		})
+	}
+
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(challenge)
+	_ = json.NewEncoder(w).Encode(ch)
 }
 
 func (s *Service) GetChallengeNotificationsHandler(w http.ResponseWriter, r *http.Request) {
+	// Use the local challenge store for discovery (works across federation)
+	if s.challengeStore != nil {
+		challenges := s.challengeStore.ForPlayer(s.client.GetDID())
+		w.Header().Set("Content-Type", "application/json")
+		if challenges == nil {
+			challenges = []*challenge.PendingChallenge{}
+		}
+		_ = json.NewEncoder(w).Encode(challenges)
+		return
+	}
+
+	// Fallback to legacy repo-based notifications (only works same-PDS)
 	notifications, err := s.client.GetChallengeNotifications(context.Background())
 	if err != nil {
 		log.Error().Err(err).Msg("Failed to fetch challenge notifications")
 		http.Error(w, "Failed to fetch notifications", http.StatusInternalServerError)
 		return
 	}
-	
+
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(notifications)
 }

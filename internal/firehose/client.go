@@ -496,10 +496,11 @@ func getEventType(path string) EventType {
 		return EventTypeResignation
 	case strings.Contains(path, "app.atchess.game"):
 		return EventTypeGame
+	case strings.Contains(path, "app.atchess.challengeNotification"):
+		return EventTypeChallengeNotification
+	case strings.Contains(path, "app.atchess.challengeAcceptance"):
+		return EventTypeChallengeAcceptance
 	case strings.Contains(path, "app.atchess.challenge"):
-		if strings.Contains(path, "app.atchess.challengeAcceptance") {
-			return EventTypeChallengeAcceptance
-		}
 		return EventTypeChallenge
 	default:
 		return EventTypeGame

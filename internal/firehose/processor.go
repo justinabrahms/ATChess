@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
+	"github.com/justinabrahms/atchess/internal/challenge"
 	"github.com/justinabrahms/atchess/internal/web"
 	"github.com/rs/zerolog/log"
 )
@@ -16,14 +18,17 @@ type EventProcessor struct {
 	trackedGames map[string]bool
 	// Map of player DIDs we're tracking
 	trackedPlayers map[string]bool
+	// Challenge store for indexing discovered challenges
+	challengeStore *challenge.Store
 }
 
 // NewEventProcessor creates a new event processor
-func NewEventProcessor(hub *web.Hub) *EventProcessor {
+func NewEventProcessor(hub *web.Hub, challengeStore *challenge.Store) *EventProcessor {
 	return &EventProcessor{
 		hub:            hub,
 		trackedGames:   make(map[string]bool),
 		trackedPlayers: make(map[string]bool),
+		challengeStore: challengeStore,
 	}
 }
 
@@ -59,6 +64,8 @@ func (p *EventProcessor) ProcessEvent(ctx context.Context, event Event) error {
 		return p.processDrawOfferEvent(ctx, event)
 	case EventTypeResignation:
 		return p.processResignationEvent(ctx, event)
+	case EventTypeChallenge:
+		return p.processChallengeEvent(ctx, event)
 	case EventTypeChallengeNotification:
 		return p.processChallengeNotificationEvent(ctx, event)
 	default:
@@ -80,6 +87,11 @@ func (p *EventProcessor) shouldProcessEvent(event Event) bool {
 
 	// Check if this event is from a tracked player
 	if p.trackedPlayers[event.Repo] {
+		return true
+	}
+
+	// Always process challenges — they need to be indexed for discovery
+	if event.Type == EventTypeChallenge {
 		return true
 	}
 
@@ -193,6 +205,67 @@ func (p *EventProcessor) processResignationEvent(ctx context.Context, event Even
 	}
 
 	p.hub.BroadcastToGame(gameRef, update)
+	return nil
+}
+
+// processChallengeEvent handles challenge records from the firehose and indexes them.
+func (p *EventProcessor) processChallengeEvent(ctx context.Context, event Event) error {
+	record, ok := event.Record.(map[string]interface{})
+	if !ok {
+		return fmt.Errorf("invalid challenge record format")
+	}
+
+	// Index the challenge so the challenged player can discover it
+	if p.challengeStore != nil {
+		challengedDID, _ := record["challenged"].(string)
+		challengerDID, _ := record["challenger"].(string)
+		color, _ := record["color"].(string)
+		message, _ := record["message"].(string)
+		proposedGameID, _ := record["proposedGameId"].(string)
+
+		createdAt := time.Now()
+		if ts, ok := record["createdAt"].(string); ok {
+			if parsed, err := time.Parse(time.RFC3339, ts); err == nil {
+				createdAt = parsed
+			}
+		}
+		expiresAt := createdAt.Add(24 * time.Hour)
+		if ts, ok := record["expiresAt"].(string); ok {
+			if parsed, err := time.Parse(time.RFC3339, ts); err == nil {
+				expiresAt = parsed
+			}
+		}
+
+		challengeURI := fmt.Sprintf("at://%s/%s", event.Repo, event.Path)
+
+		p.challengeStore.Add(&challenge.PendingChallenge{
+			ChallengeURI:   challengeURI,
+			ChallengeCID:   event.CID,
+			ChallengerDID:  challengerDID,
+			ChallengedDID:  challengedDID,
+			Color:          color,
+			Message:        message,
+			ProposedGameID: proposedGameID,
+			CreatedAt:      createdAt,
+			ExpiresAt:      expiresAt,
+		})
+	}
+
+	// Notify challenged player via WebSocket
+	challengedDID, _ := record["challenged"].(string)
+	if challengedDID != "" {
+		update := web.GameUpdate{
+			Type: "challenge",
+			Data: record,
+		}
+		p.hub.BroadcastToPlayer(challengedDID, update)
+	}
+
+	log.Info().
+		Str("repo", event.Repo).
+		Str("path", event.Path).
+		Msg("Indexed challenge from firehose")
+
 	return nil
 }
 
