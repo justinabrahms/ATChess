@@ -12,6 +12,7 @@ import (
 
 	"github.com/gorilla/mux"
 	"github.com/justinabrahms/atchess/internal/atproto"
+	"github.com/justinabrahms/atchess/internal/challenge"
 	"github.com/justinabrahms/atchess/internal/config"
 	"github.com/justinabrahms/atchess/internal/firehose"
 	"github.com/justinabrahms/atchess/internal/web"
@@ -54,9 +55,12 @@ func main() {
 	// Create WebSocket hub
 	hub := web.NewHub()
 	go hub.Run()
-	
+
+	// Create challenge store for cross-federation challenge discovery
+	challengeStore := challenge.NewStore()
+
 	// Create service
-	service := web.NewService(client, cfg)
+	service := web.NewService(client, cfg, challengeStore)
 	
 	// Initialize OAuth if base URL is configured
 	if cfg.Server.BaseURL != "" {
@@ -68,8 +72,8 @@ func main() {
 		}
 	}
 	
-	// Create firehose processor
-	processor := firehose.NewEventProcessor(hub)
+	// Create firehose processor with shared challenge store
+	processor := firehose.NewEventProcessor(hub, challengeStore)
 	
 	// Start firehose client (optional - can be disabled in config)
 	if cfg.Firehose.Enabled {
