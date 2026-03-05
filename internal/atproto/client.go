@@ -457,6 +457,82 @@ type moveRecord struct {
 	CreatedAt time.Time
 }
 
+// StoredMove represents a move record retrieved from a player's PDS repository.
+type StoredMove struct {
+	From      string    `json:"from"`
+	To        string    `json:"to"`
+	SAN       string    `json:"san"`
+	FEN       string    `json:"fen"`
+	Player    string    `json:"player"`
+	Check     bool      `json:"check"`
+	Checkmate bool      `json:"checkmate"`
+	Draw      bool      `json:"draw"`
+	CreatedAt time.Time `json:"createdAt"`
+}
+
+// ListMovesForGame fetches all app.atchess.move records from this client's
+// repository that belong to the given game URI.
+func (c *Client) ListMovesForGame(ctx context.Context, gameURI string) ([]StoredMove, error) {
+	url := fmt.Sprintf("%s/xrpc/com.atproto.repo.listRecords?repo=%s&collection=app.atchess.move&limit=100",
+		c.pdsURL, c.did)
+	resp, err := c.makeRequest("GET", url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to list move records: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("failed to list move records: HTTP %d", resp.StatusCode)
+	}
+
+	var listResp struct {
+		Records []struct {
+			Value struct {
+				Game struct {
+					URI string `json:"uri"`
+				} `json:"game"`
+				From      string `json:"from"`
+				To        string `json:"to"`
+				SAN       string `json:"san"`
+				FEN       string `json:"fen"`
+				Player    string `json:"player"`
+				Check     bool   `json:"check"`
+				Checkmate bool   `json:"checkmate"`
+				Draw      bool   `json:"draw"`
+				CreatedAt string `json:"createdAt"`
+			} `json:"value"`
+		} `json:"records"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&listResp); err != nil {
+		return nil, fmt.Errorf("failed to decode move records: %w", err)
+	}
+
+	var moves []StoredMove
+	for _, record := range listResp.Records {
+		if record.Value.Game.URI != gameURI {
+			continue
+		}
+		t, err := time.Parse(time.RFC3339, record.Value.CreatedAt)
+		if err != nil {
+			continue
+		}
+		moves = append(moves, StoredMove{
+			From:      record.Value.From,
+			To:        record.Value.To,
+			SAN:       record.Value.SAN,
+			FEN:       record.Value.FEN,
+			Player:    record.Value.Player,
+			Check:     record.Value.Check,
+			Checkmate: record.Value.Checkmate,
+			Draw:      record.Value.Draw,
+			CreatedAt: t,
+		})
+	}
+
+	return moves, nil
+}
+
 // getLatestMoveForGame fetches moves from both players' repos and returns
 // the latest move for the given game. This is the source of truth for game state.
 func (c *Client) getLatestMoveForGame(ctx context.Context, gameURI string, whiteDID, blackDID string) (*moveRecord, error) {
