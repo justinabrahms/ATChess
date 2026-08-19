@@ -24,16 +24,16 @@ func TestCreateChallengeNotification(t *testing.T) {
 			// Verify the request is creating a challenge notification
 			var req map[string]interface{}
 			json.NewDecoder(r.Body).Decode(&req)
-			
+
 			if req["collection"] != "app.atchess.challengeNotification" {
 				t.Errorf("Expected collection app.atchess.challengeNotification, got %v", req["collection"])
 			}
-			
+
 			record := req["record"].(map[string]interface{})
 			if record["challenger"] != "did:plc:test123" {
 				t.Errorf("Expected challenger DID to be client's DID, got %v", record["challenger"])
 			}
-			
+
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(map[string]interface{}{
 				"uri": "at://did:plc:challenged456/app.atchess.challengeNotification/test123",
@@ -167,7 +167,7 @@ func TestGetChallengeNotifications(t *testing.T) {
 
 func TestDeleteChallengeNotification(t *testing.T) {
 	deleteCalled := false
-	
+
 	// Mock server
 	mockPDS := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -180,18 +180,18 @@ func TestDeleteChallengeNotification(t *testing.T) {
 			})
 		case "/xrpc/com.atproto.repo.deleteRecord":
 			deleteCalled = true
-			
+
 			// Verify the request
 			var req map[string]interface{}
 			json.NewDecoder(r.Body).Decode(&req)
-			
+
 			if req["collection"] != "app.atchess.challengeNotification" {
 				t.Errorf("Expected collection app.atchess.challengeNotification, got %v", req["collection"])
 			}
 			if req["rkey"] != "notif123" {
 				t.Errorf("Expected rkey notif123, got %v", req["rkey"])
 			}
-			
+
 			w.WriteHeader(http.StatusOK)
 		default:
 			w.WriteHeader(http.StatusNotFound)

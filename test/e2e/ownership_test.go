@@ -1,27 +1,29 @@
 //go:build e2e
 
-// Ownership conformance test (atchess-1c9.4): pins the defect where
-// internal/web/service.go writes every record through a single, config-
-// supplied *atproto.Client (s.client) instead of one derived from the
-// authenticated caller (see AuthenticatedDID in internal/web/auth_middleware.go,
-// which every write handler ignores). This test is EXPECTED TO FAIL against
-// today's code. Do not "fix" it by weakening assertions -- the failure output
-// is the deliverable. See atchess-1c9.9 for the actual fix.
+// Ownership conformance test (atchess-1c9.4): pins the requirement that
+// every app.atchess.* record lands in its AUTHENTICATED AUTHOR's own AT
+// Protocol repo, derived from AuthenticatedDID
+// (internal/web/auth_middleware.go) via Service.clientFor
+// (internal/web/service.go), rather than the protocol-service instance's
+// static config-supplied identity (s.serverClient). atchess-1c9.9 fixed the
+// defect this test originally pinned; see git history for this file's
+// pre-.9 characterization-test form if you need the "expected to fail"
+// version for reference.
 //
 // IMPORTANT SUBTLETY (read before touching this file):
 //
 // test/harness starts one protocol-service instance PER PLAYER, and each
-// instance's s.client is bootstrapped from that SAME player's own account
-// (see harness.StartServices / startProtocolService: ATPROTO_HANDLE/PASSWORD
-// come from the same Account the harness later logs in as). That means for
-// the "obvious" flow -- alice logs into her own instance and acts -- the
-// protocol-service instance's static configured identity and the
-// authenticated caller's identity are ALWAYS THE SAME DID. Asserting "the
-// record landed in the acting player's own repo" against that flow would
-// pass today for the wrong reason: not because the code correctly derives
-// authorship from AuthenticatedDID, but because in this specific harness
-// topology the two identities can never diverge through a legitimate
-// alice-only or bob-only flow.
+// instance's s.serverClient is bootstrapped from that SAME player's own
+// account (see harness.StartServices / startProtocolService:
+// ATPROTO_HANDLE/PASSWORD come from the same Account the harness later logs
+// in as). That means for the "obvious" flow -- alice logs into her own
+// instance and acts -- the protocol-service instance's static configured
+// identity and the authenticated caller's identity are ALWAYS THE SAME DID.
+// Asserting "the record landed in the acting player's own repo" against
+// that flow alone cannot distinguish "correctly derived from
+// AuthenticatedDID" from "derived from the server's static identity",
+// because in this specific harness topology the two identities can never
+// diverge through a legitimate alice-only or bob-only flow.
 //
 // To get a genuinely discriminating assertion, this test provisions a THIRD
 // identity ("carol") directly on alice's PDS (the same PDS alice's protocol-
@@ -32,44 +34,22 @@
 // whatever DID comes back -- it does not require that identity to match the
 // instance's own bootstrap identity. So carol is a real, independently
 // authenticated caller whose DID is guaranteed to differ from alice's
-// instance's static s.client identity. Any record carol's requests cause to
-// be written should, if authorship were correctly attributed, land in
-// CAROL's repo -- and today it does not: it lands in alice's (the server
-// identity's) repo instead. That is the sharp, unambiguous failure this
-// test pins.
+// instance's static server identity. Any record carol's requests cause to
+// be written must, since atchess-1c9.9 landed, land in CAROL's own repo --
+// never in alice's (the server identity's).
 //
 // What this DOES distinguish: whether a write handler attributes a record
-// to the authenticated caller (AuthenticatedDID) or to the protocol-service
-// instance's static configured identity (s.client) -- exactly the bug
-// atchess-1c9.9 fixes.
+// to the authenticated caller (AuthenticatedDID, via Service.clientFor) or
+// to the protocol-service instance's static configured identity
+// (s.serverClient).
 //
 // What this does NOT distinguish: any bug in how a foreign PDS's repos are
 // resolved/read (e.g. atproto.Client.GetGame hardcodes its own configured
 // c.pdsURL rather than resolving the record's actual home PDS from its DID
 // document), which is a related but distinct defect that can independently
-// block cross-PDS reads. Where that surfaces below it is called out
-// explicitly and the affected subtest is marked, not silently treated as a
-// pass.
-//
-// NOTICE TO WHOEVER IMPLEMENTS atchess-1c9.9 (per-user atproto client):
-// the following subtests currently PASS because they assert TODAY'S BUGGY
-// behaviour. Once .9 correctly derives authorship from AuthenticatedDID,
-// these subtests are EXPECTED to go red -- that red is correct and means the
-// fix worked. As part of .9, invert their assertions (they should assert the
-// record now DOES land in the authenticated caller's repo and DOES NOT land
-// in the server identity's repo) or delete them outright if they become
-// redundant with the "FoundInAuthenticatedAuthorRepo"/"FoundInAuthenticated-
-// CreatorRepo" subtests once those start passing:
-//
-//   - Challenge/CHARACTERIZATION_InvertWhenAtchess1c9dot9Lands
-//   - Game/CHARACTERIZATION_InvertWhenAtchess1c9dot9Lands
-//   - Move/CHARACTERIZATION_AuthenticatedCreatorLockedOutOfOwnGame_InvertWhenAtchess1c9dot9Lands
-//
-// Additionally, Move/NonDiscriminating_FoundInMoverRepo proves nothing about
-// correct attribution today (see its own comment below) -- a real,
-// discriminating move-ownership assertion (analogous to the carol-based
-// Challenge/Game cases) belongs in atchess-1c9.9's own acceptance criteria,
-// once carol can actually participate in a game.
+// block cross-PDS reads (atchess-1c9.10). Where that would surface it is
+// avoided by construction: carol is provisioned on the SAME PDS as alice's
+// protocol-service instance, so no cross-PDS read is required here.
 package e2e
 
 import (
@@ -369,22 +349,20 @@ func TestOwnership(t *testing.T) {
 		t.Run("NotInOpponentRepo", func(t *testing.T) {
 			assertNotFoundIn(t, bob, "bob (opponent)", "app.atchess.challenge", rkey)
 		})
-		t.Run("CHARACTERIZATION_InvertWhenAtchess1c9dot9Lands", func(t *testing.T) {
-			// Confirmatory/diagnostic: shows exactly where the record
-			// actually went, so the misroute above is not just "missing"
-			// but demonstrably redirected to the server's own identity.
-			//
-			// THIS SUBTEST ASSERTS TODAY'S BUGGY BEHAVIOUR ON PURPOSE. It is
-			// a characterization test, not a correctness gate. See the
-			// "NOTICE TO WHOEVER IMPLEMENTS atchess-1c9.9" section in this
-			// file's package doc comment.
-			rec, err := alice.RepoGetRecord("app.atchess.challenge", rkey)
-			if err != nil {
-				t.Errorf("IF YOU ARE IMPLEMENTING atchess-1c9.9: this red is EXPECTED and CORRECT. It means the fix worked. Invert or delete this subtest as part of .9.\n\n"+
-					"(diagnostic detail: expected the misrouted record in the server identity's repo (alice, did=%s) but it is not there either (getRecord: %v) -- if you are NOT implementing .9 and are seeing this, it means the record is missing entirely from BOTH the authenticated author's repo AND the server identity's repo, which would be a separate data-loss concern)", aliceHealth.DID, err)
+		t.Run("NotMisroutedToServerIdentityRepo", func(t *testing.T) {
+			// Inverted per atchess-1c9.9 (was
+			// CHARACTERIZATION_InvertWhenAtchess1c9dot9Lands, which asserted
+			// the pre-fix buggy behaviour: the record landing in alice's
+			// repo, the protocol-service instance's static server identity,
+			// instead of carol's, the authenticated author). Now that
+			// CreateChallengeHandler derives authorship from
+			// AuthenticatedDID (Service.clientFor), the record must NOT be
+			// found in alice's repo at all.
+			if rec, err := alice.RepoGetRecord("app.atchess.challenge", rkey); err == nil {
+				t.Errorf("ownership violation: challenge authored by carol (did=%s) via alice's protocol-service instance was found in alice's repo (did=%s), the server identity's -- it should only be in carol's own repo: %+v", carol.DID, aliceHealth.DID, rec)
 				return
 			}
-			t.Logf("CONFIRMED misroute (characterization, expected to invert once atchess-1c9.9 lands): challenge authored by carol (did=%s) via alice's protocol-service instance landed in that instance's static server identity's repo (alice, did=%s) instead: %+v", carol.DID, aliceHealth.DID, rec)
+			t.Logf("OK: challenge correctly absent from alice's (server identity's) repo")
 		})
 	})
 
@@ -405,23 +383,36 @@ func TestOwnership(t *testing.T) {
 		t.Run("FoundInAuthenticatedCreatorRepo", func(t *testing.T) {
 			assertFoundIn(t, carol, "carol (authenticated creator)", "app.atchess.game", rkey, others(carol))
 		})
-		t.Run("NotInOpponentRepo", func(t *testing.T) {
-			assertNotFoundIn(t, bob, "bob (opponent)", "app.atchess.game", rkey)
-		})
-		t.Run("CHARACTERIZATION_InvertWhenAtchess1c9dot9Lands", func(t *testing.T) {
-			// THIS SUBTEST ASSERTS TODAY'S BUGGY BEHAVIOUR ON PURPOSE. It is
-			// a characterization test, not a correctness gate. See the
-			// "NOTICE TO WHOEVER IMPLEMENTS atchess-1c9.9" section in this
-			// file's package doc comment.
-			rec, err := alice.RepoGetRecord("app.atchess.game", rkey)
+		t.Run("CarolRecordedAsPlayer", func(t *testing.T) {
+			rec, err := carol.RepoGetRecord("app.atchess.game", rkey)
 			if err != nil {
-				t.Errorf("IF YOU ARE IMPLEMENTING atchess-1c9.9: this red is EXPECTED and CORRECT. It means the fix worked. Invert or delete this subtest as part of .9.\n\n"+
-					"(diagnostic detail: expected the misrouted record in the server identity's repo (alice, did=%s) but it is not there either (getRecord: %v) -- if you are NOT implementing .9 and are seeing this, it means the record is missing entirely from BOTH the authenticated author's repo AND the server identity's repo, which would be a separate data-loss concern)", aliceHealth.DID, err)
-				return
+				t.Fatalf("could not re-fetch game %s/%s from carol's own repo to check player attribution: %v", "app.atchess.game", rkey, err)
 			}
 			white, _ := rec["white"].(string)
 			black, _ := rec["black"].(string)
-			t.Logf("CONFIRMED misroute (characterization, expected to invert once atchess-1c9.9 lands): game authored by carol (did=%s) via alice's protocol-service instance landed in alice's repo (did=%s) instead, AND lists white=%s black=%s -- carol is not even recorded as a player in the game she created", carol.DID, aliceHealth.DID, white, black)
+			if white != carol.DID && black != carol.DID {
+				t.Errorf("ownership violation: game record exists in carol's repo but does not list her as a player (did=%s): white=%s black=%s", carol.DID, white, black)
+				return
+			}
+			t.Logf("OK: carol (did=%s) is correctly recorded as a player in the game she created: white=%s black=%s", carol.DID, white, black)
+		})
+		t.Run("NotInOpponentRepo", func(t *testing.T) {
+			assertNotFoundIn(t, bob, "bob (opponent)", "app.atchess.game", rkey)
+		})
+		t.Run("NotMisroutedToServerIdentityRepo", func(t *testing.T) {
+			// Inverted per atchess-1c9.9 (was
+			// CHARACTERIZATION_InvertWhenAtchess1c9dot9Lands). Now that
+			// CreateGameHandler derives authorship from AuthenticatedDID
+			// (Service.clientFor), the game record must NOT be found in
+			// alice's repo, and carol must actually be recorded as a player
+			// (white) in the game she created.
+			if rec, err := alice.RepoGetRecord("app.atchess.game", rkey); err == nil {
+				white, _ := rec["white"].(string)
+				black, _ := rec["black"].(string)
+				t.Errorf("ownership violation: game authored by carol (did=%s) via alice's protocol-service instance was found in alice's repo (did=%s), the server identity's -- white=%s black=%s -- it should only be in carol's own repo with carol recorded as a player", carol.DID, aliceHealth.DID, white, black)
+				return
+			}
+			t.Logf("OK: game correctly absent from alice's (server identity's) repo")
 		})
 	})
 
@@ -434,10 +425,10 @@ func TestOwnership(t *testing.T) {
 		// full move flow, but NOT a discriminating case (see package doc):
 		// alice's instance's server identity already equals alice, so this
 		// cannot, by itself, tell "derived from AuthenticatedDID" apart
-		// from "derived from s.client". It is included because it is
-		// literally what the brief for this bead specifies, and it does
-		// still verify the record isn't duplicated into bob's or a
-		// bystander's repo. Expect this sub-case to PASS today.
+		// from "derived from the server's static configured identity". It
+		// is included because it is literally what the brief for this bead
+		// specifies, and it does still verify the record isn't duplicated
+		// into bob's or a bystander's repo.
 		gameResp := apiPost(t, alice, "/api/games", map[string]interface{}{
 			"opponent_did": bob.DID,
 			"color":        "white",
@@ -486,20 +477,21 @@ func TestOwnership(t *testing.T) {
 		// NonDiscriminating: alice is both the authenticated caller AND
 		// this instance's static server identity (see the harness-topology
 		// caveat in the package doc comment), so this subtest cannot tell
-		// "attributed to AuthenticatedDID" apart from "attributed to
-		// s.client" -- it is expected to PASS today for a reason that
-		// proves nothing about correct attribution. Do not read a PASS here
-		// as move-ownership coverage; it only confirms the record isn't
-		// ALSO duplicated into bob's or carol's repo (see the two subtests
-		// below). A real discriminating move assertion belongs to
-		// atchess-1c9.9 (see the package doc comment).
+		// "attributed to AuthenticatedDID" apart from "attributed to the
+		// server's static identity" on its own. It only confirms the
+		// record isn't ALSO duplicated into bob's or carol's repo. The
+		// genuinely discriminating move-ownership case is
+		// Discriminating_MoveFoundInAuthenticatedMoverRepo below, which
+		// uses carol -- now possible because Game/CarolRecordedAsPlayer
+		// above confirms carol is a real participant in a game she can
+		// legally move in.
 		t.Run("NonDiscriminating_FoundInMoverRepo", func(t *testing.T) {
 			rec, ok := findMove(t, alice, gameURI)
 			if !ok {
-				t.Errorf("ownership violation (or non-discriminating pass masking a deeper issue): expected an app.atchess.move record for game=%s with from=e2 to=e4 in alice's own repo (did=%s, the moving player), but listRecords(app.atchess.move) against alice's PDS (%s) did not contain it", gameURI, alice.DID, alice.PDSURL)
+				t.Errorf("ownership violation: expected an app.atchess.move record for game=%s with from=e2 to=e4 in alice's own repo (did=%s, the moving player), but listRecords(app.atchess.move) against alice's PDS (%s) did not contain it", gameURI, alice.DID, alice.PDSURL)
 				return
 			}
-			t.Logf("NON-DISCRIMINATING PASS: move record found in alice's (mover's) repo: %+v -- this proves NOTHING about correct attribution, because alice-the-authenticated-caller and alice-the-server-identity are the SAME DID in this sub-case; it only confirms the record was not also duplicated elsewhere (see NotInOpponentRepo/NotInThirdPartyRepo below)", rec)
+			t.Logf("OK: move record found in alice's (mover's) repo: %+v", rec)
 		})
 		t.Run("NotInOpponentRepo", func(t *testing.T) {
 			if _, ok := findMove(t, bob, gameURI); ok {
@@ -516,23 +508,17 @@ func TestOwnership(t *testing.T) {
 			t.Logf("OK: move record correctly absent from carol's (third party's) repo")
 		})
 
-		// Downstream consequence of the Game subtest's failure: carol
-		// created a game via alice's instance believing herself to be a
-		// participant, but (per Game/CHARACTERIZATION_InvertWhenAtchess1c9dot9Lands
-		// above) the resulting record lists alice/bob as white/black, not
-		// carol. MakeMoveHandler's turn/participant check DOES correctly
-		// consult AuthenticatedDID (internal/web/service.go
-		// MakeMoveHandler: `authedDID := AuthenticatedDID(r)`), so carol is
-		// correctly rejected here -- but only because the game she created
-		// was never actually attributed to her in the first place.
-		//
-		// THIS SUBTEST ASSERTS TODAY'S BUGGY BEHAVIOUR ON PURPOSE. It is a
-		// characterization test, not a correctness gate. Once
-		// atchess-1c9.9 lands, carol will be correctly attributed as white
-		// in the game she created and this move will succeed (HTTP 200),
-		// not fail with 403. See the "NOTICE TO WHOEVER IMPLEMENTS
-		// atchess-1c9.9" section in this file's package doc comment.
-		t.Run("CHARACTERIZATION_AuthenticatedCreatorLockedOutOfOwnGame_InvertWhenAtchess1c9dot9Lands", func(t *testing.T) {
+		// AuthenticatedCreatorCanMoveInOwnGame: inverted per atchess-1c9.9
+		// (was CHARACTERIZATION_AuthenticatedCreatorLockedOutOfOwnGame_
+		// InvertWhenAtchess1c9dot9Lands, which asserted the pre-fix HTTP
+		// 403). Now that CreateGameHandler correctly attributes game
+		// creation to AuthenticatedDID, carol is white in the game she
+		// created via /api/games, so her move succeeds (HTTP 200). This
+		// also performs the ONE actual move POST for carolCreatedGameURI
+		// that the Discriminating_MoveFoundInAuthenticatedMoverRepo subtest
+		// below inspects (it does not POST a second move, since carol as
+		// white cannot legally move twice in a row).
+		t.Run("AuthenticatedCreatorCanMoveInOwnGame", func(t *testing.T) {
 			if carolCreatedGameURI == "" {
 				t.Skip("Game subtest did not produce a game URI to probe (see its own failure output)")
 			}
@@ -542,12 +528,40 @@ func TestOwnership(t *testing.T) {
 				"to":      "e4",
 				"fen":     "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
 			})
-			if status != http.StatusForbidden {
-				t.Errorf("IF YOU ARE IMPLEMENTING atchess-1c9.9: this red is EXPECTED and CORRECT. It means the fix worked -- carol is now correctly attributed as a participant (white) in the game she created, so her move succeeds instead of being rejected. Invert or delete this subtest as part of .9.\n\n"+
-					"(diagnostic detail: expected HTTP 403 (carol rejected as a non-participant in the game she herself created, since it was actually attributed to alice/bob), got HTTP %d: %s)", status, body)
-				return
+			if status != http.StatusOK {
+				t.Fatalf("expected carol's move in the game she created to succeed (HTTP 200) now that atchess-1c9.9 correctly attributes game creation to AuthenticatedDID, got HTTP %d: %s", status, body)
 			}
-			t.Logf("CONFIRMED downstream consequence (characterization, expected to invert once atchess-1c9.9 lands): carol authenticated and created a game via POST /api/games, but cannot ever move in it (HTTP 403: %s) because CreateGameHandler attributed it to the server identity (alice), not to her", body)
+			t.Logf("carol successfully moved in the game she created via her authenticated session: %s", body)
+		})
+
+		// Discriminating_MoveFoundInAuthenticatedMoverRepo: the genuinely
+		// discriminating move-ownership assertion required by atchess-1c9.9
+		// (replaces the old NonDiscriminating_FoundInMoverRepo pattern for
+		// this case). carol's DID is guaranteed to differ from alice's
+		// protocol-service instance's static server identity (see the
+		// carol setup above), and thanks to the fix above carol can now
+		// actually participate in -- and move in -- a game she created via
+		// that instance. If MakeMoveHandler/RecordMove derived authorship
+		// from AuthenticatedDID (via Service.clientFor) rather than the
+		// server's static identity, the move record from
+		// AuthenticatedCreatorCanMoveInOwnGame lands in CAROL's own repo,
+		// never alice's.
+		t.Run("Discriminating_MoveFoundInAuthenticatedMoverRepo", func(t *testing.T) {
+			if carolCreatedGameURI == "" {
+				t.Skip("Game subtest did not produce a game URI to probe (see its own failure output)")
+			}
+			rec, ok := findMove(t, carol, carolCreatedGameURI)
+			if !ok {
+				t.Fatalf("ownership violation: expected an app.atchess.move record for game=%s with from=e2 to=e4 in carol's own repo (did=%s, the AUTHENTICATED mover, DIFFERENT from alice's server identity did=%s), but listRecords(app.atchess.move) against carol's PDS (%s) did not contain it", carolCreatedGameURI, carol.DID, aliceHealth.DID, carol.PDSURL)
+			}
+			t.Logf("DISCRIMINATING PASS: move record found in carol's (authenticated mover's, did=%s) repo, distinct from alice's (server identity's, did=%s) repo: %+v", carol.DID, aliceHealth.DID, rec)
+
+			if _, ok := findMove(t, alice, carolCreatedGameURI); ok {
+				t.Errorf("ownership violation: move record (game=%s from=e2 to=e4) unexpectedly ALSO found in alice's repo (did=%s), the protocol-service instance's static server identity, not the authenticated mover (carol, did=%s)", carolCreatedGameURI, aliceHealth.DID, carol.DID)
+			}
+			if _, ok := findMove(t, bob, carolCreatedGameURI); ok {
+				t.Errorf("ownership violation: move record (game=%s from=e2 to=e4) unexpectedly found in bob's repo (did=%s), an unrelated third party for this game", carolCreatedGameURI, bob.DID)
+			}
 		})
 	})
 }

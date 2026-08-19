@@ -24,16 +24,16 @@ func newUpgrader(checker *OriginChecker) websocket.Upgrader {
 type Hub struct {
 	// Registered clients by game ID
 	gameClients map[string]map[*Client]bool
-	
+
 	// Broadcast channel for game updates
 	broadcast chan GameUpdate
-	
+
 	// Register requests from clients
 	register chan *Client
-	
+
 	// Unregister requests from clients
 	unregister chan *Client
-	
+
 	mu sync.RWMutex
 }
 
@@ -74,19 +74,19 @@ func (h *Hub) Run() {
 			}
 			h.gameClients[client.gameID][client] = true
 			h.mu.Unlock()
-			
+
 			log.Info().
 				Str("gameID", client.gameID).
 				Str("userID", client.userID).
 				Msg("Client connected to game")
-			
+
 		case client := <-h.unregister:
 			h.mu.Lock()
 			if clients, ok := h.gameClients[client.gameID]; ok {
 				if _, ok := clients[client]; ok {
 					delete(clients, client)
 					close(client.send)
-					
+
 					// Clean up empty game rooms
 					if len(clients) == 0 {
 						delete(h.gameClients, client.gameID)
@@ -94,24 +94,24 @@ func (h *Hub) Run() {
 				}
 			}
 			h.mu.Unlock()
-			
+
 			log.Info().
 				Str("gameID", client.gameID).
 				Str("userID", client.userID).
 				Msg("Client disconnected from game")
-			
+
 		case update := <-h.broadcast:
 			h.mu.RLock()
 			clients := h.gameClients[update.GameID]
 			h.mu.RUnlock()
-			
+
 			if clients != nil {
 				message, err := json.Marshal(update)
 				if err != nil {
 					log.Error().Err(err).Msg("Failed to marshal game update")
 					continue
 				}
-				
+
 				for client := range clients {
 					select {
 					case client.send <- message:
@@ -157,7 +157,7 @@ func (s *Service) WebSocketHandler(hub *Hub) http.HandlerFunc {
 			log.Error().Err(err).Msg("Failed to upgrade WebSocket connection")
 			return
 		}
-		
+
 		// Create client
 		client := &Client{
 			hub:    hub,
@@ -166,10 +166,10 @@ func (s *Service) WebSocketHandler(hub *Hub) http.HandlerFunc {
 			gameID: gameID,
 			userID: userID,
 		}
-		
+
 		// Register client
 		client.hub.register <- client
-		
+
 		// Start client goroutines
 		go client.writePump()
 		go client.readPump()
@@ -182,13 +182,13 @@ func (c *Client) readPump() {
 		c.hub.unregister <- c
 		c.conn.Close()
 	}()
-	
+
 	c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 	c.conn.SetPongHandler(func(string) error {
 		c.conn.SetReadDeadline(time.Now().Add(60 * time.Second))
 		return nil
 	})
-	
+
 	for {
 		_, message, err := c.conn.ReadMessage()
 		if err != nil {
@@ -197,7 +197,7 @@ func (c *Client) readPump() {
 			}
 			break
 		}
-		
+
 		// Handle incoming messages (ping/pong, etc.)
 		var msg map[string]interface{}
 		if err := json.Unmarshal(message, &msg); err == nil {
@@ -222,7 +222,7 @@ func (c *Client) writePump() {
 		ticker.Stop()
 		c.conn.Close()
 	}()
-	
+
 	for {
 		select {
 		case message, ok := <-c.send:
@@ -231,24 +231,24 @@ func (c *Client) writePump() {
 				c.conn.WriteMessage(websocket.CloseMessage, []byte{})
 				return
 			}
-			
+
 			w, err := c.conn.NextWriter(websocket.TextMessage)
 			if err != nil {
 				return
 			}
 			w.Write(message)
-			
+
 			// Add queued messages to the current WebSocket message
 			n := len(c.send)
 			for i := 0; i < n; i++ {
 				w.Write([]byte{'\n'})
 				w.Write(<-c.send)
 			}
-			
+
 			if err := w.Close(); err != nil {
 				return
 			}
-			
+
 		case <-ticker.C:
 			c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
@@ -270,7 +270,7 @@ func (h *Hub) BroadcastToPlayer(playerDID string, update GameUpdate) {
 	// In a production system, you'd want to track clients by player DID
 	update.Data = map[string]interface{}{
 		"playerDID": playerDID,
-		"data": update.Data,
+		"data":      update.Data,
 	}
 	h.broadcast <- update
 }

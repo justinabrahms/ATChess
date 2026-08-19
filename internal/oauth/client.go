@@ -59,14 +59,14 @@ func GeneratePKCE() (verifier, challenge string, err error) {
 	if _, err := rand.Read(verifierBytes); err != nil {
 		return "", "", err
 	}
-	
+
 	verifier = base64.RawURLEncoding.EncodeToString(verifierBytes)
-	
+
 	// Create challenge by hashing verifier
 	h := sha256.New()
 	h.Write([]byte(verifier))
 	challenge = base64.RawURLEncoding.EncodeToString(h.Sum(nil))
-	
+
 	return verifier, challenge, nil
 }
 
@@ -80,12 +80,12 @@ func (c *OAuthClient) BuildAuthorizationURL(authEndpoint, handle, state, codeCha
 	params.Set("scope", "atproto transition:generic")
 	params.Set("code_challenge", codeChallenge)
 	params.Set("code_challenge_method", "S256")
-	
+
 	// Include login_hint if handle is provided
 	if handle != "" {
 		params.Set("login_hint", handle)
 	}
-	
+
 	return authEndpoint + "?" + params.Encode()
 }
 
@@ -100,15 +100,15 @@ func (c *OAuthClient) CreateClientAssertion(issuer string) (string, error) {
 		"exp": now.Add(5 * time.Minute).Unix(),
 		"jti": generateJTI(),
 	}
-	
+
 	token := jwt.NewWithClaims(jwt.SigningMethodES256, claims)
 	token.Header["kid"] = "is4PQCqbnUs" // Must match the kid in our JWKS
-	
+
 	signedToken, err := token.SignedString(c.privateKey)
 	if err != nil {
 		return "", fmt.Errorf("failed to sign assertion: %w", err)
 	}
-	
+
 	return signedToken, nil
 }
 
@@ -119,7 +119,7 @@ func (c *OAuthClient) ExchangeCodeForTokens(tokenEndpoint, issuer, code, codeVer
 	if err != nil {
 		return nil, err
 	}
-	
+
 	// Try up to 2 times (initial + 1 retry with nonce)
 	var nonce string
 	for attempt := 0; attempt < 2; attempt++ {
@@ -132,14 +132,14 @@ func (c *OAuthClient) ExchangeCodeForTokens(tokenEndpoint, issuer, code, codeVer
 		data.Set("client_id", c.clientID)
 		data.Set("client_assertion_type", "urn:ietf:params:oauth:client-assertion-type:jwt-bearer")
 		data.Set("client_assertion", clientAssertion)
-		
+
 		req, err := http.NewRequest("POST", tokenEndpoint, strings.NewReader(data.Encode()))
 		if err != nil {
 			return nil, err
 		}
-		
+
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-		
+
 		// Add DPoP header if key provided
 		if dpopKey != nil {
 			dpopToken, err := createDPoPToken(dpopKey, "POST", tokenEndpoint, "", nonce)
@@ -148,18 +148,18 @@ func (c *OAuthClient) ExchangeCodeForTokens(tokenEndpoint, issuer, code, codeVer
 			}
 			req.Header.Set("DPoP", dpopToken)
 		}
-		
+
 		resp, err := c.httpClient.Do(req)
 		if err != nil {
 			return nil, err
 		}
 		defer resp.Body.Close()
-		
+
 		// Check for DPoP nonce requirement
 		if resp.StatusCode == http.StatusBadRequest {
 			body, _ := io.ReadAll(resp.Body)
 			var errorResp struct {
-				Error string `json:"error"`
+				Error            string `json:"error"`
 				ErrorDescription string `json:"error_description"`
 			}
 			if err := json.Unmarshal(body, &errorResp); err == nil && errorResp.Error == "use_dpop_nonce" {
@@ -171,21 +171,21 @@ func (c *OAuthClient) ExchangeCodeForTokens(tokenEndpoint, issuer, code, codeVer
 			}
 			return nil, fmt.Errorf("token exchange failed: HTTP %d - %s", resp.StatusCode, string(body))
 		}
-		
+
 		if resp.StatusCode != http.StatusOK {
 			// Read error response
 			body, _ := io.ReadAll(resp.Body)
 			return nil, fmt.Errorf("token exchange failed: HTTP %d - %s", resp.StatusCode, string(body))
 		}
-		
+
 		var tokenResp TokenResponse
 		if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
 			return nil, err
 		}
-		
+
 		return &tokenResp, nil
 	}
-	
+
 	return nil, fmt.Errorf("token exchange failed after retries")
 }
 
@@ -217,7 +217,7 @@ func generateJTI() string {
 
 func createDPoPToken(privateKey *ecdsa.PrivateKey, method, uri, accessToken string, nonce string) (string, error) {
 	now := time.Now()
-	
+
 	// Create DPoP JWT
 	claims := jwt.MapClaims{
 		"jti": generateJTI(),
@@ -226,20 +226,20 @@ func createDPoPToken(privateKey *ecdsa.PrivateKey, method, uri, accessToken stri
 		"iat": now.Unix(),
 		"exp": now.Add(5 * time.Minute).Unix(),
 	}
-	
+
 	// Add nonce if provided (required by some servers)
 	if nonce != "" {
 		claims["nonce"] = nonce
 	}
-	
+
 	// Add access token hash if provided
 	if accessToken != "" {
 		h := sha256.Sum256([]byte(accessToken))
 		claims["ath"] = base64.RawURLEncoding.EncodeToString(h[:])
 	}
-	
+
 	token := jwt.NewWithClaims(jwt.SigningMethodES256, claims)
-	
+
 	// Add JWK to header
 	token.Header["typ"] = "dpop+jwt"
 	token.Header["jwk"] = map[string]interface{}{
@@ -248,7 +248,7 @@ func createDPoPToken(privateKey *ecdsa.PrivateKey, method, uri, accessToken stri
 		"x":   base64.RawURLEncoding.EncodeToString(privateKey.PublicKey.X.Bytes()),
 		"y":   base64.RawURLEncoding.EncodeToString(privateKey.PublicKey.Y.Bytes()),
 	}
-	
+
 	return token.SignedString(privateKey)
 }
 

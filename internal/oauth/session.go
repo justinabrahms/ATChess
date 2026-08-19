@@ -8,14 +8,97 @@ import (
 	"time"
 )
 
-// Session represents an OAuth session with tokens and metadata
+// Session represents an authenticated session with tokens and metadata.
+// It covers both app-password logins (PDSURL + AccessToken/RefreshToken are
+// the AT Protocol accessJwt/refreshJwt from com.atproto.server.createSession,
+// DPoPKey is nil) and OAuth logins (AccessToken/RefreshToken are OAuth
+// tokens, DPoPKey is the DPoP key they are bound to). See
+// internal/web/session_auth.go (sessionAuthenticator) for how this is used
+// to build a per-user *atproto.Client (atchess-1c9.9) and internal/atproto
+// for NewClientFromSession/RefreshSession.
 type Session struct {
-	DID          string    `json:"did"`
-	Handle       string    `json:"handle"`
-	AccessToken  string    `json:"access_token"`
-	RefreshToken string    `json:"refresh_token"`
-	ExpiresAt    time.Time `json:"expires_at"`
-	DPoPKey      *ecdsa.PrivateKey `json:"-"`
+	DID    string `json:"did"`
+	Handle string `json:"handle"`
+	PDSURL string `json:"pds_url"`
+
+	AccessToken  string `json:"access_token"`
+	RefreshToken string `json:"refresh_token"`
+
+	// ExpiresAt is the SESSION's overall lifetime (e.g. "log this user out
+	// after 24h"), checked by SessionStore.GetSession. It is set once at
+	// login and is intentionally NOT extended by EnsureFresh/ForceRefresh --
+	// refreshing the underlying access token keeps the session usable, but
+	// does not itself extend how long the session is considered valid.
+	ExpiresAt time.Time `json:"expires_at"`
+
+	// AccessTokenExpiresAt is the underlying AT Protocol/OAuth access
+	// token's own expiry (parsed from its JWT "exp" claim where possible;
+	// see atproto.ParseJWTExpiry), distinct from ExpiresAt above. This is
+	// what EnsureFresh/ForceRefresh consult to decide whether the token
+	// needs refreshing before use.
+	AccessTokenExpiresAt time.Time `json:"access_token_expires_at"`
+
+	DPoPKey *ecdsa.PrivateKey `json:"-"`
+
+	// mu guards AccessToken/RefreshToken/AccessTokenExpiresAt against
+	// concurrent refreshes (see EnsureFresh/ForceRefresh). Deliberately
+	// unexported so it is never copied or serialized; Session must always
+	// be handled by pointer.
+	mu sync.Mutex `json:"-"`
+}
+
+// RefreshFunc performs the actual token-refresh call given the session's
+// current refresh token, returning a new access token, (optionally) a new
+// refresh token, and the new access token's expiry. Kept as a caller-
+// supplied function so this package stays free of AT Protocol/OAuth HTTP
+// specifics -- internal/web supplies the real implementation, backed by
+// atproto.RefreshSession for app-password sessions.
+type RefreshFunc func(refreshToken string) (accessToken, newRefreshToken string, expiresAt time.Time, err error)
+
+// tokenExpirySkew is how long before a session's recorded ExpiresAt
+// EnsureFresh proactively refreshes it, so a request is never raced against
+// the PDS's own expiry check.
+const tokenExpirySkew = 30 * time.Second
+
+// EnsureFresh returns a currently-valid access token, refreshing via
+// refreshFn first if the session is at or within tokenExpirySkew of
+// AccessTokenExpiresAt. Concurrent callers for the same session serialize
+// on s.mu, so at most one refresh call happens per expiry even under
+// concurrent requests -- the edge case explicitly called out in
+// atchess-1c9.9's brief.
+func (s *Session) EnsureFresh(refreshFn RefreshFunc) (string, error) {
+	return s.refresh(refreshFn, false)
+}
+
+// ForceRefresh unconditionally refreshes the session's access token via
+// refreshFn, ignoring AccessTokenExpiresAt. Used when the PDS itself has
+// just rejected a request with 401 -- which can happen even before our
+// locally-tracked expiry arrives (e.g. server-side revocation) -- so the
+// caller can refresh once and retry rather than looping.
+func (s *Session) ForceRefresh(refreshFn RefreshFunc) (string, error) {
+	return s.refresh(refreshFn, true)
+}
+
+func (s *Session) refresh(refreshFn RefreshFunc, force bool) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if !force && time.Now().Before(s.AccessTokenExpiresAt.Add(-tokenExpirySkew)) {
+		return s.AccessToken, nil
+	}
+	if refreshFn == nil {
+		return "", fmt.Errorf("session token needs refresh but no refresh function is available")
+	}
+	access, newRefresh, expiresAt, err := refreshFn(s.RefreshToken)
+	if err != nil {
+		return "", fmt.Errorf("failed to refresh session token: %w", err)
+	}
+	s.AccessToken = access
+	if newRefresh != "" {
+		s.RefreshToken = newRefresh
+	}
+	s.AccessTokenExpiresAt = expiresAt
+	return s.AccessToken, nil
 }
 
 // SessionStore manages OAuth sessions
@@ -35,11 +118,11 @@ func NewSessionStore() *SessionStore {
 func (s *SessionStore) CreateSession(session *Session) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	
+
 	// Generate session ID
 	sessionID := generateJTI()
 	s.sessions[sessionID] = session
-	
+
 	return sessionID
 }
 
@@ -47,17 +130,17 @@ func (s *SessionStore) CreateSession(session *Session) string {
 func (s *SessionStore) GetSession(sessionID string) (*Session, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	
+
 	session, exists := s.sessions[sessionID]
 	if !exists {
 		return nil, fmt.Errorf("session not found")
 	}
-	
+
 	// Check if session is expired
 	if time.Now().After(session.ExpiresAt) {
 		return nil, fmt.Errorf("session expired")
 	}
-	
+
 	return session, nil
 }
 
@@ -65,7 +148,7 @@ func (s *SessionStore) GetSession(sessionID string) (*Session, error) {
 func (s *SessionStore) DeleteSession(sessionID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	
+
 	delete(s.sessions, sessionID)
 }
 
@@ -73,7 +156,7 @@ func (s *SessionStore) DeleteSession(sessionID string) {
 func (s *SessionStore) CleanupExpiredSessions() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	
+
 	now := time.Now()
 	for id, session := range s.sessions {
 		if now.After(session.ExpiresAt) {
@@ -87,7 +170,7 @@ func (s *SessionStore) StartCleanupRoutine() {
 	go func() {
 		ticker := time.NewTicker(15 * time.Minute)
 		defer ticker.Stop()
-		
+
 		for range ticker.C {
 			s.CleanupExpiredSessions()
 		}
@@ -96,11 +179,11 @@ func (s *SessionStore) StartCleanupRoutine() {
 
 // AuthorizationRequest represents an in-progress OAuth authorization
 type AuthorizationRequest struct {
-	State         string    `json:"state"`
-	CodeVerifier  string    `json:"code_verifier"`
-	Handle        string    `json:"handle"`
-	CreatedAt     time.Time `json:"created_at"`
-	DPoPKey       *ecdsa.PrivateKey `json:"-"`
+	State        string            `json:"state"`
+	CodeVerifier string            `json:"code_verifier"`
+	Handle       string            `json:"handle"`
+	CreatedAt    time.Time         `json:"created_at"`
+	DPoPKey      *ecdsa.PrivateKey `json:"-"`
 }
 
 // AuthorizationStore manages pending authorization requests
@@ -120,7 +203,7 @@ func NewAuthorizationStore() *AuthorizationStore {
 func (a *AuthorizationStore) StoreAuthorization(req *AuthorizationRequest) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	
+
 	a.requests[req.State] = req
 }
 
@@ -128,18 +211,18 @@ func (a *AuthorizationStore) StoreAuthorization(req *AuthorizationRequest) {
 func (a *AuthorizationStore) GetAndDeleteAuthorization(state string) (*AuthorizationRequest, error) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	
+
 	req, exists := a.requests[state]
 	if !exists {
 		return nil, fmt.Errorf("authorization request not found")
 	}
-	
+
 	// Check if request is too old (15 minutes)
 	if time.Since(req.CreatedAt) > 15*time.Minute {
 		delete(a.requests, state)
 		return nil, fmt.Errorf("authorization request expired")
 	}
-	
+
 	delete(a.requests, state)
 	return req, nil
 }
@@ -151,7 +234,7 @@ func (s *Session) MarshalJSON() ([]byte, error) {
 		*Alias
 		DPoPKeyData []byte `json:"dpop_key_data,omitempty"`
 	}{
-		Alias: (*Alias)(s),
+		Alias:       (*Alias)(s),
 		DPoPKeyData: nil, // We don't serialize private keys
 	})
 }

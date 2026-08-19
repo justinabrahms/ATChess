@@ -13,15 +13,15 @@ import (
 
 // GameIndex represents a game available for spectating
 type GameIndex struct {
-	URI           string            `json:"uri"`
-	GameID        string            `json:"gameId"`
-	Players       GamePlayers       `json:"players"`
-	Status        chess.GameStatus  `json:"status"`
-	MoveCount     int               `json:"moveCount"`
-	LastMoveAt    *time.Time        `json:"lastMoveAt,omitempty"`
-	TimeControl   map[string]interface{} `json:"timeControl,omitempty"`
-	SpectatorCount int              `json:"spectatorCount"`
-	MaterialCount chess.MaterialCount `json:"materialCount"`
+	URI            string                 `json:"uri"`
+	GameID         string                 `json:"gameId"`
+	Players        GamePlayers            `json:"players"`
+	Status         chess.GameStatus       `json:"status"`
+	MoveCount      int                    `json:"moveCount"`
+	LastMoveAt     *time.Time             `json:"lastMoveAt,omitempty"`
+	TimeControl    map[string]interface{} `json:"timeControl,omitempty"`
+	SpectatorCount int                    `json:"spectatorCount"`
+	MaterialCount  chess.MaterialCount    `json:"materialCount"`
 }
 
 type GamePlayers struct {
@@ -38,11 +38,11 @@ type PlayerInfo struct {
 func (s *Service) GetActiveGamesHandler(w http.ResponseWriter, r *http.Request) {
 	// In a real implementation, this would query indexed games from a database
 	// For now, we'll use the firehose processor's tracked games
-	
+
 	// TODO: Implement proper game indexing service
 	// This is a placeholder that returns an empty list
 	games := []GameIndex{}
-	
+
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"games": games,
@@ -54,20 +54,20 @@ func (s *Service) GetActiveGamesHandler(w http.ResponseWriter, r *http.Request) 
 func (s *Service) GetSpectatorGameHandler(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	gameID := vars["id"]
-	
+
 	if gameID == "" {
 		http.Error(w, "Missing game ID", http.StatusBadRequest)
 		return
 	}
-	
+
 	// Fetch game from AT Protocol
-	game, err := s.client.GetGame(context.Background(), gameID)
+	game, err := s.serverClient.GetGame(context.Background(), gameID)
 	if err != nil {
 		log.Error().Err(err).Str("gameID", gameID).Msg("Failed to fetch game for spectator")
 		http.Error(w, "Game not found", http.StatusNotFound)
 		return
 	}
-	
+
 	// Get material count
 	engine, err := chess.NewEngineFromFEN(game.FEN)
 	var materialCount chess.MaterialCount
@@ -78,16 +78,16 @@ func (s *Service) GetSpectatorGameHandler(w http.ResponseWriter, r *http.Request
 	} else {
 		materialCount = engine.GetMaterialCount()
 	}
-	
+
 	// TODO: Get moves from AT Protocol when move records are implemented
 	// For now, moves are parsed from PGN in the engine
-	
+
 	// Prepare spectator response
 	response := map[string]interface{}{
-		"game": game,
+		"game":          game,
 		"materialCount": materialCount,
 	}
-	
+
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(response)
 }
@@ -97,7 +97,7 @@ func (s *Service) UpdateSpectatorCountHandler(hub *Hub) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		vars := mux.Vars(r)
 		gameID := vars["id"]
-		
+
 		var req struct {
 			Action string `json:"action"` // "join" or "leave"
 		}
@@ -105,7 +105,7 @@ func (s *Service) UpdateSpectatorCountHandler(hub *Hub) http.HandlerFunc {
 			http.Error(w, "Invalid request body", http.StatusBadRequest)
 			return
 		}
-		
+
 		// Get current spectator count from WebSocket hub
 		hub.mu.RLock()
 		spectatorCount := 0
@@ -113,7 +113,7 @@ func (s *Service) UpdateSpectatorCountHandler(hub *Hub) http.HandlerFunc {
 			spectatorCount = len(clients)
 		}
 		hub.mu.RUnlock()
-		
+
 		// Broadcast spectator count update
 		hub.BroadcastGameUpdate(GameUpdate{
 			GameID: gameID,
@@ -122,10 +122,10 @@ func (s *Service) UpdateSpectatorCountHandler(hub *Hub) http.HandlerFunc {
 				"count": spectatorCount,
 			},
 		})
-		
+
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
-			"gameId": gameID,
+			"gameId":         gameID,
 			"spectatorCount": spectatorCount,
 		})
 	}
@@ -135,24 +135,24 @@ func (s *Service) UpdateSpectatorCountHandler(hub *Hub) http.HandlerFunc {
 func (s *Service) CheckAbandonmentHandler(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	gameID := vars["id"]
-	
+
 	// Fetch game
-	game, err := s.client.GetGame(context.Background(), gameID)
+	game, err := s.serverClient.GetGame(context.Background(), gameID)
 	if err != nil {
 		http.Error(w, "Game not found", http.StatusNotFound)
 		return
 	}
-	
+
 	// Only check active games
 	if game.Status != chess.StatusActive {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"abandoned": false,
-			"reason": "Game already ended",
+			"reason":    "Game already ended",
 		})
 		return
 	}
-	
+
 	// TODO: Get last move from AT Protocol when move records are implemented
 	// For now, use game creation time as last activity
 	lastActivityStr := game.CreatedAt
@@ -162,20 +162,20 @@ func (s *Service) CheckAbandonmentHandler(w http.ResponseWriter, r *http.Request
 		http.Error(w, "Invalid timestamp", http.StatusInternalServerError)
 		return
 	}
-	
+
 	// Default abandonment timeout: 3 days for correspondence
 	abandonmentTimeout := 3 * 24 * time.Hour
 	timeSinceLastActivity := time.Since(lastActivityTime)
-	
+
 	abandoned := timeSinceLastActivity > abandonmentTimeout
-	
+
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
-		"abandoned": abandoned,
-		"lastActivity": lastActivityStr,
+		"abandoned":         abandoned,
+		"lastActivity":      lastActivityStr,
 		"timeSinceLastMove": timeSinceLastActivity.String(),
-		"timeout": abandonmentTimeout.String(),
-		"canClaim": abandoned,
+		"timeout":           abandonmentTimeout.String(),
+		"canClaim":          abandoned,
 	})
 }
 
@@ -186,6 +186,6 @@ func (s *Service) ClaimAbandonedGameHandler(w http.ResponseWriter, r *http.Reque
 	// 2. Verifies abandonment
 	// 3. Updates game status to winner
 	// 4. Creates a system move or note about abandonment
-	
+
 	http.Error(w, "Not implemented", http.StatusNotImplemented)
 }

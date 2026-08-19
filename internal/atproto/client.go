@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base32"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -19,25 +20,49 @@ import (
 type Client struct {
 	pdsURL      string
 	accessJWT   string
+	refreshJWT  string
 	did         string
 	handle      string
 	httpClient  *http.Client
 	dpopManager *auth.DPoPManager
 	useDPoP     bool
+
+	// auth, if set, supplies (and refreshes) the access token for this
+	// client's requests -- see NewClientFromSession. When nil, the client
+	// uses the static accessJWT captured at login (NewClient/
+	// NewClientWithDPoP), matching this package's original behaviour.
+	auth Authenticator
+}
+
+// Authenticator supplies the bearer token used to authenticate a Client's
+// requests when it was built via NewClientFromSession (as opposed to a
+// direct handle+password login), refreshing that token when necessary.
+// Implementations must be safe for concurrent use -- see
+// oauth.Session.EnsureFresh/ForceRefresh in internal/oauth, which
+// internal/web's sessionAuthenticator is built on.
+type Authenticator interface {
+	// Token returns a currently-valid access token, refreshing it first if
+	// it is at or near expiry.
+	Token() (string, error)
+	// ForceRefresh discards any local freshness assumption and refreshes
+	// immediately. Called after the PDS itself rejects a request with 401,
+	// in case the server invalidated the token for a reason this client
+	// could not have predicted locally (e.g. revocation).
+	ForceRefresh() (string, error)
 }
 
 // generateGameID creates a deterministic record key for a game based on challenge parameters
 func generateGameID(challengerDID, challengedDID string, timestamp time.Time) string {
 	// Create deterministic input from challenge parameters
 	input := fmt.Sprintf("%s:%s:%d", challengerDID, challengedDID, timestamp.Unix())
-	
+
 	// Hash the input
 	hash := sha256.Sum256([]byte(input))
-	
+
 	// Encode to base32 and take first 13 characters (similar to TID length)
 	encoder := base32.StdEncoding.WithPadding(base32.NoPadding)
 	encoded := encoder.EncodeToString(hash[:8])
-	
+
 	// Convert to lowercase and add prefix to distinguish from auto-generated TIDs
 	return "ch" + strings.ToLower(encoded)[:11]
 }
@@ -59,7 +84,7 @@ func NewClientWithDPoP(pdsURL, handle, password string, useDPoP bool) (*Client, 
 			return nil, fmt.Errorf("failed to create DPoP manager: %w", err)
 		}
 		dpopManager = manager
-		
+
 		// Create a DPoP-enabled HTTP client
 		// We'll set up the token getter after authentication
 		httpClient = &http.Client{
@@ -70,44 +95,46 @@ func NewClientWithDPoP(pdsURL, handle, password string, useDPoP bool) (*Client, 
 			Timeout: 30 * time.Second,
 		}
 	}
-	
+
 	// Create session
 	sessionReq := map[string]interface{}{
 		"identifier": handle,
 		"password":   password,
 	}
-	
+
 	reqBody, _ := json.Marshal(sessionReq)
 	req, err := http.NewRequest("POST", pdsURL+"/xrpc/com.atproto.server.createSession", bytes.NewBuffer(reqBody))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
-	
+
 	req.Header.Set("Content-Type", "application/json")
-	
+
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create session: %w", err)
 	}
 	defer resp.Body.Close()
-	
+
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("failed to create session: HTTP %d", resp.StatusCode)
 	}
-	
+
 	var session struct {
-		AccessJwt string `json:"accessJwt"`
-		Did       string `json:"did"`
-		Handle    string `json:"handle"`
+		AccessJwt  string `json:"accessJwt"`
+		RefreshJwt string `json:"refreshJwt"`
+		Did        string `json:"did"`
+		Handle     string `json:"handle"`
 	}
-	
+
 	if err := json.NewDecoder(resp.Body).Decode(&session); err != nil {
 		return nil, fmt.Errorf("failed to decode session response: %w", err)
 	}
-	
+
 	client := &Client{
 		pdsURL:      pdsURL,
 		accessJWT:   session.AccessJwt,
+		refreshJWT:  session.RefreshJwt,
 		did:         session.Did,
 		handle:      session.Handle,
 		httpClient:  httpClient,
@@ -130,22 +157,150 @@ func (c *Client) GetDID() string {
 	return c.did
 }
 
-// makeRequest is a helper method to create and execute HTTP requests with proper authentication
+// GetAccessJWT returns the current AT Protocol access token (accessJwt).
+// Exposed so callers (e.g. internal/web's LoginHandler) can persist it in a
+// session for later use by NewClientFromSession.
+func (c *Client) GetAccessJWT() string {
+	return c.accessJWT
+}
+
+// GetRefreshJWT returns the AT Protocol refresh token (refreshJwt) obtained
+// at login, if any.
+func (c *Client) GetRefreshJWT() string {
+	return c.refreshJWT
+}
+
+// NewClientFromSession builds a Client that authenticates as the identity
+// described by did/handle via auth, rather than performing a fresh
+// handle+password login. This is how internal/web's authenticated handlers
+// act as the caller (AuthenticatedDID) instead of the protocol-service
+// instance's own static configured identity (atchess-1c9.9). useDPoP
+// controls whether the Authorization header is "DPoP <token>" or
+// "Bearer <token>"; today only Bearer (app-password) sessions are wired
+// end-to-end -- DPoP-bound OAuth sessions are atchess-1c9.12's job.
+func NewClientFromSession(pdsURL, did, handle string, useDPoP bool, auth Authenticator) (*Client, error) {
+	if auth == nil {
+		return nil, fmt.Errorf("NewClientFromSession: an Authenticator is required")
+	}
+	accessJWT, err := auth.Token()
+	if err != nil {
+		return nil, fmt.Errorf("failed to obtain access token for session: %w", err)
+	}
+	return &Client{
+		pdsURL:     pdsURL,
+		accessJWT:  accessJWT,
+		did:        did,
+		handle:     handle,
+		httpClient: &http.Client{Timeout: 30 * time.Second},
+		useDPoP:    useDPoP,
+		auth:       auth,
+	}, nil
+}
+
+// RefreshSession exchanges a refresh token for a new access/refresh token
+// pair via com.atproto.server.refreshSession. Used by internal/web to renew
+// an app-password session's access token without requiring the user to
+// re-enter their password.
+func RefreshSession(pdsURL, refreshJWT string) (accessJWT, newRefreshJWT string, err error) {
+	req, err := http.NewRequest("POST", pdsURL+"/xrpc/com.atproto.server.refreshSession", nil)
+	if err != nil {
+		return "", "", fmt.Errorf("failed to create refresh request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+refreshJWT)
+
+	httpClient := &http.Client{Timeout: 30 * time.Second}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return "", "", fmt.Errorf("refreshSession request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", "", fmt.Errorf("refreshSession returned HTTP %d: %s", resp.StatusCode, string(body))
+	}
+
+	var result struct {
+		AccessJwt  string `json:"accessJwt"`
+		RefreshJwt string `json:"refreshJwt"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", "", fmt.Errorf("failed to decode refreshSession response: %w", err)
+	}
+
+	return result.AccessJwt, result.RefreshJwt, nil
+}
+
+// ParseJWTExpiry extracts the "exp" claim (Unix seconds) from a JWT's
+// payload without verifying its signature -- used only to decide when a
+// locally-held access token is due for a proactive refresh; the PDS remains
+// the sole authority on whether the token is actually still valid.
+func ParseJWTExpiry(token string) (time.Time, bool) {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		return time.Time{}, false
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		return time.Time{}, false
+	}
+	var claims struct {
+		Exp int64 `json:"exp"`
+	}
+	if err := json.Unmarshal(payload, &claims); err != nil || claims.Exp == 0 {
+		return time.Time{}, false
+	}
+	return time.Unix(claims.Exp, 0), true
+}
+
+// makeRequest creates and executes an HTTP request with proper
+// authentication, transparently refreshing and retrying once on a 401 when
+// the client was built via NewClientFromSession (c.auth != nil).
 func (c *Client) makeRequest(method, url string, body []byte) (*http.Response, error) {
+	resp, err := c.doRequest(method, url, body)
+	if err != nil {
+		return nil, err
+	}
+
+	if resp.StatusCode == http.StatusUnauthorized && c.auth != nil {
+		resp.Body.Close()
+		if _, rerr := c.auth.ForceRefresh(); rerr != nil {
+			return nil, fmt.Errorf("request unauthorized (401) and token refresh failed: %w", rerr)
+		}
+		resp, err = c.doRequest(method, url, body)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return resp, nil
+}
+
+// doRequest performs a single attempt of an authenticated HTTP request.
+func (c *Client) doRequest(method, url string, body []byte) (*http.Response, error) {
 	req, err := http.NewRequest(method, url, bytes.NewBuffer(body))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
-	
+
 	req.Header.Set("Content-Type", "application/json")
-	
+
+	token := c.accessJWT
+	if c.auth != nil {
+		t, terr := c.auth.Token()
+		if terr != nil {
+			return nil, fmt.Errorf("failed to obtain access token: %w", terr)
+		}
+		token = t
+	}
+
 	// Set authorization header based on whether DPoP is enabled
 	if c.useDPoP {
-		req.Header.Set("Authorization", "DPoP "+c.accessJWT)
+		req.Header.Set("Authorization", "DPoP "+token)
 	} else {
-		req.Header.Set("Authorization", "Bearer "+c.accessJWT)
+		req.Header.Set("Authorization", "Bearer "+token)
 	}
-	
+
 	return c.httpClient.Do(req)
 }
 
@@ -172,7 +327,7 @@ func (c *Client) createGame(ctx context.Context, opponentDID, color string, rkey
 		whiteDID = c.did
 		blackDID = opponentDID
 	}
-	
+
 	// Create initial game record
 	gameRecord := map[string]interface{}{
 		"$type":     "app.atchess.game",
@@ -183,7 +338,7 @@ func (c *Client) createGame(ctx context.Context, opponentDID, color string, rkey
 		"fen":       "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1", // Starting position
 		"pgn":       "",
 	}
-	
+
 	// Add challenge reference if provided
 	if challengeURI != "" {
 		gameRecord["challenge"] = map[string]interface{}{
@@ -191,39 +346,39 @@ func (c *Client) createGame(ctx context.Context, opponentDID, color string, rkey
 			"cid": challengeCID,
 		}
 	}
-	
+
 	// Create record in repository
 	createReq := map[string]interface{}{
 		"repo":       c.did,
 		"collection": "app.atchess.game",
 		"record":     gameRecord,
 	}
-	
+
 	// Add explicit rkey if provided
 	if rkey != nil {
 		createReq["rkey"] = *rkey
 	}
-	
+
 	reqBody, _ := json.Marshal(createReq)
 	resp, err := c.makeRequest("POST", c.pdsURL+"/xrpc/com.atproto.repo.createRecord", reqBody)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create game record: %w", err)
 	}
 	defer resp.Body.Close()
-	
+
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("failed to create game record: HTTP %d", resp.StatusCode)
 	}
-	
+
 	var createResp struct {
 		URI string `json:"uri"`
 		CID string `json:"cid"`
 	}
-	
+
 	if err := json.NewDecoder(resp.Body).Decode(&createResp); err != nil {
 		return nil, fmt.Errorf("failed to decode response: %w", err)
 	}
-	
+
 	return &chess.Game{
 		ID:        createResp.URI,
 		White:     whiteDID,
@@ -340,52 +495,52 @@ func (c *Client) RecordMove(ctx context.Context, gameURI string, move *chess.Mov
 func (c *Client) CreateChallenge(ctx context.Context, opponentDID, color, message string) (*chess.Challenge, error) {
 	createdAt := time.Now()
 	proposedGameID := generateGameID(c.did, opponentDID, createdAt)
-	
+
 	challengeRecord := map[string]interface{}{
-		"$type":         "app.atchess.challenge",
-		"createdAt":     createdAt.Format(time.RFC3339),
-		"challenger":    c.did,
-		"challenged":    opponentDID,
-		"status":        "pending",
-		"color":         color,
+		"$type":          "app.atchess.challenge",
+		"createdAt":      createdAt.Format(time.RFC3339),
+		"challenger":     c.did,
+		"challenged":     opponentDID,
+		"status":         "pending",
+		"color":          color,
 		"proposedGameId": proposedGameID,
-		"message":       message,
-		"expiresAt":     createdAt.Add(24 * time.Hour).Format(time.RFC3339),
+		"message":        message,
+		"expiresAt":      createdAt.Add(24 * time.Hour).Format(time.RFC3339),
 	}
-	
+
 	createReq := map[string]interface{}{
 		"repo":       c.did,
 		"collection": "app.atchess.challenge",
 		"record":     challengeRecord,
 	}
-	
+
 	reqBody, _ := json.Marshal(createReq)
 	resp, err := c.makeRequest("POST", c.pdsURL+"/xrpc/com.atproto.repo.createRecord", reqBody)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create challenge record: %w", err)
 	}
 	defer resp.Body.Close()
-	
+
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("failed to create challenge record: HTTP %d", resp.StatusCode)
 	}
-	
+
 	var createResp struct {
 		URI string `json:"uri"`
 		CID string `json:"cid"`
 	}
-	
+
 	if err := json.NewDecoder(resp.Body).Decode(&createResp); err != nil {
 		return nil, fmt.Errorf("failed to decode response: %w", err)
 	}
-	
+
 	// Try to create a notification in the challenged player's repository
 	// This is best-effort - it may fail if we can't write to their repo
 	timeControl := map[string]interface{}{
 		"type":        "correspondence",
 		"daysPerMove": 3,
 	}
-	
+
 	// Attempt to create notification but don't fail the challenge creation if it fails
 	notificationErr := c.CreateChallengeNotification(ctx, opponentDID, createResp.URI, createResp.CID, c.handle, color, message, timeControl)
 	if notificationErr != nil {
@@ -393,7 +548,7 @@ func (c *Client) CreateChallenge(ctx context.Context, opponentDID, color, messag
 		// In a real implementation, you might want to log this properly
 		fmt.Printf("Warning: Could not create challenge notification: %v\n", notificationErr)
 	}
-	
+
 	return &chess.Challenge{
 		ID:             createResp.URI,
 		Challenger:     c.did,
@@ -415,33 +570,33 @@ func (c *Client) getGameRecord(ctx context.Context, gameURI string) (string, map
 	if len(parts) < 5 || !strings.HasPrefix(gameURI, "at://") {
 		return "", nil, fmt.Errorf("invalid AT Protocol URI format: %s", gameURI)
 	}
-	
+
 	repo := parts[2] // The DID
 	rkey := parts[4] // The record key
-	
-	url := fmt.Sprintf("%s/xrpc/com.atproto.repo.getRecord?repo=%s&collection=app.atchess.game&rkey=%s", 
+
+	url := fmt.Sprintf("%s/xrpc/com.atproto.repo.getRecord?repo=%s&collection=app.atchess.game&rkey=%s",
 		c.pdsURL, repo, rkey)
 	resp, err := c.makeRequest("GET", url, nil)
 	if err != nil {
 		return "", nil, fmt.Errorf("failed to get game record: %w", err)
 	}
 	defer resp.Body.Close()
-	
+
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		return "", nil, fmt.Errorf("failed to get game record: HTTP %d - %s", resp.StatusCode, string(body))
 	}
-	
+
 	var getResp struct {
 		URI   string                 `json:"uri"`
 		CID   string                 `json:"cid"`
 		Value map[string]interface{} `json:"value"`
 	}
-	
+
 	if err := json.NewDecoder(resp.Body).Decode(&getResp); err != nil {
 		return "", nil, fmt.Errorf("failed to decode response: %w", err)
 	}
-	
+
 	return getResp.CID, getResp.Value, nil
 }
 
@@ -593,38 +748,38 @@ func (c *Client) GetGame(ctx context.Context, gameURI string) (*chess.Game, erro
 	// Parse the AT Protocol URI to extract repo and rkey
 	// Example URI: at://did:plc:example/app.atchess.game/3k2uv5...
 	// We need to call com.atproto.repo.getRecord
-	
+
 	// Parse the URI to extract components
 	// Format: at://did:plc:USER/app.atchess.game/RKEY
 	parts := strings.Split(gameURI, "/")
 	if len(parts) < 4 || !strings.HasPrefix(gameURI, "at://") {
 		return nil, fmt.Errorf("invalid AT Protocol URI format: %s", gameURI)
 	}
-	
+
 	repo := parts[2] // The DID
 	rkey := parts[4] // The record key
-	
-	url := fmt.Sprintf("%s/xrpc/com.atproto.repo.getRecord?repo=%s&collection=app.atchess.game&rkey=%s", 
+
+	url := fmt.Sprintf("%s/xrpc/com.atproto.repo.getRecord?repo=%s&collection=app.atchess.game&rkey=%s",
 		c.pdsURL, repo, rkey)
 	resp, err := c.makeRequest("GET", url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get game record: %w", err)
 	}
 	defer resp.Body.Close()
-	
+
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("failed to get game record: HTTP %d", resp.StatusCode)
 	}
-	
+
 	var getResp struct {
 		Value struct {
-			Type      string `json:"$type"`
-			CreatedAt string `json:"createdAt"`
-			White     string `json:"white"`
-			Black     string `json:"black"`
-			Status    string `json:"status"`
-			FEN       string `json:"fen"`
-			PGN       string `json:"pgn"`
+			Type        string `json:"$type"`
+			CreatedAt   string `json:"createdAt"`
+			White       string `json:"white"`
+			Black       string `json:"black"`
+			Status      string `json:"status"`
+			FEN         string `json:"fen"`
+			PGN         string `json:"pgn"`
 			TimeControl *struct {
 				Type        string `json:"type"`
 				Initial     int    `json:"initial"`
@@ -633,11 +788,11 @@ func (c *Client) GetGame(ctx context.Context, gameURI string) (*chess.Game, erro
 			} `json:"timeControl"`
 		} `json:"value"`
 	}
-	
+
 	if err := json.NewDecoder(resp.Body).Decode(&getResp); err != nil {
 		return nil, fmt.Errorf("failed to decode response: %w", err)
 	}
-	
+
 	var timeControl *chess.TimeControl
 	if getResp.Value.TimeControl != nil {
 		timeControl = &chess.TimeControl{
@@ -647,7 +802,7 @@ func (c *Client) GetGame(ctx context.Context, gameURI string) (*chess.Game, erro
 			Increment:   getResp.Value.TimeControl.Increment,
 		}
 	}
-	
+
 	game := &chess.Game{
 		ID:          gameURI,
 		White:       getResp.Value.White,
@@ -694,28 +849,28 @@ func (c *Client) ResolveHandle(ctx context.Context, handle string) (string, erro
 	if strings.HasPrefix(handle, "did:") {
 		return handle, nil
 	}
-	
+
 	// Otherwise, resolve via com.atproto.identity.resolveHandle
 	url := fmt.Sprintf("%s/xrpc/com.atproto.identity.resolveHandle?handle=%s", c.pdsURL, handle)
-	
+
 	resp, err := c.makeRequest("GET", url, nil)
 	if err != nil {
 		return "", fmt.Errorf("failed to resolve handle: %w", err)
 	}
 	defer resp.Body.Close()
-	
+
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		return "", fmt.Errorf("failed to resolve handle: %s", string(body))
 	}
-	
+
 	var result struct {
 		DID string `json:"did"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return "", fmt.Errorf("failed to decode response: %w", err)
 	}
-	
+
 	return result.DID, nil
 }
 
@@ -723,7 +878,7 @@ func (c *Client) ResolveHandle(ctx context.Context, handle string) (string, erro
 func (c *Client) CreateChallengeNotification(ctx context.Context, challengedDID, challengeURI, challengeCID, challengerHandle, color, message string, timeControl map[string]interface{}) error {
 	// Calculate expiration time (24 hours from now)
 	expiresAt := time.Now().Add(24 * time.Hour)
-	
+
 	// Create notification record
 	notificationRecord := map[string]interface{}{
 		"$type":     "app.atchess.challengeNotification",
@@ -734,33 +889,33 @@ func (c *Client) CreateChallengeNotification(ctx context.Context, challengedDID,
 		},
 		"challenger":       c.did,
 		"challengerHandle": challengerHandle,
-		"color":           color,
-		"expiresAt":       expiresAt.Format(time.RFC3339),
+		"color":            color,
+		"expiresAt":        expiresAt.Format(time.RFC3339),
 	}
-	
+
 	// Add optional fields
 	if message != "" {
 		notificationRecord["message"] = message
 	}
-	
+
 	if timeControl != nil {
 		notificationRecord["timeControl"] = timeControl
 	}
-	
+
 	// Create record in challenged player's repository
 	createReq := map[string]interface{}{
 		"repo":       challengedDID,
 		"collection": "app.atchess.challengeNotification",
 		"record":     notificationRecord,
 	}
-	
+
 	reqBody, _ := json.Marshal(createReq)
 	resp, err := c.makeRequest("POST", c.pdsURL+"/xrpc/com.atproto.repo.createRecord", reqBody)
 	if err != nil {
 		return fmt.Errorf("failed to create challenge notification: %w", err)
 	}
 	defer resp.Body.Close()
-	
+
 	// Handle expected error cases
 	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusUnauthorized {
 		// We don't have permission to write to the challenged player's repo
@@ -768,12 +923,12 @@ func (c *Client) CreateChallengeNotification(ctx context.Context, challengedDID,
 		body, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("cannot write to challenged player's repository: HTTP %d - %s", resp.StatusCode, string(body))
 	}
-	
+
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("failed to create challenge notification: HTTP %d - %s", resp.StatusCode, string(body))
 	}
-	
+
 	return nil
 }
 
@@ -787,12 +942,12 @@ func (c *Client) GetChallengeNotifications(ctx context.Context) ([]*ChallengeNot
 		return nil, fmt.Errorf("failed to list challenge notifications: %w", err)
 	}
 	defer resp.Body.Close()
-	
+
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("failed to list challenge notifications: HTTP %d - %s", resp.StatusCode, string(body))
 	}
-	
+
 	var listResp struct {
 		Records []struct {
 			URI   string `json:"uri"`
@@ -813,27 +968,27 @@ func (c *Client) GetChallengeNotifications(ctx context.Context) ([]*ChallengeNot
 			} `json:"value"`
 		} `json:"records"`
 	}
-	
+
 	if err := json.NewDecoder(resp.Body).Decode(&listResp); err != nil {
 		return nil, fmt.Errorf("failed to decode response: %w", err)
 	}
-	
+
 	// Filter out expired notifications and convert to our type
 	var notifications []*ChallengeNotification
 	now := time.Now()
-	
+
 	for _, record := range listResp.Records {
 		// Parse expiration time
 		expiresAt, err := time.Parse(time.RFC3339, record.Value.ExpiresAt)
 		if err != nil {
 			continue // Skip if we can't parse the expiration
 		}
-		
+
 		// Skip expired notifications
 		if expiresAt.Before(now) {
 			continue
 		}
-		
+
 		notification := &ChallengeNotification{
 			URI:              record.URI,
 			CID:              record.CID,
@@ -847,10 +1002,10 @@ func (c *Client) GetChallengeNotifications(ctx context.Context) ([]*ChallengeNot
 			ExpiresAt:        record.Value.ExpiresAt,
 			TimeControl:      record.Value.TimeControl,
 		}
-		
+
 		notifications = append(notifications, notification)
 	}
-	
+
 	return notifications, nil
 }
 
@@ -877,34 +1032,34 @@ func (c *Client) DeleteChallengeNotification(ctx context.Context, notificationUR
 	if len(parts) < 5 || !strings.HasPrefix(notificationURI, "at://") {
 		return fmt.Errorf("invalid notification URI format: %s", notificationURI)
 	}
-	
+
 	repo := parts[2] // The DID
 	rkey := parts[4] // The record key
-	
+
 	// Verify this notification belongs to the current user
 	if repo != c.did {
 		return fmt.Errorf("cannot delete notification from another user's repository")
 	}
-	
+
 	// Delete the record
 	deleteReq := map[string]interface{}{
 		"repo":       repo,
 		"collection": "app.atchess.challengeNotification",
 		"rkey":       rkey,
 	}
-	
+
 	reqBody, _ := json.Marshal(deleteReq)
 	resp, err := c.makeRequest("POST", c.pdsURL+"/xrpc/com.atproto.repo.deleteRecord", reqBody)
 	if err != nil {
 		return fmt.Errorf("failed to delete notification: %w", err)
 	}
 	defer resp.Body.Close()
-	
+
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("failed to delete notification: HTTP %d - %s", resp.StatusCode, string(body))
 	}
-	
+
 	return nil
 }
 
@@ -915,12 +1070,12 @@ func (c *Client) OfferDraw(ctx context.Context, gameID string, message string) (
 	if err != nil {
 		return nil, fmt.Errorf("failed to get game record: %w", err)
 	}
-	
+
 	// Verify the game is active
 	if status, ok := gameValue["status"].(string); ok && status != "active" {
 		return nil, fmt.Errorf("cannot offer draw in a game with status: %s", status)
 	}
-	
+
 	// Create draw offer record
 	drawOfferRecord := map[string]interface{}{
 		"$type":     "app.atchess.drawOffer",
@@ -932,40 +1087,40 @@ func (c *Client) OfferDraw(ctx context.Context, gameID string, message string) (
 		"offeredBy": c.did,
 		"status":    "pending",
 	}
-	
+
 	// Add optional message
 	if message != "" {
 		drawOfferRecord["message"] = message
 	}
-	
+
 	// Create record in repository
 	createReq := map[string]interface{}{
 		"repo":       c.did,
 		"collection": "app.atchess.drawOffer",
 		"record":     drawOfferRecord,
 	}
-	
+
 	reqBody, _ := json.Marshal(createReq)
 	resp, err := c.makeRequest("POST", c.pdsURL+"/xrpc/com.atproto.repo.createRecord", reqBody)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create draw offer record: %w", err)
 	}
 	defer resp.Body.Close()
-	
+
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("failed to create draw offer record: HTTP %d - %s", resp.StatusCode, string(body))
 	}
-	
+
 	var createResp struct {
 		URI string `json:"uri"`
 		CID string `json:"cid"`
 	}
-	
+
 	if err := json.NewDecoder(resp.Body).Decode(&createResp); err != nil {
 		return nil, fmt.Errorf("failed to decode response: %w", err)
 	}
-	
+
 	return &DrawOffer{
 		URI:       createResp.URI,
 		CID:       createResp.CID,
@@ -985,39 +1140,39 @@ func (c *Client) RespondToDrawOffer(ctx context.Context, drawOfferURI string, ac
 	if len(parts) < 5 || !strings.HasPrefix(drawOfferURI, "at://") {
 		return fmt.Errorf("invalid draw offer URI format: %s", drawOfferURI)
 	}
-	
+
 	repo := parts[2] // The DID
 	rkey := parts[4] // The record key
-	
+
 	// Get the draw offer record
-	url := fmt.Sprintf("%s/xrpc/com.atproto.repo.getRecord?repo=%s&collection=app.atchess.drawOffer&rkey=%s", 
+	url := fmt.Sprintf("%s/xrpc/com.atproto.repo.getRecord?repo=%s&collection=app.atchess.drawOffer&rkey=%s",
 		c.pdsURL, repo, rkey)
 	resp, err := c.makeRequest("GET", url, nil)
 	if err != nil {
 		return fmt.Errorf("failed to get draw offer record: %w", err)
 	}
 	defer resp.Body.Close()
-	
+
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("failed to get draw offer record: HTTP %d - %s", resp.StatusCode, string(body))
 	}
-	
+
 	var getResp struct {
 		URI   string                 `json:"uri"`
 		CID   string                 `json:"cid"`
 		Value map[string]interface{} `json:"value"`
 	}
-	
+
 	if err := json.NewDecoder(resp.Body).Decode(&getResp); err != nil {
 		return fmt.Errorf("failed to decode response: %w", err)
 	}
-	
+
 	// Verify the draw offer is still pending
 	if status, ok := getResp.Value["status"].(string); ok && status != "pending" {
 		return fmt.Errorf("draw offer is not pending, current status: %s", status)
 	}
-	
+
 	// Get the game reference
 	gameRef, ok := getResp.Value["game"].(map[string]interface{})
 	if !ok {
@@ -1027,7 +1182,7 @@ func (c *Client) RespondToDrawOffer(ctx context.Context, drawOfferURI string, ac
 	if !ok {
 		return fmt.Errorf("missing game URI in draw offer")
 	}
-	
+
 	// Update the draw offer record
 	getResp.Value["status"] = "accepted"
 	if !accept {
@@ -1035,7 +1190,7 @@ func (c *Client) RespondToDrawOffer(ctx context.Context, drawOfferURI string, ac
 	}
 	getResp.Value["respondedAt"] = time.Now().Format(time.RFC3339)
 	getResp.Value["respondedBy"] = c.did
-	
+
 	// Update the draw offer record
 	putReq := map[string]interface{}{
 		"repo":       repo,
@@ -1044,19 +1199,19 @@ func (c *Client) RespondToDrawOffer(ctx context.Context, drawOfferURI string, ac
 		"record":     getResp.Value,
 		"swapCid":    getResp.CID,
 	}
-	
+
 	putReqBody, _ := json.Marshal(putReq)
 	putResp, err := c.makeRequest("POST", c.pdsURL+"/xrpc/com.atproto.repo.putRecord", putReqBody)
 	if err != nil {
 		return fmt.Errorf("failed to update draw offer record: %w", err)
 	}
 	defer putResp.Body.Close()
-	
+
 	if putResp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(putResp.Body)
 		return fmt.Errorf("failed to update draw offer record: HTTP %d - %s", putResp.StatusCode, string(body))
 	}
-	
+
 	// If the draw was accepted, update the game status
 	if accept {
 		// Get the game record
@@ -1064,14 +1219,14 @@ func (c *Client) RespondToDrawOffer(ctx context.Context, drawOfferURI string, ac
 		if err != nil {
 			return fmt.Errorf("failed to get game record for status update: %w", err)
 		}
-		
+
 		// Parse the game URI to check if we own the game record
 		gameParts := strings.Split(gameURI, "/")
 		if len(gameParts) >= 5 && gameParts[2] == c.did {
 			// Update the game status to draw
 			gameValue["status"] = "draw"
 			gameValue["updatedAt"] = time.Now().Format(time.RFC3339)
-			
+
 			// Update the game record
 			gameRkey := gameParts[4]
 			updateGameReq := map[string]interface{}{
@@ -1081,21 +1236,21 @@ func (c *Client) RespondToDrawOffer(ctx context.Context, drawOfferURI string, ac
 				"record":     gameValue,
 				"swapCid":    gameCID,
 			}
-			
+
 			updateGameReqBody, _ := json.Marshal(updateGameReq)
 			updateGameResp, err := c.makeRequest("POST", c.pdsURL+"/xrpc/com.atproto.repo.putRecord", updateGameReqBody)
 			if err != nil {
 				return fmt.Errorf("failed to update game record: %w", err)
 			}
 			defer updateGameResp.Body.Close()
-			
+
 			if updateGameResp.StatusCode != http.StatusOK {
 				body, _ := io.ReadAll(updateGameResp.Body)
 				return fmt.Errorf("failed to update game record: HTTP %d - %s", updateGameResp.StatusCode, string(body))
 			}
 		}
 	}
-	
+
 	return nil
 }
 
@@ -1106,16 +1261,16 @@ func (c *Client) ResignGame(ctx context.Context, gameID string, reason string) e
 	if err != nil {
 		return fmt.Errorf("failed to get game record: %w", err)
 	}
-	
+
 	// Verify the game is active
 	if status, ok := gameValue["status"].(string); ok && status != "active" {
 		return fmt.Errorf("cannot resign from a game with status: %s", status)
 	}
-	
+
 	// Determine who won based on who is resigning
 	whiteDID, _ := gameValue["white"].(string)
 	blackDID, _ := gameValue["black"].(string)
-	
+
 	var newStatus string
 	if c.did == whiteDID {
 		newStatus = "black_won"
@@ -1124,48 +1279,48 @@ func (c *Client) ResignGame(ctx context.Context, gameID string, reason string) e
 	} else {
 		return fmt.Errorf("player is not part of this game")
 	}
-	
+
 	// Create resignation record
 	resignationRecord := map[string]interface{}{
-		"$type":           "app.atchess.resignation",
-		"createdAt":       time.Now().Format(time.RFC3339),
+		"$type":     "app.atchess.resignation",
+		"createdAt": time.Now().Format(time.RFC3339),
 		"game": map[string]interface{}{
 			"uri": gameID,
 			"cid": gameCID,
 		},
 		"resigningPlayer": c.did,
 	}
-	
+
 	// Add optional reason
 	if reason != "" {
 		resignationRecord["reason"] = reason
 	}
-	
+
 	// Create record in repository
 	createReq := map[string]interface{}{
 		"repo":       c.did,
 		"collection": "app.atchess.resignation",
 		"record":     resignationRecord,
 	}
-	
+
 	reqBody, _ := json.Marshal(createReq)
 	resp, err := c.makeRequest("POST", c.pdsURL+"/xrpc/com.atproto.repo.createRecord", reqBody)
 	if err != nil {
 		return fmt.Errorf("failed to create resignation record: %w", err)
 	}
 	defer resp.Body.Close()
-	
+
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("failed to create resignation record: HTTP %d - %s", resp.StatusCode, string(body))
 	}
-	
+
 	// Update the game status if we own the game record
 	parts := strings.Split(gameID, "/")
 	if len(parts) >= 5 && parts[2] == c.did {
 		gameValue["status"] = newStatus
 		gameValue["updatedAt"] = time.Now().Format(time.RFC3339)
-		
+
 		// Update the game record
 		rkey := parts[4]
 		updateReq := map[string]interface{}{
@@ -1175,20 +1330,20 @@ func (c *Client) ResignGame(ctx context.Context, gameID string, reason string) e
 			"record":     gameValue,
 			"swapCid":    gameCID,
 		}
-		
+
 		updateReqBody, _ := json.Marshal(updateReq)
 		updateResp, err := c.makeRequest("POST", c.pdsURL+"/xrpc/com.atproto.repo.putRecord", updateReqBody)
 		if err != nil {
 			return fmt.Errorf("failed to update game record: %w", err)
 		}
 		defer updateResp.Body.Close()
-		
+
 		if updateResp.StatusCode != http.StatusOK {
 			body, _ := io.ReadAll(updateResp.Body)
 			return fmt.Errorf("failed to update game record: HTTP %d - %s", updateResp.StatusCode, string(body))
 		}
 	}
-	
+
 	return nil
 }
 
@@ -1202,12 +1357,12 @@ func (c *Client) GetDrawOffers(ctx context.Context, gameID string) ([]*DrawOffer
 		return nil, fmt.Errorf("failed to list draw offers: %w", err)
 	}
 	defer resp.Body.Close()
-	
+
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("failed to list draw offers: HTTP %d - %s", resp.StatusCode, string(body))
 	}
-	
+
 	var listResp struct {
 		Records []struct {
 			URI   string `json:"uri"`
@@ -1215,24 +1370,24 @@ func (c *Client) GetDrawOffers(ctx context.Context, gameID string) ([]*DrawOffer
 			Value struct {
 				Type      string `json:"$type"`
 				CreatedAt string `json:"createdAt"`
-				Game struct {
+				Game      struct {
 					URI string `json:"uri"`
 					CID string `json:"cid"`
 				} `json:"game"`
-				OfferedBy    string `json:"offeredBy"`
-				MoveNumber   int    `json:"moveNumber"`
-				Message      string `json:"message"`
-				Status       string `json:"status"`
-				RespondedAt  string `json:"respondedAt"`
-				RespondedBy  string `json:"respondedBy"`
+				OfferedBy   string `json:"offeredBy"`
+				MoveNumber  int    `json:"moveNumber"`
+				Message     string `json:"message"`
+				Status      string `json:"status"`
+				RespondedAt string `json:"respondedAt"`
+				RespondedBy string `json:"respondedBy"`
 			} `json:"value"`
 		} `json:"records"`
 	}
-	
+
 	if err := json.NewDecoder(resp.Body).Decode(&listResp); err != nil {
 		return nil, fmt.Errorf("failed to decode response: %w", err)
 	}
-	
+
 	// Filter for the specific game and pending status
 	var offers []*DrawOffer
 	for _, record := range listResp.Records {
@@ -1253,7 +1408,7 @@ func (c *Client) GetDrawOffers(ctx context.Context, gameID string) ([]*DrawOffer
 			offers = append(offers, offer)
 		}
 	}
-	
+
 	return offers, nil
 }
 
@@ -1294,34 +1449,34 @@ func (c *Client) CheckTimeViolation(ctx context.Context, gameID string) (bool, *
 	if err != nil {
 		return false, nil, fmt.Errorf("failed to get game record: %w", err)
 	}
-	
+
 	// Check if game is still active
 	if status, ok := gameValue["status"].(string); ok && status != "active" {
 		return false, nil, nil // Game is not active, no time violation possible
 	}
-	
+
 	// Get players
 	whiteDID, _ := gameValue["white"].(string)
 	blackDID, _ := gameValue["black"].(string)
-	
+
 	// Determine whose turn it is from FEN
 	fen, _ := gameValue["fen"].(string)
 	fenParts := strings.Split(fen, " ")
 	if len(fenParts) < 2 {
 		return false, nil, fmt.Errorf("invalid FEN format")
 	}
-	
+
 	var currentPlayerDID string
 	if fenParts[1] == "w" {
 		currentPlayerDID = whiteDID
 	} else {
 		currentPlayerDID = blackDID
 	}
-	
+
 	// Get the challenge reference to access time control settings
 	var timeControlType string
 	var daysPerMove int
-	
+
 	if challengeRef, ok := gameValue["challenge"].(map[string]interface{}); ok {
 		challengeURI, _ := challengeRef["uri"].(string)
 		if challengeURI != "" {
@@ -1330,19 +1485,19 @@ func (c *Client) CheckTimeViolation(ctx context.Context, gameID string) (bool, *
 			if len(challengeParts) >= 5 {
 				challengeRepo := challengeParts[2]
 				challengeRkey := challengeParts[4]
-				
+
 				url := fmt.Sprintf("%s/xrpc/com.atproto.repo.getRecord?repo=%s&collection=app.atchess.challenge&rkey=%s",
 					c.pdsURL, challengeRepo, challengeRkey)
 				resp, err := c.makeRequest("GET", url, nil)
 				if err == nil && resp.StatusCode == http.StatusOK {
 					defer resp.Body.Close()
-					
+
 					var challengeResp struct {
 						Value struct {
 							TimeControl map[string]interface{} `json:"timeControl"`
 						} `json:"value"`
 					}
-					
+
 					if err := json.NewDecoder(resp.Body).Decode(&challengeResp); err == nil {
 						if tc := challengeResp.Value.TimeControl; tc != nil {
 							if tcType, ok := tc["type"].(string); ok {
@@ -1357,13 +1512,13 @@ func (c *Client) CheckTimeViolation(ctx context.Context, gameID string) (bool, *
 			}
 		}
 	}
-	
+
 	// Default to correspondence with 3 days per move if not specified
 	if timeControlType == "" {
 		timeControlType = "correspondence"
 		daysPerMove = 3
 	}
-	
+
 	// For correspondence games, check the last move timestamp
 	if timeControlType == "correspondence" {
 		// Get the most recent move
@@ -1371,7 +1526,7 @@ func (c *Client) CheckTimeViolation(ctx context.Context, gameID string) (bool, *
 		if err != nil {
 			return false, nil, fmt.Errorf("failed to get last move: %w", err)
 		}
-		
+
 		// If no moves yet, use game creation time
 		var lastMoveTime time.Time
 		if lastMove != nil {
@@ -1390,7 +1545,7 @@ func (c *Client) CheckTimeViolation(ctx context.Context, gameID string) (bool, *
 				return false, nil, fmt.Errorf("game missing createdAt timestamp")
 			}
 		}
-		
+
 		// Check if time has expired
 		timeLimit := time.Duration(daysPerMove) * 24 * time.Hour
 		if time.Since(lastMoveTime) > timeLimit {
@@ -1407,10 +1562,10 @@ func (c *Client) CheckTimeViolation(ctx context.Context, gameID string) (bool, *
 			return true, violation, nil
 		}
 	}
-	
+
 	// TODO: Implement for other time control types (rapid, blitz, bullet)
 	// These would require tracking time remaining per player
-	
+
 	return false, nil, nil
 }
 
@@ -1421,23 +1576,23 @@ func (c *Client) getLastMove(ctx context.Context, gameID string, excludePlayerDI
 }, error) {
 	// List moves for both players
 	players := []string{}
-	
+
 	// Parse game URI to get players
 	gameParts := strings.Split(gameID, "/")
 	if len(gameParts) >= 5 {
 		gameRepo := gameParts[2]
 		players = append(players, gameRepo)
 	}
-	
+
 	// Get game record to find the other player
 	_, gameValue, err := c.getGameRecord(ctx, gameID)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	whiteDID, _ := gameValue["white"].(string)
 	blackDID, _ := gameValue["black"].(string)
-	
+
 	// Add the other player if different from repo owner
 	if whiteDID != players[0] {
 		players = append(players, whiteDID)
@@ -1445,13 +1600,13 @@ func (c *Client) getLastMove(ctx context.Context, gameID string, excludePlayerDI
 	if blackDID != players[0] && blackDID != whiteDID {
 		players = append(players, blackDID)
 	}
-	
+
 	var lastMove *struct {
 		CreatedAt string
 		Player    string
 	}
 	var lastMoveTime time.Time
-	
+
 	// Check moves from all players
 	for _, playerDID := range players {
 		url := fmt.Sprintf("%s/xrpc/com.atproto.repo.listRecords?repo=%s&collection=app.atchess.move&limit=100",
@@ -1461,11 +1616,11 @@ func (c *Client) getLastMove(ctx context.Context, gameID string, excludePlayerDI
 			continue // Skip if we can't access this player's moves
 		}
 		defer resp.Body.Close()
-		
+
 		if resp.StatusCode != http.StatusOK {
 			continue
 		}
-		
+
 		var listResp struct {
 			Records []struct {
 				Value struct {
@@ -1477,11 +1632,11 @@ func (c *Client) getLastMove(ctx context.Context, gameID string, excludePlayerDI
 				} `json:"value"`
 			} `json:"records"`
 		}
-		
+
 		if err := json.NewDecoder(resp.Body).Decode(&listResp); err != nil {
 			continue
 		}
-		
+
 		// Find the most recent move for this game
 		for _, record := range listResp.Records {
 			if record.Value.Game.URI == gameID && record.Value.Player != excludePlayerDID {
@@ -1489,7 +1644,7 @@ func (c *Client) getLastMove(ctx context.Context, gameID string, excludePlayerDI
 				if err != nil {
 					continue
 				}
-				
+
 				if lastMove == nil || moveTime.After(lastMoveTime) {
 					lastMoveTime = moveTime
 					lastMove = &struct {
@@ -1503,7 +1658,7 @@ func (c *Client) getLastMove(ctx context.Context, gameID string, excludePlayerDI
 			}
 		}
 	}
-	
+
 	return lastMove, nil
 }
 
@@ -1514,29 +1669,29 @@ func (c *Client) ClaimTimeVictory(ctx context.Context, gameID string) error {
 	if err != nil {
 		return fmt.Errorf("failed to check time violation: %w", err)
 	}
-	
+
 	if !hasViolation {
 		return fmt.Errorf("no time violation detected")
 	}
-	
+
 	// Get the game record
 	gameCID, gameValue, err := c.getGameRecord(ctx, gameID)
 	if err != nil {
 		return fmt.Errorf("failed to get game record: %w", err)
 	}
-	
+
 	// Verify the claiming player is part of the game
 	whiteDID, _ := gameValue["white"].(string)
 	blackDID, _ := gameValue["black"].(string)
-	
+
 	if c.did != whiteDID && c.did != blackDID {
 		return fmt.Errorf("you are not a player in this game")
 	}
-	
+
 	// Create time violation record
 	violationRecord := map[string]interface{}{
-		"$type":           "app.atchess.timeViolation",
-		"createdAt":       time.Now().Format(time.RFC3339),
+		"$type":     "app.atchess.timeViolation",
+		"createdAt": time.Now().Format(time.RFC3339),
 		"game": map[string]interface{}{
 			"uri": gameID,
 			"cid": gameCID,
@@ -1546,33 +1701,33 @@ func (c *Client) ClaimTimeVictory(ctx context.Context, gameID string) error {
 		"lastMoveTimestamp": violation.LastMoveTimestamp,
 		"timeControlType":   violation.TimeControlType,
 	}
-	
+
 	if violation.DaysPerMove > 0 {
 		violationRecord["daysPerMove"] = violation.DaysPerMove
 	}
 	if violation.TimeRemaining > 0 {
 		violationRecord["timeRemaining"] = violation.TimeRemaining
 	}
-	
+
 	// Create the violation record
 	createReq := map[string]interface{}{
 		"repo":       c.did,
 		"collection": "app.atchess.timeViolation",
 		"record":     violationRecord,
 	}
-	
+
 	reqBody, _ := json.Marshal(createReq)
 	resp, err := c.makeRequest("POST", c.pdsURL+"/xrpc/com.atproto.repo.createRecord", reqBody)
 	if err != nil {
 		return fmt.Errorf("failed to create time violation record: %w", err)
 	}
 	defer resp.Body.Close()
-	
+
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf("failed to create time violation record: HTTP %d - %s", resp.StatusCode, string(body))
 	}
-	
+
 	// Update game status if we own the game record
 	parts := strings.Split(gameID, "/")
 	if len(parts) >= 5 && parts[2] == c.did {
@@ -1583,10 +1738,10 @@ func (c *Client) ClaimTimeVictory(ctx context.Context, gameID string) error {
 		} else {
 			newStatus = "white_won"
 		}
-		
+
 		gameValue["status"] = newStatus
 		gameValue["updatedAt"] = time.Now().Format(time.RFC3339)
-		
+
 		// Update the game record
 		rkey := parts[4]
 		updateReq := map[string]interface{}{
@@ -1596,20 +1751,20 @@ func (c *Client) ClaimTimeVictory(ctx context.Context, gameID string) error {
 			"record":     gameValue,
 			"swapCid":    gameCID,
 		}
-		
+
 		updateReqBody, _ := json.Marshal(updateReq)
 		updateResp, err := c.makeRequest("POST", c.pdsURL+"/xrpc/com.atproto.repo.putRecord", updateReqBody)
 		if err != nil {
 			return fmt.Errorf("failed to update game record: %w", err)
 		}
 		defer updateResp.Body.Close()
-		
+
 		if updateResp.StatusCode != http.StatusOK {
 			body, _ := io.ReadAll(updateResp.Body)
 			return fmt.Errorf("failed to update game record: HTTP %d - %s", updateResp.StatusCode, string(body))
 		}
 	}
-	
+
 	return nil
 }
 
@@ -1620,34 +1775,34 @@ func (c *Client) GetTimeRemaining(ctx context.Context, gameID string) (time.Dura
 	if err != nil {
 		return 0, fmt.Errorf("failed to get game record: %w", err)
 	}
-	
+
 	// Check if game is still active
 	if status, ok := gameValue["status"].(string); ok && status != "active" {
 		return 0, fmt.Errorf("game is not active")
 	}
-	
+
 	// Get players
 	whiteDID, _ := gameValue["white"].(string)
 	blackDID, _ := gameValue["black"].(string)
-	
+
 	// Determine whose turn it is from FEN
 	fen, _ := gameValue["fen"].(string)
 	fenParts := strings.Split(fen, " ")
 	if len(fenParts) < 2 {
 		return 0, fmt.Errorf("invalid FEN format")
 	}
-	
+
 	var currentPlayerDID string
 	if fenParts[1] == "w" {
 		currentPlayerDID = whiteDID
 	} else {
 		currentPlayerDID = blackDID
 	}
-	
+
 	// Get time control settings from challenge
 	var timeControlType string
 	var daysPerMove int
-	
+
 	if challengeRef, ok := gameValue["challenge"].(map[string]interface{}); ok {
 		challengeURI, _ := challengeRef["uri"].(string)
 		if challengeURI != "" {
@@ -1655,19 +1810,19 @@ func (c *Client) GetTimeRemaining(ctx context.Context, gameID string) (time.Dura
 			if len(challengeParts) >= 5 {
 				challengeRepo := challengeParts[2]
 				challengeRkey := challengeParts[4]
-				
+
 				url := fmt.Sprintf("%s/xrpc/com.atproto.repo.getRecord?repo=%s&collection=app.atchess.challenge&rkey=%s",
 					c.pdsURL, challengeRepo, challengeRkey)
 				resp, err := c.makeRequest("GET", url, nil)
 				if err == nil && resp.StatusCode == http.StatusOK {
 					defer resp.Body.Close()
-					
+
 					var challengeResp struct {
 						Value struct {
 							TimeControl map[string]interface{} `json:"timeControl"`
 						} `json:"value"`
 					}
-					
+
 					if err := json.NewDecoder(resp.Body).Decode(&challengeResp); err == nil {
 						if tc := challengeResp.Value.TimeControl; tc != nil {
 							if tcType, ok := tc["type"].(string); ok {
@@ -1682,13 +1837,13 @@ func (c *Client) GetTimeRemaining(ctx context.Context, gameID string) (time.Dura
 			}
 		}
 	}
-	
+
 	// Default to correspondence with 3 days per move
 	if timeControlType == "" {
 		timeControlType = "correspondence"
 		daysPerMove = 3
 	}
-	
+
 	// For correspondence games, calculate time remaining
 	if timeControlType == "correspondence" {
 		// Get the most recent move
@@ -1696,7 +1851,7 @@ func (c *Client) GetTimeRemaining(ctx context.Context, gameID string) (time.Dura
 		if err != nil {
 			return 0, fmt.Errorf("failed to get last move: %w", err)
 		}
-		
+
 		var lastMoveTime time.Time
 		if lastMove != nil {
 			lastMoveTime, err = time.Parse(time.RFC3339, lastMove.CreatedAt)
@@ -1714,19 +1869,19 @@ func (c *Client) GetTimeRemaining(ctx context.Context, gameID string) (time.Dura
 				return 0, fmt.Errorf("game missing createdAt timestamp")
 			}
 		}
-		
+
 		// Calculate time remaining
 		timeLimit := time.Duration(daysPerMove) * 24 * time.Hour
 		elapsed := time.Since(lastMoveTime)
 		remaining := timeLimit - elapsed
-		
+
 		if remaining < 0 {
 			return 0, nil // Time has expired
 		}
-		
+
 		return remaining, nil
 	}
-	
+
 	// TODO: Implement for other time control types
 	return 0, fmt.Errorf("time control type %s not yet implemented", timeControlType)
 }

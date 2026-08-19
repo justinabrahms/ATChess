@@ -4,14 +4,16 @@ import (
 	"context"
 	"net/http"
 
+	"github.com/justinabrahms/atchess/internal/oauth"
 	"github.com/rs/zerolog/log"
 )
 
 type contextKey string
 
 const (
-	contextKeyDID    contextKey = "authenticated_did"
-	contextKeyHandle contextKey = "authenticated_handle"
+	contextKeyDID     contextKey = "authenticated_did"
+	contextKeyHandle  contextKey = "authenticated_handle"
+	contextKeySession contextKey = "authenticated_session"
 )
 
 // AuthMiddleware validates the session from X-Session-ID header and injects
@@ -40,6 +42,7 @@ func AuthMiddleware(next http.Handler) http.Handler {
 
 		ctx := context.WithValue(r.Context(), contextKeyDID, session.DID)
 		ctx = context.WithValue(ctx, contextKeyHandle, session.Handle)
+		ctx = context.WithValue(ctx, contextKeySession, session)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
@@ -54,4 +57,15 @@ func AuthenticatedDID(r *http.Request) string {
 func AuthenticatedHandle(r *http.Request) string {
 	handle, _ := r.Context().Value(contextKeyHandle).(string)
 	return handle
+}
+
+// authenticatedSession returns the *oauth.Session for the current request,
+// as injected by AuthMiddleware, or nil if there is none (e.g. the request
+// did not go through AuthMiddleware, or no session store was configured).
+// Used by Service.clientFor (atchess-1c9.9) to build a per-user
+// *atproto.Client instead of reusing the protocol-service instance's static
+// configured identity.
+func authenticatedSession(r *http.Request) *oauth.Session {
+	session, _ := r.Context().Value(contextKeySession).(*oauth.Session)
+	return session
 }

@@ -15,21 +15,21 @@ import (
 func LoadPrivateKey() (*ecdsa.PrivateKey, error) {
 	// Try environment variable first
 	keyPEM := os.Getenv("OAUTH_PRIVATE_KEY")
-	
+
 	// If not in env, try file
 	if keyPEM == "" {
 		keyPath := os.Getenv("OAUTH_PRIVATE_KEY_PATH")
 		if keyPath == "" {
 			keyPath = "oauth-private-key.pem"
 		}
-		
+
 		keyBytes, err := os.ReadFile(keyPath)
 		if err != nil {
 			return nil, fmt.Errorf("failed to read private key file: %w", err)
 		}
 		keyPEM = string(keyBytes)
 	}
-	
+
 	// Parse the PEM
 	block, _ := pem.Decode([]byte(keyPEM))
 	if block == nil {
@@ -63,25 +63,25 @@ func ParseJWKToPublicKey(jwk map[string]interface{}) (*ecdsa.PublicKey, error) {
 	if !ok {
 		return nil, fmt.Errorf("missing x coordinate")
 	}
-	
+
 	yStr, ok := jwk["y"].(string)
 	if !ok {
 		return nil, fmt.Errorf("missing y coordinate")
 	}
-	
+
 	xBytes, err := base64.RawURLEncoding.DecodeString(xStr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to decode x: %w", err)
 	}
-	
+
 	yBytes, err := base64.RawURLEncoding.DecodeString(yStr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to decode y: %w", err)
 	}
-	
+
 	x := new(big.Int).SetBytes(xBytes)
 	y := new(big.Int).SetBytes(yBytes)
-	
+
 	return &ecdsa.PublicKey{
 		Curve: elliptic.P256(),
 		X:     x,
