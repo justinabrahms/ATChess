@@ -5,6 +5,69 @@
 # Usage: docker compose -f docker-compose.dual-pds.yml up -d
 #        ./scripts/test-local.sh
 #
+# NETWORKING (see atchess-1c9.17 for the bug this fixes, and its bead notes
+# for the empirical investigation behind this design):
+#
+# The official PDS image (@atproto/pds dist/config/config.js, envToCfg())
+# derives its published serviceEndpoint *only* from PDS_HOSTNAME/PDS_PORT,
+# and only supports two shapes -- there is no env var that sets an arbitrary
+# publicUrl directly:
+#   - PDS_HOSTNAME=localhost       -> serviceEndpoint = http://localhost:${PDS_PORT}
+#   - PDS_HOSTNAME=<anything else> -> serviceEndpoint = https://<hostname>
+#     (no port at all -- assumes a TLS-terminating reverse proxy on 443)
+# For a local, plain-HTTP, two-PDS setup we are therefore locked into the
+# first shape: the literal hostname "localhost" is unconditionally baked into
+# each published serviceEndpoint, and the only thing that can differ between
+# alice and bob is the port (PDS_PORT_ALICE=2583 vs PDS_PORT_BOB=2584).
+#
+# That literal "localhost" creates a genuine conflict between our two
+# reachability requirements:
+#   1. The host (where Go tests run) must be able to reach both endpoints.
+#   2. Containers in the compose network (e.g. one PDS resolving and calling
+#      the other's published serviceEndpoint, as real federation will do)
+#      must ALSO be able to reach both endpoints, using that same literal
+#      "http://localhost:<port>" string -- a client that only knows a DID
+#      cannot rewrite the hostname it resolved.
+# "localhost" cannot be redirected by ordinary compose-level DNS tricks:
+# empirically (tested against this harness's actual container images),
+# `extra_hosts: ["localhost:host-gateway"]` is silently ignored for the name
+# "localhost" specifically (both glibc- and musl-based images special-case
+# it independently of /etc/hosts content -- this is not the case for other,
+# ordinary hostnames, which extra_hosts overrides normally). And
+# `network_mode: host` -- which would make "localhost" mean the same
+# real machine everywhere -- does not reliably proxy container ports back to
+# the actual host in every Docker setup (confirmed here: with
+# network_mode: host, `curl http://localhost:<port>` from the real host got
+# "Connection refused", while the identical port published the ordinary way
+# with `ports:` worked correctly), so it cannot be relied on to satisfy
+# requirement 1.
+#
+# Resolution: pds-alice keeps ordinary bridge networking and publishes BOTH
+# players' ports to the host (`ports:` maps 2583:2583 and 2584:2584) --
+# this alone satisfies requirement 1 for both players, since Docker's own
+# host<->container port forwarding is a real kernel/netns-level mechanism,
+# not a DNS trick. pds-bob then joins pds-alice's network namespace via
+# `network_mode: "service:pds-alice"` instead of getting its own. Inside that
+# *shared* namespace, "localhost" genuinely is the same loopback for both
+# processes (alice bound to :2583, bob bound to :2584), so
+# `docker exec <either container> curl http://localhost:<either port>`
+# reaches the right PDS regardless of which container you exec into --
+# satisfying requirement 2 without touching the "localhost" special-case at
+# all (no extra_hosts override needed; this is Docker's own namespace-sharing
+# primitive, doing exactly what network_mode: host would do but scoped to
+# just these two containers instead of the real host, so it works
+# regardless of whether host networking is reliable in a given environment).
+# pds-bob deliberately has no `ports:` of its own (invalid together with
+# network_mode; alice's `ports:` already covers bob's port) and no separate
+# `volumes`/`healthcheck` restriction -- those remain per-container as usual,
+# only the network stack is shared.
+#
+# local-plc/local-plc-db do not need any of this: PDS_DID_PLC_URL and
+# DATABASE_URL are plain outbound client config we set ourselves (not
+# derived/locked by the PDS image's hostname branching above), so they use
+# normal compose service-name DNS ("local-plc", "local-plc-db") exactly as
+# before -- no "localhost" involved, no conflict.
+#
 # PLC directory mode (see ATCHESS_PLC_URL below and docs/local-pds-setup.md):
 #   - LOCAL (default, `make test-federation-up`): PDS_DID_PLC_URL points at the
 #     real, public https://plc.directory. Account creation publishes REAL,
@@ -75,13 +138,16 @@ services:
     restart: "no"
     container_name: atchess-local-plc
 
+  # Network-namespace owner for both PDSes -- see the NETWORKING comment
+  # above. Publishes both alice's and bob's ports to the host.
   pds-alice:
     image: ghcr.io/bluesky-social/pds:latest
     ports:
-      - "${PDS_PORT_ALICE:-2583}:3000"
+      - "${PDS_PORT_ALICE:-2583}:${PDS_PORT_ALICE:-2583}"
+      - "${PDS_PORT_BOB:-2584}:${PDS_PORT_BOB:-2584}"
     environment:
       - PDS_HOSTNAME=localhost
-      - PDS_PORT=3000
+      - PDS_PORT=${PDS_PORT_ALICE:-2583}
       - PDS_JWT_SECRET=atchess-test-jwt-alice
       - PDS_ADMIN_PASSWORD=admin-alice
       - PDS_INVITE_REQUIRED=false
@@ -101,7 +167,7 @@ services:
     volumes:
       - pds-alice-data:/pds
     healthcheck:
-      test: ["CMD-SHELL", "wget -q --spider http://localhost:3000/xrpc/_health || exit 1"]
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:${PDS_PORT_ALICE:-2583}/xrpc/_health || exit 1"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -109,13 +175,19 @@ services:
     restart: "no"
     container_name: atchess-pds-alice
 
+  # Shares pds-alice's network namespace instead of getting its own -- see
+  # the NETWORKING comment above for why. No `ports:` here: that is invalid
+  # together with `network_mode`, and pds-alice's `ports:` already publishes
+  # bob's port too.
   pds-bob:
     image: ghcr.io/bluesky-social/pds:latest
-    ports:
-      - "${PDS_PORT_BOB:-2584}:3000"
+    network_mode: "service:pds-alice"
+    depends_on:
+      pds-alice:
+        condition: service_started
     environment:
       - PDS_HOSTNAME=localhost
-      - PDS_PORT=3000
+      - PDS_PORT=${PDS_PORT_BOB:-2584}
       - PDS_JWT_SECRET=atchess-test-jwt-bob
       - PDS_ADMIN_PASSWORD=admin-bob
       - PDS_INVITE_REQUIRED=false
@@ -135,7 +207,7 @@ services:
     volumes:
       - pds-bob-data:/pds
     healthcheck:
-      test: ["CMD-SHELL", "wget -q --spider http://localhost:3000/xrpc/_health || exit 1"]
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:${PDS_PORT_BOB:-2584}/xrpc/_health || exit 1"]
       interval: 5s
       timeout: 3s
       retries: 10
