@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "atchess",
+  "project_id": "c1db4681-f1f9-4eb0-b024-d9bf780aa5c2"
+}
