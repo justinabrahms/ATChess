@@ -103,7 +103,7 @@ func NewClientWithDPoP(pdsURL, handle, password string, useDPoP bool) (*Client, 
 	}
 
 	reqBody, _ := json.Marshal(sessionReq)
-	req, err := http.NewRequest("POST", pdsURL+"/xrpc/com.atproto.server.createSession", bytes.NewBuffer(reqBody))
+	req, err := http.NewRequest("POST", xrpcURL(pdsURL, "com.atproto.server.createSession", nil), bytes.NewBuffer(reqBody))
 	if err != nil {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
@@ -202,7 +202,7 @@ func NewClientFromSession(pdsURL, did, handle string, useDPoP bool, auth Authent
 // an app-password session's access token without requiring the user to
 // re-enter their password.
 func RefreshSession(pdsURL, refreshJWT string) (accessJWT, newRefreshJWT string, err error) {
-	req, err := http.NewRequest("POST", pdsURL+"/xrpc/com.atproto.server.refreshSession", nil)
+	req, err := http.NewRequest("POST", xrpcURL(pdsURL, "com.atproto.server.refreshSession", nil), nil)
 	if err != nil {
 		return "", "", fmt.Errorf("failed to create refresh request: %w", err)
 	}
@@ -360,7 +360,7 @@ func (c *Client) createGame(ctx context.Context, opponentDID, color string, rkey
 	}
 
 	reqBody, _ := json.Marshal(createReq)
-	resp, err := c.makeRequest("POST", c.pdsURL+"/xrpc/com.atproto.repo.createRecord", reqBody)
+	resp, err := c.makeRequest("POST", xrpcURL(c.pdsURL, "com.atproto.repo.createRecord", nil), reqBody)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create game record: %w", err)
 	}
@@ -435,7 +435,7 @@ func (c *Client) RecordMove(ctx context.Context, gameURI string, move *chess.Mov
 		}
 
 		putReqBody, _ := json.Marshal(putReq)
-		putResp, err := c.makeRequest("POST", c.pdsURL+"/xrpc/com.atproto.repo.putRecord", putReqBody)
+		putResp, err := c.makeRequest("POST", xrpcURL(c.pdsURL, "com.atproto.repo.putRecord", nil), putReqBody)
 		if err != nil {
 			return fmt.Errorf("failed to update game record: %w", err)
 		}
@@ -479,7 +479,7 @@ func (c *Client) RecordMove(ctx context.Context, gameURI string, move *chess.Mov
 	}
 
 	reqBody, _ := json.Marshal(createReq)
-	resp, err := c.makeRequest("POST", c.pdsURL+"/xrpc/com.atproto.repo.createRecord", reqBody)
+	resp, err := c.makeRequest("POST", xrpcURL(c.pdsURL, "com.atproto.repo.createRecord", nil), reqBody)
 	if err != nil {
 		return fmt.Errorf("failed to create move record: %w", err)
 	}
@@ -515,7 +515,7 @@ func (c *Client) CreateChallenge(ctx context.Context, opponentDID, color, messag
 	}
 
 	reqBody, _ := json.Marshal(createReq)
-	resp, err := c.makeRequest("POST", c.pdsURL+"/xrpc/com.atproto.repo.createRecord", reqBody)
+	resp, err := c.makeRequest("POST", xrpcURL(c.pdsURL, "com.atproto.repo.createRecord", nil), reqBody)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create challenge record: %w", err)
 	}
@@ -574,8 +574,7 @@ func (c *Client) getGameRecord(ctx context.Context, gameURI string) (string, map
 	repo := parts[2] // The DID
 	rkey := parts[4] // The record key
 
-	url := fmt.Sprintf("%s/xrpc/com.atproto.repo.getRecord?repo=%s&collection=app.atchess.game&rkey=%s",
-		c.pdsURL, repo, rkey)
+	url := xrpcURL(c.pdsURL, "com.atproto.repo.getRecord", nil) + fmt.Sprintf("?repo=%s&collection=app.atchess.game&rkey=%s", repo, rkey)
 	resp, err := c.makeRequest("GET", url, nil)
 	if err != nil {
 		return "", nil, fmt.Errorf("failed to get game record: %w", err)
@@ -623,8 +622,7 @@ type StoredMove struct {
 // ListMovesForGame fetches all app.atchess.move records from this client's
 // repository that belong to the given game URI.
 func (c *Client) ListMovesForGame(ctx context.Context, gameURI string) ([]StoredMove, error) {
-	url := fmt.Sprintf("%s/xrpc/com.atproto.repo.listRecords?repo=%s&collection=app.atchess.move&limit=100",
-		c.pdsURL, c.did)
+	url := xrpcURL(c.pdsURL, "com.atproto.repo.listRecords", nil) + fmt.Sprintf("?repo=%s&collection=app.atchess.move&limit=100", c.did)
 	resp, err := c.makeRequest("GET", url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list move records: %w", err)
@@ -692,8 +690,7 @@ func (c *Client) getLatestMoveForGame(ctx context.Context, gameURI string, white
 		if playerDID == "" {
 			continue
 		}
-		url := fmt.Sprintf("%s/xrpc/com.atproto.repo.listRecords?repo=%s&collection=app.atchess.move&limit=100",
-			c.pdsURL, playerDID)
+		url := xrpcURL(c.pdsURL, "com.atproto.repo.listRecords", nil) + fmt.Sprintf("?repo=%s&collection=app.atchess.move&limit=100", playerDID)
 		resp, err := c.makeRequest("GET", url, nil)
 		if err != nil {
 			continue
@@ -759,8 +756,7 @@ func (c *Client) GetGame(ctx context.Context, gameURI string) (*chess.Game, erro
 	repo := parts[2] // The DID
 	rkey := parts[4] // The record key
 
-	url := fmt.Sprintf("%s/xrpc/com.atproto.repo.getRecord?repo=%s&collection=app.atchess.game&rkey=%s",
-		c.pdsURL, repo, rkey)
+	url := xrpcURL(c.pdsURL, "com.atproto.repo.getRecord", nil) + fmt.Sprintf("?repo=%s&collection=app.atchess.game&rkey=%s", repo, rkey)
 	resp, err := c.makeRequest("GET", url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get game record: %w", err)
@@ -851,7 +847,7 @@ func (c *Client) ResolveHandle(ctx context.Context, handle string) (string, erro
 	}
 
 	// Otherwise, resolve via com.atproto.identity.resolveHandle
-	url := fmt.Sprintf("%s/xrpc/com.atproto.identity.resolveHandle?handle=%s", c.pdsURL, handle)
+	url := xrpcURL(c.pdsURL, "com.atproto.identity.resolveHandle", nil) + fmt.Sprintf("?handle=%s", handle)
 
 	resp, err := c.makeRequest("GET", url, nil)
 	if err != nil {
@@ -910,7 +906,7 @@ func (c *Client) CreateChallengeNotification(ctx context.Context, challengedDID,
 	}
 
 	reqBody, _ := json.Marshal(createReq)
-	resp, err := c.makeRequest("POST", c.pdsURL+"/xrpc/com.atproto.repo.createRecord", reqBody)
+	resp, err := c.makeRequest("POST", xrpcURL(c.pdsURL, "com.atproto.repo.createRecord", nil), reqBody)
 	if err != nil {
 		return fmt.Errorf("failed to create challenge notification: %w", err)
 	}
@@ -935,8 +931,7 @@ func (c *Client) CreateChallengeNotification(ctx context.Context, challengedDID,
 // GetChallengeNotifications retrieves pending challenge notifications for the current user
 func (c *Client) GetChallengeNotifications(ctx context.Context) ([]*ChallengeNotification, error) {
 	// List records in the challengeNotification collection
-	url := fmt.Sprintf("%s/xrpc/com.atproto.repo.listRecords?repo=%s&collection=app.atchess.challengeNotification&limit=100",
-		c.pdsURL, c.did)
+	url := xrpcURL(c.pdsURL, "com.atproto.repo.listRecords", nil) + fmt.Sprintf("?repo=%s&collection=app.atchess.challengeNotification&limit=100", c.did)
 	resp, err := c.makeRequest("GET", url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list challenge notifications: %w", err)
@@ -1049,7 +1044,7 @@ func (c *Client) DeleteChallengeNotification(ctx context.Context, notificationUR
 	}
 
 	reqBody, _ := json.Marshal(deleteReq)
-	resp, err := c.makeRequest("POST", c.pdsURL+"/xrpc/com.atproto.repo.deleteRecord", reqBody)
+	resp, err := c.makeRequest("POST", xrpcURL(c.pdsURL, "com.atproto.repo.deleteRecord", nil), reqBody)
 	if err != nil {
 		return fmt.Errorf("failed to delete notification: %w", err)
 	}
@@ -1101,7 +1096,7 @@ func (c *Client) OfferDraw(ctx context.Context, gameID string, message string) (
 	}
 
 	reqBody, _ := json.Marshal(createReq)
-	resp, err := c.makeRequest("POST", c.pdsURL+"/xrpc/com.atproto.repo.createRecord", reqBody)
+	resp, err := c.makeRequest("POST", xrpcURL(c.pdsURL, "com.atproto.repo.createRecord", nil), reqBody)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create draw offer record: %w", err)
 	}
@@ -1145,8 +1140,7 @@ func (c *Client) RespondToDrawOffer(ctx context.Context, drawOfferURI string, ac
 	rkey := parts[4] // The record key
 
 	// Get the draw offer record
-	url := fmt.Sprintf("%s/xrpc/com.atproto.repo.getRecord?repo=%s&collection=app.atchess.drawOffer&rkey=%s",
-		c.pdsURL, repo, rkey)
+	url := xrpcURL(c.pdsURL, "com.atproto.repo.getRecord", nil) + fmt.Sprintf("?repo=%s&collection=app.atchess.drawOffer&rkey=%s", repo, rkey)
 	resp, err := c.makeRequest("GET", url, nil)
 	if err != nil {
 		return fmt.Errorf("failed to get draw offer record: %w", err)
@@ -1201,7 +1195,7 @@ func (c *Client) RespondToDrawOffer(ctx context.Context, drawOfferURI string, ac
 	}
 
 	putReqBody, _ := json.Marshal(putReq)
-	putResp, err := c.makeRequest("POST", c.pdsURL+"/xrpc/com.atproto.repo.putRecord", putReqBody)
+	putResp, err := c.makeRequest("POST", xrpcURL(c.pdsURL, "com.atproto.repo.putRecord", nil), putReqBody)
 	if err != nil {
 		return fmt.Errorf("failed to update draw offer record: %w", err)
 	}
@@ -1238,7 +1232,7 @@ func (c *Client) RespondToDrawOffer(ctx context.Context, drawOfferURI string, ac
 			}
 
 			updateGameReqBody, _ := json.Marshal(updateGameReq)
-			updateGameResp, err := c.makeRequest("POST", c.pdsURL+"/xrpc/com.atproto.repo.putRecord", updateGameReqBody)
+			updateGameResp, err := c.makeRequest("POST", xrpcURL(c.pdsURL, "com.atproto.repo.putRecord", nil), updateGameReqBody)
 			if err != nil {
 				return fmt.Errorf("failed to update game record: %w", err)
 			}
@@ -1304,7 +1298,7 @@ func (c *Client) ResignGame(ctx context.Context, gameID string, reason string) e
 	}
 
 	reqBody, _ := json.Marshal(createReq)
-	resp, err := c.makeRequest("POST", c.pdsURL+"/xrpc/com.atproto.repo.createRecord", reqBody)
+	resp, err := c.makeRequest("POST", xrpcURL(c.pdsURL, "com.atproto.repo.createRecord", nil), reqBody)
 	if err != nil {
 		return fmt.Errorf("failed to create resignation record: %w", err)
 	}
@@ -1332,7 +1326,7 @@ func (c *Client) ResignGame(ctx context.Context, gameID string, reason string) e
 		}
 
 		updateReqBody, _ := json.Marshal(updateReq)
-		updateResp, err := c.makeRequest("POST", c.pdsURL+"/xrpc/com.atproto.repo.putRecord", updateReqBody)
+		updateResp, err := c.makeRequest("POST", xrpcURL(c.pdsURL, "com.atproto.repo.putRecord", nil), updateReqBody)
 		if err != nil {
 			return fmt.Errorf("failed to update game record: %w", err)
 		}
@@ -1350,8 +1344,7 @@ func (c *Client) ResignGame(ctx context.Context, gameID string, reason string) e
 // GetDrawOffers retrieves pending draw offers for a game
 func (c *Client) GetDrawOffers(ctx context.Context, gameID string) ([]*DrawOffer, error) {
 	// List draw offer records
-	url := fmt.Sprintf("%s/xrpc/com.atproto.repo.listRecords?repo=%s&collection=app.atchess.drawOffer&limit=100",
-		c.pdsURL, c.did)
+	url := xrpcURL(c.pdsURL, "com.atproto.repo.listRecords", nil) + fmt.Sprintf("?repo=%s&collection=app.atchess.drawOffer&limit=100", c.did)
 	resp, err := c.makeRequest("GET", url, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list draw offers: %w", err)
@@ -1486,8 +1479,7 @@ func (c *Client) CheckTimeViolation(ctx context.Context, gameID string) (bool, *
 				challengeRepo := challengeParts[2]
 				challengeRkey := challengeParts[4]
 
-				url := fmt.Sprintf("%s/xrpc/com.atproto.repo.getRecord?repo=%s&collection=app.atchess.challenge&rkey=%s",
-					c.pdsURL, challengeRepo, challengeRkey)
+				url := xrpcURL(c.pdsURL, "com.atproto.repo.getRecord", nil) + fmt.Sprintf("?repo=%s&collection=app.atchess.challenge&rkey=%s", challengeRepo, challengeRkey)
 				resp, err := c.makeRequest("GET", url, nil)
 				if err == nil && resp.StatusCode == http.StatusOK {
 					defer resp.Body.Close()
@@ -1609,8 +1601,7 @@ func (c *Client) getLastMove(ctx context.Context, gameID string, excludePlayerDI
 
 	// Check moves from all players
 	for _, playerDID := range players {
-		url := fmt.Sprintf("%s/xrpc/com.atproto.repo.listRecords?repo=%s&collection=app.atchess.move&limit=100",
-			c.pdsURL, playerDID)
+		url := xrpcURL(c.pdsURL, "com.atproto.repo.listRecords", nil) + fmt.Sprintf("?repo=%s&collection=app.atchess.move&limit=100", playerDID)
 		resp, err := c.makeRequest("GET", url, nil)
 		if err != nil {
 			continue // Skip if we can't access this player's moves
@@ -1717,7 +1708,7 @@ func (c *Client) ClaimTimeVictory(ctx context.Context, gameID string) error {
 	}
 
 	reqBody, _ := json.Marshal(createReq)
-	resp, err := c.makeRequest("POST", c.pdsURL+"/xrpc/com.atproto.repo.createRecord", reqBody)
+	resp, err := c.makeRequest("POST", xrpcURL(c.pdsURL, "com.atproto.repo.createRecord", nil), reqBody)
 	if err != nil {
 		return fmt.Errorf("failed to create time violation record: %w", err)
 	}
@@ -1753,7 +1744,7 @@ func (c *Client) ClaimTimeVictory(ctx context.Context, gameID string) error {
 		}
 
 		updateReqBody, _ := json.Marshal(updateReq)
-		updateResp, err := c.makeRequest("POST", c.pdsURL+"/xrpc/com.atproto.repo.putRecord", updateReqBody)
+		updateResp, err := c.makeRequest("POST", xrpcURL(c.pdsURL, "com.atproto.repo.putRecord", nil), updateReqBody)
 		if err != nil {
 			return fmt.Errorf("failed to update game record: %w", err)
 		}
@@ -1811,8 +1802,7 @@ func (c *Client) GetTimeRemaining(ctx context.Context, gameID string) (time.Dura
 				challengeRepo := challengeParts[2]
 				challengeRkey := challengeParts[4]
 
-				url := fmt.Sprintf("%s/xrpc/com.atproto.repo.getRecord?repo=%s&collection=app.atchess.challenge&rkey=%s",
-					c.pdsURL, challengeRepo, challengeRkey)
+				url := xrpcURL(c.pdsURL, "com.atproto.repo.getRecord", nil) + fmt.Sprintf("?repo=%s&collection=app.atchess.challenge&rkey=%s", challengeRepo, challengeRkey)
 				resp, err := c.makeRequest("GET", url, nil)
 				if err == nil && resp.StatusCode == http.StatusOK {
 					defer resp.Body.Close()
