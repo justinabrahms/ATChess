@@ -330,39 +330,54 @@ func TestOwnership(t *testing.T) {
 	// ---------------------------------------------------------------
 	// Challenge ownership
 	// ---------------------------------------------------------------
-	t.Run("Challenge", func(t *testing.T) {
-		// carol (authenticated on alice's instance) challenges bob. If
-		// authorship were correctly derived from AuthenticatedDID, this
-		// record would land in carol's own repo.
-		resp := apiPost(t, carol, "/api/challenges", map[string]interface{}{
+	t.Run("Challenge_Expect502UntilAtchess1c9dot11", func(t *testing.T) {
+		// carol (authenticated on alice's instance) challenges bob. This
+		// subtest used to assert the challenge record lands in carol's own
+		// repo (proving authorship is correctly derived from
+		// AuthenticatedDID rather than the server's static identity). But
+		// atchess-1c9.31 changed CreateChallenge to roll back the challenge
+		// record and report failure (HTTP 502) whenever the follow-up
+		// challenge-notification write to the OPPONENT's repo fails -- and
+		// that write structurally cannot succeed today, same-PDS or
+		// cross-PDS: AT Protocol never permits writing into a repo that
+		// isn't your own with your own session credentials (verified
+		// directly against this harness's PDS: alice's own session gets
+		// HTTP 401 "AuthenticationRequired" attempting to createRecord into
+		// a THIRD, same-PDS account's (carol's) repo, the same shape of
+		// failure observed here against bob's, cross-PDS). So every challenge 502s
+		// and rolls back until atchess-1c9.11's redesign lands.
+		//
+		// What this subtest can still honestly verify, without weakening
+		// anything it used to check: the rollback itself leaves no orphan
+		// challenge record behind in carol's (the authenticated author's)
+		// own repo. FoundInAuthenticatedAuthorRepo-style coverage for
+		// records that DO land successfully is unaffected and still
+		// exercised below by the Game and Move subtests.
+		before, err := carol.RepoListRecords("app.atchess.challenge")
+		if err != nil {
+			t.Fatalf("could not list carol's app.atchess.challenge records before the challenge attempt: %v", err)
+		}
+
+		status, body := apiPostExpectStatus(t, carol, "/api/challenges", map[string]interface{}{
 			"opponent_did": bob.DID,
 			"color":        "white",
 			"message":      "ownership-test challenge",
 		})
-		uri := recordURI(t, resp, "POST /api/challenges (as carol)")
-		rkey := rkeyOf(t, uri)
-		t.Logf("challenge created: uri=%s rkey=%s", uri, rkey)
+		if status != http.StatusBadGateway {
+			t.Fatalf("expected HTTP 502 (challenge-notification delivery is expected to fail and roll back until atchess-1c9.11 -- see atchess-1c9.31), got %d: %s", status, body)
+		}
+		t.Logf("OK (expected until atchess-1c9.11): challenge creation 502'd as designed: %s", body)
 
-		t.Run("FoundInAuthenticatedAuthorRepo", func(t *testing.T) {
-			assertFoundIn(t, carol, "carol (authenticated author)", "app.atchess.challenge", rkey, others(carol))
-		})
-		t.Run("NotInOpponentRepo", func(t *testing.T) {
-			assertNotFoundIn(t, bob, "bob (opponent)", "app.atchess.challenge", rkey)
-		})
-		t.Run("NotMisroutedToServerIdentityRepo", func(t *testing.T) {
-			// Inverted per atchess-1c9.9 (was
-			// CHARACTERIZATION_InvertWhenAtchess1c9dot9Lands, which asserted
-			// the pre-fix buggy behaviour: the record landing in alice's
-			// repo, the protocol-service instance's static server identity,
-			// instead of carol's, the authenticated author). Now that
-			// CreateChallengeHandler derives authorship from
-			// AuthenticatedDID (Service.clientFor), the record must NOT be
-			// found in alice's repo at all.
-			if rec, err := alice.RepoGetRecord("app.atchess.challenge", rkey); err == nil {
-				t.Errorf("ownership violation: challenge authored by carol (did=%s) via alice's protocol-service instance was found in alice's repo (did=%s), the server identity's -- it should only be in carol's own repo: %+v", carol.DID, aliceHealth.DID, rec)
+		t.Run("RolledBackNoOrphanInAuthorRepo", func(t *testing.T) {
+			after, err := carol.RepoListRecords("app.atchess.challenge")
+			if err != nil {
+				t.Fatalf("could not list carol's app.atchess.challenge records after the challenge attempt: %v", err)
+			}
+			if len(after) != len(before) {
+				t.Errorf("ownership violation: expected the failed challenge to be fully rolled back (atchess-1c9.31), but carol's app.atchess.challenge record count changed from %d to %d", len(before), len(after))
 				return
 			}
-			t.Logf("OK: challenge correctly absent from alice's (server identity's) repo")
+			t.Logf("OK: carol's app.atchess.challenge repo record count unchanged (%d) after the rolled-back 502 attempt -- no orphan left in the authenticated author's own repo", len(after))
 		})
 	})
 

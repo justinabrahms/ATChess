@@ -12,16 +12,25 @@
 // full before touching this file -- it is NOT the single bug the bead's
 // input description names; there are two independent, stacked defects):
 //
-//  1. internal/atproto/client.go's CreateChallengeNotification (~line 723)
+//  1. internal/atproto/client.go's CreateChallengeNotification (~line 1100)
 //     issues com.atproto.repo.createRecord with "repo": challengedDID
 //     against c.pdsURL (the CALLER's own configured PDS) -- an attempt to
 //     write into a repo AT Protocol does not permit you to write into (you
 //     may only write to your own repo, on your own PDS, with your own
-//     session credentials). It is invoked as a best-effort side effect of
-//     CreateChallenge (client.go ~line 388) and its error is swallowed
-//     (printed to stdout, never surfaced to the HTTP caller) -- so
-//     POST /api/challenges reports success even though the notification
-//     write below it silently failed.
+//     session credentials), so it is expected to fail. UPDATED BY
+//     ATCHESS-1C9.31 (2026-08-20): this failure is NO LONGER swallowed.
+//     CreateChallenge (client.go ~line 515, see ErrChallengeNotificationFailed)
+//     now treats it as fatal, rolls back the challenge record it just wrote
+//     to its own repo (so no orphan is left behind), and returns a wrapped
+//     error; CreateChallengeHandler (internal/web/service.go) maps that to
+//     HTTP 502, not 200. So POST /api/challenges no longer reports false
+//     success -- it now fails loudly and honestly, which is exactly what
+//     atchess-1c9.31 set out to fix. What remains true, and is what THIS
+//     test still exists to pin, is finding 2 below: even once atchess-1c9.11
+//     makes the notification write actually succeed, delivery still would
+//     not reach the challenged player's own protocol-service instance,
+//     because that instance reads from its own, separate, empty in-process
+//     Store.
 //
 //  2. Separately -- and this is what actually determines what THIS test
 //     observes over HTTP -- internal/web/service.go's
@@ -30,8 +39,10 @@
 //     described in the bead's input) at all, whenever a
 //     *challenge.Store is configured. cmd/protocol/main.go ALWAYS
 //     configures one (challenge.NewStore()), so this handler always takes
-//     the s.challengeStore.ForPlayer(s.client.GetDID()) branch instead:
-//     an IN-MEMORY, IN-PROCESS index (see internal/challenge/store.go's own
+//     the s.challengeStore.ForPlayer(AuthenticatedDID(r)) branch instead
+//     (internal/web/service.go:363, keyed by the authenticated caller of
+//     the request, not by the server's own static identity -- changed by
+//     atchess-1c9.9): an IN-MEMORY, IN-PROCESS index (see internal/challenge/store.go's own
 //     doc comment: "This solves the fundamental AT Protocol limitation
 //     where you cannot write to another user's repository ... we maintain
 //     a local index"). CreateChallengeHandler adds to that same in-memory
@@ -47,14 +58,17 @@
 //     enabled, requires a real relay/BGS to carry events between two
 //     independent PDSes -- not present in this hermetic stack.
 //
-//     So: notification delivery has TWO independent, stacked failures, not
+//     So: notification delivery has TWO independent, stacked defects, not
 //     one. The cross-repo record write described in the bead's input is
 //     itself rejected by AT Protocol (root-caused in finding 1, confirmed
-//     empirically below) -- but even if it somehow succeeded, the HTTP
-//     surface this test exercises (GET /api/challenge-notifications)
-//     would still not consult that record, because it reads an in-process
-//     Store that was never populated on the challenged player's instance.
-//     atchess-1c9.11's redesign needs to account for BOTH.
+//     empirically below) -- and, per the atchess-1c9.31 update to finding 1
+//     above, that rejection is now surfaced honestly (HTTP 502, with the
+//     orphaned challenge record rolled back) rather than swallowed. But
+//     even if that write somehow succeeded, the HTTP surface this test
+//     exercises (GET /api/challenge-notifications) would still not consult
+//     that record, because it reads an in-process Store that was never
+//     populated on the challenged player's instance. atchess-1c9.11's
+//     redesign needs to account for BOTH.
 //
 //  3. DELETE /api/challenge-notifications/{key} ("decline") is wired only
 //     to the legacy repo-record deletion path
@@ -76,6 +90,7 @@ package e2e
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"testing"
@@ -160,10 +175,21 @@ func pollChallengeNotifications(t *testing.T, player *harness.Player, deadline t
 // createSessionRaw authenticates directly against pdsURL via the raw
 // com.atproto.server.createSession XRPC endpoint (bypassing both
 // test/harness's protocol-service session and internal/atproto.Client),
-// so this test can replicate -- and independently capture the verbatim PDS
-// response to -- the exact cross-repo write CreateChallengeNotification
-// (internal/atproto/client.go) performs internally as a swallowed,
-// unobservable side effect of POST /api/challenges.
+// so this test can replicate -- and independently capture -- the exact
+// cross-repo write CreateChallengeNotification (internal/atproto/client.go)
+// performs internally as part of POST /api/challenges. As of atchess-1c9.31
+// this write's failure is no longer swallowed: CreateChallenge wraps it
+// (fmt.Errorf("%w: %v", ErrChallengeNotificationFailed, notificationErr),
+// client.go ~line 584) and CreateChallengeHandler (internal/web/service.go)
+// puts that wrapped error's text -- which itself already contains the
+// verbatim PDS status and body, since CreateChallengeNotification's own
+// error is "cannot write to challenged player's repository: HTTP %d - %s"
+// (client.go ~line 1151) -- straight into the HTTP 502 response body. So
+// the verbatim PDS response IS surfaced to the HTTP caller today, just
+// wrapped inside prefix text. Independently replicating the call here still
+// adds value: it isolates the write from CreateChallenge's rollback and
+// error-wrapping logic entirely, giving a response this test observes
+// directly rather than one it would have to parse out of prefixed text.
 func createSessionRaw(t *testing.T, pdsURL, handle, password string) (accessJwt, did string) {
 	t.Helper()
 	reqBody, _ := json.Marshal(map[string]string{"identifier": handle, "password": password})
@@ -245,39 +271,116 @@ func TestChallengeDelivery(t *testing.T) {
 	// test exists to pin.
 	// ---------------------------------------------------------------
 	var challengeURI string
+	// challengeIsSynthetic is true only when NO real challenge record was
+	// ever created anywhere (the by-handle attempt below failed to produce
+	// one, whether via HTTP 400 or 502, and the DID-fallback attempt that
+	// then ran also 502'd) and challengeURI is instead a fabricated placeholder used
+	// purely so the downstream diagnostic subtests have something to
+	// reference. It gates the wording of those subtests' messages so they
+	// state what is actually true of the current run rather than assuming a
+	// real challenge exists.
+	challengeIsSynthetic := false
+	// handleResolutionOK reflects whether ResolveHandle itself succeeded
+	// (i.e. alice's instance got as far as calling CreateChallenge), NOT
+	// whether a challenge was actually created end-to-end. It is false only
+	// on HTTP 400 (the atchess-1c9.5 handle-resolution defect); it is true
+	// on both HTTP 502 (resolution worked, challenge-notification delivery
+	// failed -- the atchess-1c9.31/.11 state) and HTTP 200 (fully fixed).
+	// See test/e2e/federation_test.go's HandleResolution subtest, which
+	// this mirrors -- conflating 502 with the .5 defect here previously
+	// produced a false "handleResolutionOK=false" in this test's SUMMARY
+	// line that directly contradicted TestFederation.
 	handleResolutionOK := false
+	// challengeCreatedByHandle is true only when the by-handle attempt
+	// itself returned HTTP 200 with a real challengeURI, so the DID
+	// fallback below is skipped. It is deliberately distinct from
+	// handleResolutionOK: a 502 means resolution worked but no challenge
+	// exists yet, so the fallback still needs to run to obtain a
+	// challengeURI (real or, today, synthetic) for the rest of the test.
+	challengeCreatedByHandle := false
 	t.Run("AliceChallengesBobByHandle_PassesEvenIfDegradedToDIDFallback_SeeAtchess1c9dot5", func(t *testing.T) {
 		status, body := apiPostExpectStatus(t, alice, "/api/challenges", map[string]interface{}{
 			"opponent_did": accounts.Bob.Handle,
 			"color":        "white",
 			"message":      "challenge-delivery test challenge",
 		})
-		if status != http.StatusOK {
-			t.Logf("DEGRADED: challenging bob by handle (%q) failed (HTTP %d: %s) -- consistent with the atchess-1c9.5 handle-resolution defect (ResolveHandle queries alice's own PDS, %s, which cannot resolve a handle hosted on bob's PDS, %s). Falling back to bob's known DID.", accounts.Bob.Handle, status, body, alice.PDSURL, accounts.Bob.PDSURL)
-			return
+		switch status {
+		case http.StatusBadRequest:
+			// Resolution itself failed -- the atchess-1c9.5 defect
+			// (ResolveHandle queries alice's own PDS, which cannot resolve
+			// a handle hosted on bob's PDS). Believed fixed by
+			// atchess-1c9.10; if seen, may be a regression. Logged, not
+			// failed: this subtest's job is to feed the rest of the test a
+			// challenge (degrading to the DID fallback below), not to
+			// re-pin atchess-1c9.5 -- TestFederation already does that.
+			t.Logf("DEGRADED: challenging bob by handle (%q) failed with HTTP 400 -- consistent with the atchess-1c9.5 handle-resolution defect (ResolveHandle queries alice's own PDS, %s, which cannot resolve a handle hosted on bob's PDS, %s). Falling back to bob's known DID. Body: %s", accounts.Bob.Handle, alice.PDSURL, accounts.Bob.PDSURL, body)
+		case http.StatusBadGateway:
+			// Resolution SUCCEEDED (alice's instance got past ResolveHandle
+			// to CreateChallenge, per atchess-1c9.10) -- the 502 is the
+			// separate, expected atchess-1c9.31/.11 challenge-notification-
+			// delivery failure, NOT the atchess-1c9.5 handle-resolution
+			// defect. No challenge record was created or persisted
+			// (CreateChallenge rolls it back). Falling back to bob's known
+			// DID below purely to obtain a challengeURI for the diagnostic
+			// subtests -- resolution itself is not in question here.
+			handleResolutionOK = true
+			t.Logf("OK (handle resolution succeeded; the 502 is the separate, expected atchess-1c9.31/.11 challenge-notification-delivery failure, NOT the atchess-1c9.5 defect): challenging bob by handle (%q) returned HTTP 502: %s", accounts.Bob.Handle, body)
+		case http.StatusOK:
+			var decoded map[string]interface{}
+			if err := json.Unmarshal([]byte(body), &decoded); err != nil {
+				t.Fatalf("challenge-by-handle: HTTP 200 but undecodable body: %v (body: %s)", err, body)
+			}
+			challengeURI = recordURI(t, decoded, "POST /api/challenges (as alice, by handle)")
+			handleResolutionOK = true
+			challengeCreatedByHandle = true
+			t.Logf("OK: alice challenged bob by handle %q -- challenge uri=%s", accounts.Bob.Handle, challengeURI)
+		default:
+			t.Fatalf("challenge-by-handle: unexpected status %d (want 400 -- resolution itself failed, the atchess-1c9.5 defect -- or 502 -- resolution ok, delivery failed, the atchess-1c9.31/.11 state -- or 200 -- fully fixed): %s", status, body)
 		}
-		var decoded map[string]interface{}
-		if err := json.Unmarshal([]byte(body), &decoded); err != nil {
-			t.Fatalf("challenge-by-handle: HTTP 200 but undecodable body: %v (body: %s)", err, body)
-		}
-		challengeURI = recordURI(t, decoded, "POST /api/challenges (as alice, by handle)")
-		handleResolutionOK = true
-		t.Logf("OK: alice challenged bob by handle %q -- challenge uri=%s", accounts.Bob.Handle, challengeURI)
 	})
 
-	if !handleResolutionOK {
-		t.Logf("DEGRADED FALLBACK: using bob's known DID (%s) directly instead of his handle (%q), because AliceChallengesBobByHandle failed above", accounts.Bob.DID, accounts.Bob.Handle)
-		resp := apiPost(t, alice, "/api/challenges", map[string]interface{}{
+	if !challengeCreatedByHandle {
+		t.Logf("DEGRADED FALLBACK: using bob's known DID (%s) directly instead of his handle (%q), because no challenge was created via the by-handle attempt above (see above for why: either handle resolution itself failed -- HTTP 400, the atchess-1c9.5 defect -- or resolution worked but delivery failed -- HTTP 502, the expected atchess-1c9.31/.11 state)", accounts.Bob.DID, accounts.Bob.Handle)
+		// Use apiPostExpectStatus, not apiPost: as of atchess-1c9.31,
+		// CreateChallenge rolls back the challenge record and returns 502
+		// whenever the follow-up challenge-notification write fails --
+		// which it structurally always does today (see atchess-1c9.31's
+		// fix-pass notes; this is the same expected failure the DID
+		// fallback below is designed to survive, not a fresh defect).
+		// apiPost would Fatalf the whole test function here, silently
+		// discarding every downstream diagnostic subtest this file exists
+		// to run (BobSeesPendingChallengeFromAlice, CrossRepoWriteDiagnostic,
+		// the decline subtests, DirectPDSCorroboration) -- exactly the
+		// regression this fix-pass exists to correct. TestChallengeDelivery
+		// must still FAIL overall (it remains atchess-1c9.11's gate), but it
+		// must fail informatively, with all its diagnostics reached and
+		// reported.
+		status, body := apiPostExpectStatus(t, alice, "/api/challenges", map[string]interface{}{
 			"opponent_did": accounts.Bob.DID,
 			"color":        "white",
 			"message":      "challenge-delivery test challenge (fallback by DID)",
 		})
-		challengeURI = recordURI(t, resp, "POST /api/challenges (as alice, fallback by DID)")
-		t.Logf("challenge created via DID fallback: uri=%s", challengeURI)
+		switch status {
+		case http.StatusOK:
+			var decoded map[string]interface{}
+			if err := json.Unmarshal([]byte(body), &decoded); err != nil {
+				t.Fatalf("challenge-by-DID fallback: HTTP 200 but undecodable body: %v (body: %s)", err, body)
+			}
+			challengeURI = recordURI(t, decoded, "POST /api/challenges (as alice, fallback by DID)")
+			t.Logf("challenge created via DID fallback: uri=%s", challengeURI)
+		case http.StatusBadGateway:
+			t.Errorf("EXPECTED UNTIL ATCHESS-1C9.11: challenge-by-DID fallback also 502'd (atchess-1c9.31: challenge-notification delivery cannot succeed today, so CreateChallenge rolls back the challenge record instead of reporting false success). No challenge record was created or persisted anywhere as a result. Body: %s\n"+
+				"The diagnostic subtests below use a SYNTHETIC placeholder challenge URI (clearly logged as such) purely so they still have something to reference; it does not correspond to any record that was ever actually written.", body)
+			challengeIsSynthetic = true
+			challengeURI = fmt.Sprintf("at://%s/app.atchess.challenge/synthetic-rolledback-%d", alice.DID, time.Now().UnixNano())
+			t.Logf("using SYNTHETIC placeholder challenge uri for downstream diagnostics only: %s", challengeURI)
+		default:
+			t.Fatalf("challenge-by-DID fallback returned an unexpected status (neither 200 nor the expected-until-atchess-1c9.11 502): HTTP %d: %s", status, body)
+		}
 	}
 
 	if challengeURI == "" {
-		t.Fatalf("cannot continue: no challenge record was created by either the handle path or the DID fallback")
+		t.Fatalf("cannot continue: no challenge record (real or synthetic placeholder) is available from either the handle path or the DID fallback")
 	}
 	challengeRkey := rkeyOf(t, challengeURI)
 
@@ -297,8 +400,28 @@ func TestChallengeDelivery(t *testing.T) {
 			return
 		}
 		if len(notifications) == 0 {
-			t.Errorf("challenge delivery defect confirmed: bob (authenticated against his own protocol-service instance, %s) sees ZERO pending challenges after polling for %s, even though alice created one (uri=%s) directed at him (did=%s). Last response body: %s.\n"+
-				"Root cause (see this file's package doc comment for the full trace): GetChallengeNotificationsHandler (internal/web/service.go) reads bob's own in-PROCESS challenge.Store, which was never populated -- the challenge was added to ALICE's instance's own in-memory Store (by CreateChallengeHandler, on her process only), and the firehose that could otherwise bridge the two processes' Stores is disabled in this harness (FIREHOSE_ENABLED=false) and requires a real relay even when enabled. Independently, the record-based delivery path (atproto.Client.CreateChallengeNotification, invoked as a best-effort side effect of CreateChallenge) is expected to fail outright because it attempts to write into bob's repo via alice's own PDS -- see the CrossRepoWriteDiagnostic and DirectPDSCorroboration subtests below for the verbatim evidence.",
+			if challengeIsSynthetic {
+				// The CURRENT, EXPECTED state as of atchess-1c9.31: no
+				// challenge was ever actually created anywhere. The
+				// by-handle attempt above did not produce one (either a
+				// 400, the atchess-1c9.5 defect, or a 502), and the
+				// DID-fallback attempt that then ran also returned HTTP
+				// 502 (CreateChallenge's challenge-notification write to
+				// bob's own repo cannot succeed today, so it rolls back the
+				// challenge record rather than persisting it or reporting
+				// false success). challengeURI here is a SYNTHETIC
+				// placeholder used only so this and later subtests have
+				// something to reference -- it does not correspond to any
+				// record that was ever written anywhere, on either alice's
+				// or bob's instance/repo, so of course bob's Store (and
+				// alice's) is empty.
+				t.Errorf("bob (authenticated against his own protocol-service instance, %s) sees ZERO pending challenges after polling for %s. This is the CURRENT, EXPECTED state, not evidence of the historical Store-bridging defect: no challenge record was ever actually created anywhere -- see the AliceChallengesBobByHandle subtest above (which did not produce a real challenge) and the DID fallback that then ran, which returned HTTP 502 (atchess-1c9.31: CreateChallenge rolls back the challenge record whenever the challenge-notification write to bob's repo fails, which it structurally always does today). challengeURI=%s used here is a SYNTHETIC placeholder for diagnostics only, not a real record. Last response body: %s.\n"+
+					"See the CrossRepoWriteDiagnostic and DirectPDSCorroboration subtests below for the verbatim evidence of WHY the notification write itself fails, and this file's package doc comment (finding 2) for the separate, still-live Store-bridging defect that would remain even once atchess-1c9.11 makes the write succeed.",
+					bob.ProtocolURL, elapsed, challengeURI, body)
+				return
+			}
+			t.Errorf("challenge delivery defect confirmed: bob (authenticated against his own protocol-service instance, %s) sees ZERO pending challenges after polling for %s, even though a REAL challenge record was created (uri=%s) directed at him (did=%s). Last response body: %s.\n"+
+				"Root cause (see this file's package doc comment, finding 2, for the full trace): GetChallengeNotificationsHandler (internal/web/service.go) reads bob's own in-PROCESS challenge.Store, which was never populated -- the challenge was added to ALICE's instance's own in-memory Store (by CreateChallengeHandler, on her process only), and the firehose that could otherwise bridge the two processes' Stores is disabled in this harness (FIREHOSE_ENABLED=false) and requires a real relay even when enabled.",
 				bob.ProtocolURL, elapsed, challengeURI, bob.DID, body)
 			return
 		}
@@ -330,10 +453,14 @@ func TestChallengeDelivery(t *testing.T) {
 	// ---------------------------------------------------------------
 	// Determine what actually happens to the cross-repo write:
 	// independently replicate the exact call
-	// atproto.Client.CreateChallengeNotification makes internally (and
-	// whose error is silently swallowed by CreateChallenge), so its
-	// verbatim PDS response is captured and reported rather than merely
-	// inferred from the empty notification list above.
+	// atproto.Client.CreateChallengeNotification makes internally (whose
+	// error, as of atchess-1c9.31, CreateChallenge now treats as fatal --
+	// rolling back the challenge record and returning HTTP 502 -- rather
+	// than silently swallowing it), so its verbatim PDS response is
+	// captured directly and in isolation, rather than only observed as
+	// text embedded (wrapped in prefix wording) inside CreateChallenge's
+	// own 502 response body -- see the doc comment on createSessionRaw
+	// above for where that embedding happens.
 	// ---------------------------------------------------------------
 	t.Run("CrossRepoWriteDiagnostic", func(t *testing.T) {
 		aliceAccessJwt, aliceDID := createSessionRaw(t, accounts.Alice.PDSURL, accounts.Alice.Handle, accounts.Alice.Password)
@@ -386,7 +513,16 @@ func TestChallengeDelivery(t *testing.T) {
 			t.Logf("decline attempt (real notification present): HTTP %d: %s", status, body)
 			return
 		}
-		t.Errorf("cannot genuinely test decline: bob was never delivered a real challenge notification (see BobSeesPendingChallengeFromAlice above), so there is no legitimate notification key to decline. Attempting DELETE with the best available candidate key (the original challenge's rkey, %q) purely to document actual behavior, not as a substitute for real coverage.", challengeRkey)
+		// candidateKeyDescription names what challengeRkey actually is: the
+		// rkey of a REAL challenge record only when one was created (either
+		// the by-handle or DID-fallback attempt above returned HTTP 200);
+		// when challengeIsSynthetic, no real challenge was ever created, so
+		// it is only the fabricated placeholder's rkey.
+		candidateKeyDescription := "the original challenge's rkey"
+		if challengeIsSynthetic {
+			candidateKeyDescription = "the synthetic placeholder's rkey (no original challenge exists)"
+		}
+		t.Errorf("cannot genuinely test decline: bob was never delivered a real challenge notification (see BobSeesPendingChallengeFromAlice above), so there is no legitimate notification key to decline. Attempting DELETE with the best available candidate key (%s, %q) purely to document actual behavior, not as a substitute for real coverage.", candidateKeyDescription, challengeRkey)
 
 		req, err := http.NewRequest(http.MethodDelete, bob.ProtocolURL+"/api/challenge-notifications/"+challengeRkey, nil)
 		if err != nil {
@@ -398,7 +534,7 @@ func TestChallengeDelivery(t *testing.T) {
 		}
 		defer resp.Body.Close()
 		body, _ := io.ReadAll(resp.Body)
-		t.Logf("DELETE /api/challenge-notifications/%s (as bob, candidate key = original challenge's rkey): HTTP %d: %s -- this exercises finding 3 from the package doc comment (DeleteChallengeNotificationHandler requires a FULL at:// URI in the route's {key} segment, which mux can never supply, since {key} is a single non-slash path segment; expect this to fail structurally, independent of federation)", challengeRkey, resp.StatusCode, string(body))
+		t.Logf("DELETE /api/challenge-notifications/%s (as bob, candidate key = %s): HTTP %d: %s -- this exercises finding 3 from the package doc comment (DeleteChallengeNotificationHandler requires a FULL at:// URI in the route's {key} segment, which mux can never supply, since {key} is a single non-slash path segment; expect this to fail structurally, independent of federation)", challengeRkey, candidateKeyDescription, resp.StatusCode, string(body))
 
 		// Whatever DELETE did or didn't do, re-confirm bob's list is still
 		// empty of alice's challenge -- consistent either way, since it was
@@ -419,19 +555,32 @@ func TestChallengeDelivery(t *testing.T) {
 	// Step 6: alice must NOT see her own outbound challenge in her own
 	// inbound list.
 	//
-	// WEAK WHILE DELIVERY IS BROKEN (atchess-1c9.11): alice's own
-	// protocol-service instance's in-process challenge.Store genuinely does
-	// hold the challenge she just created (CreateChallengeHandler adds it on
-	// her process), so ForPlayer(aliceDID) returning empty here DOES
-	// genuinely exercise the challenged-DID keying -- this is not a
-	// vacuous/no-op assertion. But it cannot distinguish a correctly working
-	// filter from delivery being broken everywhere (as BobSeesPendingChallengeFromAlice
-	// above establishes it currently is): with zero notifications delivered
-	// to anyone, alice trivially "does not see" her own outbound one too.
-	// The subtest name discloses this so a bare PASS is not read as full
-	// coverage of the filter.
+	// EXPLICITLY INERT WHILE challengeIsSynthetic (the CURRENT, EXPECTED
+	// state as of atchess-1c9.31): as of atchess-1c9.31, CreateChallengeHandler
+	// returns HTTP 502 BEFORE reaching s.challengeStore.Add
+	// (internal/web/service.go:332 vs :343) whenever challenge-notification
+	// delivery fails -- which it structurally always does today (see this
+	// file's package doc comment). So in that state, no challenge was ever
+	// added to ANY Store, including alice's own: her in-process
+	// challenge.Store is empty. The assertion below ("alice's inbound list
+	// does not contain her own outbound challenge") therefore holds
+	// TRIVIALLY in that state -- an empty list cannot contain anything -- so
+	// it is deliberately kept (not deleted), left inert, and disclosed as
+	// such by both its own name and the t.Logf below, rather than being
+	// mistaken for coverage of the challenged-DID filter. It is kept rather
+	// than deleted because it starts asserting something REAL automatically
+	// the moment a real challenge is created (challengeIsSynthetic == false,
+	// i.e. either the by-handle or DID-fallback attempt above returned HTTP
+	// 200): in that case alice's own Store genuinely does hold the
+	// challenge she just created (CreateChallengeHandler's s.challengeStore.Add
+	// is reached on success), so ForPlayer(aliceDID) returning empty there
+	// DOES genuinely exercise the challenged-DID keying. See atchess-1c9.11
+	// for when that becomes the normal case.
 	// ---------------------------------------------------------------
 	t.Run("AliceDoesNotSeeOwnOutboundChallenge_WeakWhileDeliveryBroken_SeeAtchess1c9dot11", func(t *testing.T) {
+		if challengeIsSynthetic {
+			t.Logf("INERT: no real challenge was ever created (the by-handle attempt above did not produce one -- either a 400 or a 502 -- and the DID-fallback attempt that then ran also returned HTTP 502), so alice's own challenge.Store was never populated and this assertion holds vacuously -- it is NOT evidence the challenged-DID filter works. See atchess-1c9.11.")
+		}
 		status, notifications, body := getChallengeNotifications(t, alice)
 		if status != http.StatusOK {
 			t.Errorf("GET /api/challenge-notifications (as alice) returned HTTP %d: %s", status, body)
@@ -443,7 +592,11 @@ func TestChallengeDelivery(t *testing.T) {
 				return
 			}
 		}
-		t.Logf("OK: alice's inbound list does not contain her own outbound challenge (list: %+v)", notifications)
+		if challengeIsSynthetic {
+			t.Logf("OK (VACUOUSLY -- see INERT log above): alice's inbound list does not contain her own outbound challenge (list: %+v)", notifications)
+		} else {
+			t.Logf("OK (real assertion -- a real challenge exists and alice's own Store was populated): alice's inbound list does not contain her own outbound challenge (list: %+v)", notifications)
+		}
 	})
 
 	// ---------------------------------------------------------------
@@ -478,5 +631,5 @@ func TestChallengeDelivery(t *testing.T) {
 		}
 	})
 
-	t.Logf("SUMMARY: challengeURI=%s handleResolutionOK=%v bobSawNotificationViaAPI=%v", challengeURI, handleResolutionOK, bobSawNotification)
+	t.Logf("SUMMARY: challengeURI=%s challengeIsSynthetic=%v handleResolutionOK=%v bobSawNotificationViaAPI=%v", challengeURI, challengeIsSynthetic, handleResolutionOK, bobSawNotification)
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -320,6 +321,17 @@ func (s *Service) CreateChallengeHandler(w http.ResponseWriter, r *http.Request)
 	ch, err := client.CreateChallenge(context.Background(), opponentDID, req.Color, req.Message)
 	if err != nil {
 		log.Error().Err(err).Msg("Failed to create challenge")
+		if errors.Is(err, atproto.ErrChallengeNotificationFailed) {
+			// The challenge record write itself succeeded, but delivering
+			// the notification to the challenged player's own repository --
+			// a write against a PDS we don't control -- failed and was
+			// rolled back. That's an upstream dependency failing, not a
+			// defect in this service, so 502 (Bad Gateway) fits better than
+			// 500: it tells the caller (and any monitoring) that the fault
+			// is downstream, in AT Protocol federation, not here.
+			http.Error(w, fmt.Sprintf("Failed to create challenge: %v", err), http.StatusBadGateway)
+			return
+		}
 		http.Error(w, "Failed to create challenge", http.StatusInternalServerError)
 		return
 	}

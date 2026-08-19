@@ -3,11 +3,86 @@ package atproto
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
 )
+
+// TestCreateChallenge_NotificationFailureRollsBackAndReturnsError is a
+// regression test for atchess-1c9.31: CreateChallenge used to log a failed
+// notification write with fmt.Printf and return success anyway, leaving an
+// orphaned app.atchess.challenge record and telling the caller a challenge
+// was created when the challenged player was never notified. This asserts
+// CreateChallenge instead rolls back the challenge record and returns
+// ErrChallengeNotificationFailed.
+func TestCreateChallenge_NotificationFailureRollsBackAndReturnsError(t *testing.T) {
+	var deleteCalled bool
+	var deletedRkey string
+
+	mockPDS := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/xrpc/com.atproto.server.createSession":
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"accessJwt": "test-jwt",
+				"did":       "did:plc:challenger123",
+				"handle":    "challenger.test",
+			})
+		case "/xrpc/com.atproto.repo.createRecord":
+			var req map[string]interface{}
+			json.NewDecoder(r.Body).Decode(&req)
+			switch req["collection"] {
+			case "app.atchess.challenge":
+				w.Header().Set("Content-Type", "application/json")
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"uri": "at://did:plc:challenger123/app.atchess.challenge/chal789",
+					"cid": "challenge-cid",
+				})
+			case "app.atchess.challengeNotification":
+				// Simulate the real-world failure this bead fixes: the
+				// challenged player's repo rejects the cross-repo write.
+				w.WriteHeader(http.StatusForbidden)
+				json.NewEncoder(w).Encode(map[string]interface{}{"error": "AccountNotFound"})
+			default:
+				w.WriteHeader(http.StatusNotFound)
+			}
+		case "/xrpc/com.atproto.repo.deleteRecord":
+			deleteCalled = true
+			var req map[string]interface{}
+			json.NewDecoder(r.Body).Decode(&req)
+			deletedRkey, _ = req["rkey"].(string)
+			w.WriteHeader(http.StatusOK)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer mockPDS.Close()
+
+	client, err := NewClient(mockPDS.URL, "challenger.test", "password")
+	if err != nil {
+		t.Fatalf("Failed to create client: %v", err)
+	}
+
+	challenge, err := client.CreateChallenge(context.Background(), "did:plc:challenged456", "white", "gg")
+
+	if err == nil {
+		t.Fatal("expected CreateChallenge to return an error when the notification write fails, got nil (unqualified success)")
+	}
+	if challenge != nil {
+		t.Errorf("expected nil challenge on failure, got %+v", challenge)
+	}
+	if !errors.Is(err, ErrChallengeNotificationFailed) {
+		t.Errorf("expected error to wrap ErrChallengeNotificationFailed, got: %v", err)
+	}
+	if !deleteCalled {
+		t.Error("expected the orphaned challenge record to be rolled back via deleteRecord, but it was never called")
+	}
+	if deletedRkey != "chal789" {
+		t.Errorf("expected rollback to delete rkey chal789, got %q", deletedRkey)
+	}
+}
 
 func TestCreateChallengeNotification(t *testing.T) {
 	// Mock server to simulate PDS

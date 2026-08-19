@@ -7,6 +7,7 @@ import (
 	"encoding/base32"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -16,7 +17,18 @@ import (
 
 	"github.com/justinabrahms/atchess/internal/auth"
 	"github.com/justinabrahms/atchess/internal/chess"
+	"github.com/rs/zerolog/log"
 )
+
+// ErrChallengeNotificationFailed indicates a challenge record was written to
+// the challenger's own repository, but the corresponding notification could
+// not be delivered to the challenged player's repository (e.g. their PDS
+// rejected the cross-repo write, is unreachable, or the account was not
+// found). CreateChallenge rolls back the challenge record in this case and
+// wraps the underlying error with this sentinel so callers -- notably the
+// HTTP handler -- can distinguish "upstream delivery failed" from other
+// failure modes. See atchess-1c9.31.
+var ErrChallengeNotificationFailed = errors.New("challenge notification delivery failed")
 
 type Client struct {
 	pdsURL      string
@@ -542,19 +554,34 @@ func (c *Client) CreateChallenge(ctx context.Context, opponentDID, color, messag
 		return nil, fmt.Errorf("failed to decode response: %w", err)
 	}
 
-	// Try to create a notification in the challenged player's repository
-	// This is best-effort - it may fail if we can't write to their repo
+	// Create a notification in the challenged player's repository. Delivery
+	// of this notification is not best-effort: it is how the challenged
+	// player learns the challenge exists at all. If it fails, the challenge
+	// record we just wrote to our own repo is an orphan nobody was told
+	// about and nobody will ever respond to, so we roll it back and fail
+	// the whole operation rather than reporting success (atchess-1c9.31).
 	timeControl := map[string]interface{}{
 		"type":        "correspondence",
 		"daysPerMove": 3,
 	}
 
-	// Attempt to create notification but don't fail the challenge creation if it fails
 	notificationErr := c.CreateChallengeNotification(ctx, opponentDID, createResp.URI, createResp.CID, c.handle, color, message, timeControl)
 	if notificationErr != nil {
-		// Log the error but don't fail the challenge creation
-		// In a real implementation, you might want to log this properly
-		fmt.Printf("Warning: Could not create challenge notification: %v\n", notificationErr)
+		log.Error().
+			Err(notificationErr).
+			Str("challengeURI", createResp.URI).
+			Str("challengedDID", opponentDID).
+			Msg("challenge notification delivery failed; rolling back challenge record")
+
+		if delErr := c.deleteChallengeRecord(createResp.URI); delErr != nil {
+			log.Error().
+				Err(delErr).
+				Str("challengeURI", createResp.URI).
+				Msg("failed to roll back orphaned challenge record after notification delivery failure; manual cleanup required")
+			return nil, fmt.Errorf("%w: %v (rollback of orphaned challenge record %s also failed: %v)", ErrChallengeNotificationFailed, notificationErr, createResp.URI, delErr)
+		}
+
+		return nil, fmt.Errorf("%w: %v", ErrChallengeNotificationFailed, notificationErr)
 	}
 
 	return &chess.Challenge{
@@ -568,6 +595,40 @@ func (c *Client) CreateChallenge(ctx context.Context, opponentDID, color, messag
 		CreatedAt:      challengeRecord["createdAt"].(string),
 		ExpiresAt:      challengeRecord["expiresAt"].(string),
 	}, nil
+}
+
+// deleteChallengeRecord deletes an app.atchess.challenge record from the
+// challenger's own repository (c.did). It is used by CreateChallenge to roll
+// back a just-created challenge record when the follow-up notification write
+// to the challenged player's repository fails, so a failed CreateChallenge
+// call never leaves a challenge record behind that the caller was not told
+// about (atchess-1c9.31).
+func (c *Client) deleteChallengeRecord(challengeURI string) error {
+	parts := strings.Split(challengeURI, "/")
+	if len(parts) < 5 || !strings.HasPrefix(challengeURI, "at://") {
+		return fmt.Errorf("invalid challenge URI format: %s", challengeURI)
+	}
+	rkey := parts[4]
+
+	deleteReq := map[string]interface{}{
+		"repo":       c.did,
+		"collection": "app.atchess.challenge",
+		"rkey":       rkey,
+	}
+
+	reqBody, _ := json.Marshal(deleteReq)
+	resp, err := c.makeRequest("POST", xrpcURL(c.pdsURL, "com.atproto.repo.deleteRecord", nil), reqBody)
+	if err != nil {
+		return fmt.Errorf("failed to delete challenge record: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("failed to delete challenge record: HTTP %d - %s", resp.StatusCode, string(body))
+	}
+
+	return nil
 }
 
 // getGameRecord fetches a game record and returns its CID and value
@@ -1082,11 +1143,21 @@ func (c *Client) CreateChallengeNotification(ctx context.Context, challengedDID,
 		// We don't have permission to write to the challenged player's repo
 		// This is expected in many cases (different PDS, privacy settings, etc.)
 		body, _ := io.ReadAll(resp.Body)
+		log.Error().
+			Int("status", resp.StatusCode).
+			Str("body", string(body)).
+			Str("challengedDID", challengedDID).
+			Msg("cannot write challenge notification to challenged player's repository")
 		return fmt.Errorf("cannot write to challenged player's repository: HTTP %d - %s", resp.StatusCode, string(body))
 	}
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
+		log.Error().
+			Int("status", resp.StatusCode).
+			Str("body", string(body)).
+			Str("challengedDID", challengedDID).
+			Msg("failed to create challenge notification")
 		return fmt.Errorf("failed to create challenge notification: HTTP %d - %s", resp.StatusCode, string(body))
 	}
 
