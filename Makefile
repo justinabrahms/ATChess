@@ -1,4 +1,4 @@
-.PHONY: build protocol web run-protocol run-web dev-protocol dev-web dev test test-protocol test-web test-integration test-e2e test-local test-local-up test-local-down test-federation-up test-federation-down lint fmt clean
+.PHONY: build protocol web run-protocol run-web dev-protocol dev-web dev test test-protocol test-web test-integration test-e2e test-local test-local-up test-local-down test-federation-up test-federation-up-ci test-federation-down lint fmt clean
 
 # Build commands
 build: protocol web
@@ -66,12 +66,26 @@ test-local-down:
 	./scripts/test-local.sh --down
 
 # Dual-PDS federated test harness (two independent PDS instances + two accounts)
+#
+# test-federation-up: LOCAL mode. Uses the real, public https://plc.directory
+#   (see docker-compose.dual-pds.yml for why). Convenient for ad-hoc dev runs;
+#   do not loop this repeatedly, it permanently publishes DID documents.
+#
+# test-federation-up-ci: CI mode. Brings up a hermetic local-plc service
+#   first and waits for it to report healthy, then starts the PDSes pointed
+#   at it instead of the public directory. Same harness/account script as
+#   local mode -- only PDS_DID_PLC_URL differs.
 test-federation-up:
 	docker compose -f docker-compose.dual-pds.yml up -d
 	./scripts/create-dual-pds-accounts.sh
 
+test-federation-up-ci:
+	docker compose -f docker-compose.dual-pds.yml --profile ci up -d --wait local-plc
+	ATCHESS_PLC_URL=http://local-plc:2582 docker compose -f docker-compose.dual-pds.yml --profile ci up -d
+	./scripts/create-dual-pds-accounts.sh
+
 test-federation-down:
-	docker compose -f docker-compose.dual-pds.yml down -v
+	docker compose -f docker-compose.dual-pds.yml --profile ci down -v
 
 # Code quality
 lint:

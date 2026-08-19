@@ -2,6 +2,14 @@
 
 This guide helps you set up a local AT Protocol Personal Data Server (PDS) for testing ATChess.
 
+> **Dual-PDS federated harness / PLC directory note:** the separate dual-PDS
+> test harness (`docker-compose.dual-pds.yml`, `make test-federation-up`) is
+> documented in [docs/testing-guide.md](testing-guide.md#multi-pds-testing-cross-pds-federation).
+> Its default (local) mode publishes real, permanent DID documents to the
+> public `https://plc.directory` -- a consciously accepted limitation, not a
+> bug. Use `make test-federation-up-ci` for a hermetic run (local PLC
+> server, no public directory involved), which is what CI uses.
+
 ## Prerequisites
 
 - Docker and Docker Compose installed

@@ -4,8 +4,77 @@
 #
 # Usage: docker compose -f docker-compose.dual-pds.yml up -d
 #        ./scripts/test-local.sh
+#
+# PLC directory mode (see ATCHESS_PLC_URL below and docs/local-pds-setup.md):
+#   - LOCAL (default, `make test-federation-up`): PDS_DID_PLC_URL points at the
+#     real, public https://plc.directory. Account creation publishes REAL,
+#     PERMANENT DID documents to that third-party ledger -- it is append-only
+#     and entries cannot be deleted. This is a consciously accepted limitation
+#     for convenient ad-hoc local runs; do not loop `up`/`down -v` repeatedly.
+#   - CI (`make test-federation-up-ci`): PDS_DID_PLC_URL is overridden to the
+#     `local-plc` service below (profile "ci"), a hermetic did:plc server
+#     backed by its own throwaway Postgres (also profile "ci"). Nothing is
+#     published publicly and there is no dependency on a third party ATChess
+#     does not operate. Both modes run the identical harness/account script --
+#     only this URL differs.
 
 services:
+  # Throwaway Postgres for the local-plc service below. CI mode only (profile
+  # "ci"); local mode never starts this container.
+  #
+  # NOTE: the did-method-plc server's built-in in-memory mock database
+  # (selected by omitting DATABASE_URL) was tried first and rejected: its
+  # Sequencer expects a real Database/kysely instance and throws
+  # "Cannot read properties of undefined (reading 'selectFrom')" on startup,
+  # so the mock path is not viable with the current upstream server build.
+  # A real (but ephemeral, ci-only) Postgres is required instead.
+  local-plc-db:
+    image: postgres:16-alpine
+    profiles: ["ci"]
+    environment:
+      - POSTGRES_USER=plc
+      - POSTGRES_PASSWORD=plc
+      - POSTGRES_DB=plc
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U plc -d plc"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+      start_period: 3s
+    restart: "no"
+    container_name: atchess-local-plc-db
+
+  # Local, hermetic did:plc server for CI mode only (profile "ci"). Built from
+  # source (no maintained public image was found -- see task notes) from the
+  # reference implementation that runs the real https://plc.directory.
+  local-plc:
+    build:
+      context: https://github.com/did-method-plc/did-method-plc.git
+      dockerfile: packages/server/Dockerfile
+    profiles: ["ci"]
+    depends_on:
+      local-plc-db:
+        condition: service_healthy
+    environment:
+      - PORT=2582
+      - DATABASE_URL=postgres://plc:plc@local-plc-db:5432/plc
+      - LOG_ENABLED=true
+    # The image's default CMD (packages/server/service/index.js) is the
+    # production/AWS entrypoint that requires DB_CREDS_JSON and dd-trace; we
+    # want the plain dev entrypoint (packages/server/src/bin.ts, built to
+    # dist/bin.js) which reads DATABASE_URL/PORT directly.
+    command: ["node", "--enable-source-maps", "../dist/bin.js"]
+    ports:
+      - "${PLC_PORT:-2582}:2582"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:2582/_health || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    restart: "no"
+    container_name: atchess-local-plc
+
   pds-alice:
     image: ghcr.io/bluesky-social/pds:latest
     ports:
@@ -20,7 +89,7 @@ services:
       - PDS_EMAIL_FROM_ADDRESS=noreply@alice.localhost
       - PDS_DATA_DIRECTORY=/pds
       - PDS_BLOBSTORE_DISK_LOCATION=/pds/blocks
-      - PDS_DID_PLC_URL=https://plc.directory
+      - PDS_DID_PLC_URL=${ATCHESS_PLC_URL:-https://plc.directory}
       - PDS_BSKY_APP_VIEW_URL=https://api.bsky.app
       - PDS_BSKY_APP_VIEW_DID=did:web:api.bsky.app
       - PDS_CRAWLERS=https://bsky.network
@@ -54,7 +123,7 @@ services:
       - PDS_EMAIL_FROM_ADDRESS=noreply@bob.localhost
       - PDS_DATA_DIRECTORY=/pds
       - PDS_BLOBSTORE_DISK_LOCATION=/pds/blocks
-      - PDS_DID_PLC_URL=https://plc.directory
+      - PDS_DID_PLC_URL=${ATCHESS_PLC_URL:-https://plc.directory}
       - PDS_BSKY_APP_VIEW_URL=https://api.bsky.app
       - PDS_BSKY_APP_VIEW_DID=did:web:api.bsky.app
       - PDS_CRAWLERS=https://bsky.network

@@ -218,11 +218,28 @@ For advanced testing of AT Protocol federation between different PDS instances, 
 
 ### Setup Dual PDS Environment
 
-The dual PDS setup runs two separate PDS instances to test cross-PDS communication:
+The dual PDS setup runs two separate PDS instances to test cross-PDS communication.
+
+**PLC directory mode -- read this before running repeatedly:** by default
+(`make test-federation-up`), both PDS instances register accounts against the
+real, public `https://plc.directory`. That publishes permanent, public DID
+documents to a third-party ledger that ATChess does not operate and cannot
+delete entries from. This is a consciously accepted limitation for
+convenient local dev use -- do not loop `up`/`down -v` repeatedly. CI (and
+anyone who wants a fully hermetic run) should use `make test-federation-up-ci`
+instead, which brings up a local, throwaway did:plc server + Postgres
+(profile `ci` in `docker-compose.dual-pds.yml`) and points both PDSes at it,
+publishing nothing publicly. Both modes run the same account script and
+produce the same `test/.harness-accounts.json` shape.
 
 ```bash
 # Quick setup (recommended)
 ./scripts/test-dual-pds-setup.sh
+
+# Or, via the current Makefile targets:
+make test-federation-up      # local mode: public https://plc.directory
+make test-federation-up-ci   # CI mode: hermetic local PLC, no public writes
+make test-federation-down    # tears down either mode
 ```
 
 **Or manual setup:**
