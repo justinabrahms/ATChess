@@ -51,3 +51,6 @@ test/.harness-accounts.json
 .beads-credential-key
 .beads/proxieddb/
 *.bak.[0-9]*
+
+# Live bsky.social test credentials for atchess-1c9.14 (never commit)
+test/.live-accounts.json

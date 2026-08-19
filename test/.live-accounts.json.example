@@ -1,0 +1,13 @@
+{
+  "_comment": "Copy to test/.live-accounts.json (gitignored) and fill in. Used by atchess-1c9.14 for live-network validation against real bsky.social. App passwords come from https://bsky.app/settings/app-passwords -- use app passwords, never the account's real password.",
+  "alice": {
+    "handle": "your-first-test-account.bsky.social",
+    "pdsUrl": "https://bsky.social",
+    "password": "xxxx-xxxx-xxxx-xxxx"
+  },
+  "bob": {
+    "handle": "your-second-test-account.bsky.social",
+    "pdsUrl": "https://bsky.social",
+    "password": "xxxx-xxxx-xxxx-xxxx"
+  }
+}
