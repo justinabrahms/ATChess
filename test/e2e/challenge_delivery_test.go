@@ -418,8 +418,20 @@ func TestChallengeDelivery(t *testing.T) {
 	// ---------------------------------------------------------------
 	// Step 6: alice must NOT see her own outbound challenge in her own
 	// inbound list.
+	//
+	// WEAK WHILE DELIVERY IS BROKEN (atchess-1c9.11): alice's own
+	// protocol-service instance's in-process challenge.Store genuinely does
+	// hold the challenge she just created (CreateChallengeHandler adds it on
+	// her process), so ForPlayer(aliceDID) returning empty here DOES
+	// genuinely exercise the challenged-DID keying -- this is not a
+	// vacuous/no-op assertion. But it cannot distinguish a correctly working
+	// filter from delivery being broken everywhere (as BobSeesPendingChallengeFromAlice
+	// above establishes it currently is): with zero notifications delivered
+	// to anyone, alice trivially "does not see" her own outbound one too.
+	// The subtest name discloses this so a bare PASS is not read as full
+	// coverage of the filter.
 	// ---------------------------------------------------------------
-	t.Run("AliceDoesNotSeeOwnOutboundChallenge", func(t *testing.T) {
+	t.Run("AliceDoesNotSeeOwnOutboundChallenge_WeakWhileDeliveryBroken_SeeAtchess1c9dot11", func(t *testing.T) {
 		status, notifications, body := getChallengeNotifications(t, alice)
 		if status != http.StatusOK {
 			t.Errorf("GET /api/challenge-notifications (as alice) returned HTTP %d: %s", status, body)

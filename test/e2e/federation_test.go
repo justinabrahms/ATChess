@@ -235,7 +235,7 @@ func TestFederation(t *testing.T) {
 	})
 
 	var gameURI string
-	t.Run("Accept", func(t *testing.T) {
+	t.Run("Accept_EMULATED_NoAcceptEndpoint_SeeAtchess1c9dot29", func(t *testing.T) {
 		t.Log("DEGRADED/ADAPTED: no HTTP endpoint exists to accept a challenge and link it to the proposed game -- CreateGameFromChallenge (internal/atproto/client.go) is never routed in cmd/protocol/main.go, only plain POST /api/games is. Emulating 'Bob accepts' as bob calling POST /api/games from his OWN protocol-service instance, taking black (the color opposite of what alice requested). This is a faithful analogue of the real accept flow (see bobClient.CreateGameFromChallenge in test/e2e/challenge_test.go, which likewise creates the game in the ACCEPTING player's own repo) but is a separate, distinct API-completeness gap from the two c.pdsURL routing defects this test otherwise pins -- do not count it as a third instance of the same bug.")
 		resp := apiPost(t, bob, "/api/games", map[string]interface{}{
 			"opponent_did": alice.DID,
