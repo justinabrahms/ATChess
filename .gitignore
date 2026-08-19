@@ -47,3 +47,4 @@ web.log
 *.db
 .beads-credential-key
 .beads/proxieddb/
+*.bak.[0-9]*
