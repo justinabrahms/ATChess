@@ -287,8 +287,8 @@ func TestClient_SequenceTracking(t *testing.T) {
 	// Wait for messages to be processed
 	time.Sleep(200 * time.Millisecond)
 	
-	if client.lastSequence != 101 {
-		t.Errorf("Expected last sequence to be 101, got %d", client.lastSequence)
+	if seq := client.LastSequence(); seq != 101 {
+		t.Errorf("Expected last sequence to be 101, got %d", seq)
 	}
 }
 

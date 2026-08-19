@@ -70,6 +70,7 @@ type Client struct {
 	cancel        context.CancelFunc
 	reconnectDelay time.Duration
 	mu            sync.RWMutex
+	wg            sync.WaitGroup
 	connected     bool
 	lastSequence  int64
 	
@@ -133,25 +134,33 @@ func NewClient(handler EventHandler, opts ...Option) *Client {
 
 // Start begins listening to the firehose
 func (c *Client) Start() error {
-	go c.run()
+	c.wg.Add(1)
+	go func() {
+		defer c.wg.Done()
+		c.run()
+	}()
 	return nil
 }
 
-// Stop gracefully shuts down the client
+// Stop gracefully shuts down the client. It blocks until all background
+// goroutines (the connection loop and ping loop) have fully exited, so
+// callers can safely release resources (e.g. loggers) immediately after
+// Stop returns.
 func (c *Client) Stop() error {
 	c.cancel()
-	
+
 	c.mu.Lock()
+	var err error
 	if c.conn != nil {
-		err := c.conn.Close()
+		err = c.conn.Close()
 		c.conn = nil
 		c.connected = false
-		c.mu.Unlock()
-		return err
 	}
 	c.mu.Unlock()
-	
-	return nil
+
+	c.wg.Wait()
+
+	return err
 }
 
 // IsConnected returns whether the client is connected
@@ -159,6 +168,22 @@ func (c *Client) IsConnected() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.connected
+}
+
+// LastSequence returns the last processed firehose sequence number.
+// Safe for concurrent use.
+func (c *Client) LastSequence() int64 {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.lastSequence
+}
+
+// setLastSequence updates the last processed firehose sequence number.
+// Safe for concurrent use.
+func (c *Client) setLastSequence(seq int64) {
+	c.mu.Lock()
+	c.lastSequence = seq
+	c.mu.Unlock()
 }
 
 func (c *Client) run() {
@@ -187,8 +212,8 @@ func (c *Client) connect() error {
 	
 	// Build URL with cursor if we have a sequence
 	url := c.url
-	if c.lastSequence > 0 {
-		url = fmt.Sprintf("%s?cursor=%d", url, c.lastSequence)
+	if lastSeq := c.LastSequence(); lastSeq > 0 {
+		url = fmt.Sprintf("%s?cursor=%d", url, lastSeq)
 	}
 	
 	// Set up headers
@@ -223,6 +248,7 @@ func (c *Client) connect() error {
 
 func (c *Client) listen() error {
 	// Start ping routine
+	c.wg.Add(1)
 	go c.pingLoop()
 	
 	for {
@@ -321,7 +347,7 @@ func (c *Client) processCBORMessage(data []byte) error {
 	// Extract sequence number
 	if seqNode, err := bodyNode.LookupByString("seq"); err == nil {
 		if seq, err := seqNode.AsInt(); err == nil && seq > 0 {
-			c.lastSequence = seq
+			c.setLastSequence(seq)
 		}
 	}
 
@@ -459,7 +485,7 @@ func (c *Client) processTestMessage(data []byte) error {
 	
 	// Update sequence for resumption
 	if message.Seq > 0 {
-		c.lastSequence = message.Seq
+		c.setLastSequence(message.Seq)
 	}
 	
 	// We're only interested in commit events
@@ -586,6 +612,7 @@ func nodeToGo(node ipld.Node) (interface{}, error) {
 }
 
 func (c *Client) pingLoop() {
+	defer c.wg.Done()
 	ticker := time.NewTicker(pingInterval)
 	defer ticker.Stop()
 	
