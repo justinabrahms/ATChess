@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -26,6 +27,13 @@ type Client struct {
 	httpClient  *http.Client
 	dpopManager *auth.DPoPManager
 	useDPoP     bool
+
+	// plcDirectoryURL, when non-empty, overrides DefaultPLCDirectoryURL for
+	// this client's DID/handle resolution (identity.go) -- see
+	// SetPLCDirectoryURL. Empty means "use the default", so the zero value
+	// *Client (as produced by any existing constructor) keeps working
+	// unchanged.
+	plcDirectoryURL string
 
 	// auth, if set, supplies (and refreshes) the access token for this
 	// client's requests -- see NewClientFromSession. When nil, the client
@@ -574,8 +582,12 @@ func (c *Client) getGameRecord(ctx context.Context, gameURI string) (string, map
 	repo := parts[2] // The DID
 	rkey := parts[4] // The record key
 
-	url := xrpcURL(c.pdsURL, "com.atproto.repo.getRecord", nil) + fmt.Sprintf("?repo=%s&collection=app.atchess.game&rkey=%s", repo, rkey)
-	resp, err := c.makeRequest("GET", url, nil)
+	base, ownRepo, err := c.resolveReadEndpoint(ctx, repo)
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to get game record: %w", err)
+	}
+	params := url.Values{"repo": {repo}, "collection": {"app.atchess.game"}, "rkey": {rkey}}
+	resp, err := c.getXRPC(ctx, base, ownRepo, "com.atproto.repo.getRecord", params)
 	if err != nil {
 		return "", nil, fmt.Errorf("failed to get game record: %w", err)
 	}
@@ -604,6 +616,39 @@ type moveRecord struct {
 	Checkmate bool
 	Draw      bool
 	CreatedAt time.Time
+	// rkey is the move record's own AT-URI record key (a TID -- see
+	// recordKey/moveIsAfter). CreatedAt (an RFC3339 timestamp, second
+	// resolution) is not fine-grained enough to order two moves recorded
+	// within the same second -- which cross-repo moves routinely are, once
+	// atchess-1c9.10 makes it possible to read them at all -- so rkey
+	// breaks ties.
+	rkey string
+}
+
+// recordKey extracts the trailing record key (TID) from an at:// record
+// URI, e.g. "at://did:plc:x/app.atchess.move/3mthkghep7k2k" -> "3mthkghep7k2k".
+func recordKey(atURI string) string {
+	idx := strings.LastIndex(atURI, "/")
+	if idx < 0 {
+		return atURI
+	}
+	return atURI[idx+1:]
+}
+
+// moveIsAfter reports whether the move record identified by (t, rkey)
+// should be considered strictly more recent than (otherT, otherRkey). AT
+// Protocol TIDs are, by design, lexicographically sortable by creation time
+// (base32-sortable, monotonic per repo) -- see
+// https://atproto.com/specs/tid -- so comparing rkey strings resolves a
+// CreatedAt tie (same second) far more precisely than CreatedAt alone.
+func moveIsAfter(t time.Time, rkey string, otherT time.Time, otherRkey string) bool {
+	if t.After(otherT) {
+		return true
+	}
+	if t.Before(otherT) {
+		return false
+	}
+	return rkey > otherRkey
 }
 
 // StoredMove represents a move record retrieved from a player's PDS repository.
@@ -622,8 +667,8 @@ type StoredMove struct {
 // ListMovesForGame fetches all app.atchess.move records from this client's
 // repository that belong to the given game URI.
 func (c *Client) ListMovesForGame(ctx context.Context, gameURI string) ([]StoredMove, error) {
-	url := xrpcURL(c.pdsURL, "com.atproto.repo.listRecords", nil) + fmt.Sprintf("?repo=%s&collection=app.atchess.move&limit=100", c.did)
-	resp, err := c.makeRequest("GET", url, nil)
+	params := url.Values{"repo": {c.did}, "collection": {"app.atchess.move"}, "limit": {"100"}}
+	resp, err := c.getXRPC(ctx, c.pdsURL, true, "com.atproto.repo.listRecords", params)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list move records: %w", err)
 	}
@@ -690,8 +735,12 @@ func (c *Client) getLatestMoveForGame(ctx context.Context, gameURI string, white
 		if playerDID == "" {
 			continue
 		}
-		url := xrpcURL(c.pdsURL, "com.atproto.repo.listRecords", nil) + fmt.Sprintf("?repo=%s&collection=app.atchess.move&limit=100", playerDID)
-		resp, err := c.makeRequest("GET", url, nil)
+		base, ownRepo, err := c.resolveReadEndpoint(ctx, playerDID)
+		if err != nil {
+			continue
+		}
+		params := url.Values{"repo": {playerDID}, "collection": {"app.atchess.move"}, "limit": {"100"}}
+		resp, err := c.getXRPC(ctx, base, ownRepo, "com.atproto.repo.listRecords", params)
 		if err != nil {
 			continue
 		}
@@ -703,6 +752,7 @@ func (c *Client) getLatestMoveForGame(ctx context.Context, gameURI string, white
 
 		var listResp struct {
 			Records []struct {
+				URI   string `json:"uri"`
 				Value struct {
 					Game struct {
 						URI string `json:"uri"`
@@ -727,10 +777,12 @@ func (c *Client) getLatestMoveForGame(ctx context.Context, gameURI string, white
 			if err != nil {
 				continue
 			}
-			if latest == nil || t.After(latest.CreatedAt) {
+			rkey := recordKey(record.URI)
+			if latest == nil || moveIsAfter(t, rkey, latest.CreatedAt, latest.rkey) {
 				latest = &moveRecord{
 					FEN:       record.Value.FEN,
 					Checkmate: record.Value.Checkmate,
+					rkey:      rkey,
 					Draw:      record.Value.Draw,
 					CreatedAt: t,
 				}
@@ -756,8 +808,12 @@ func (c *Client) GetGame(ctx context.Context, gameURI string) (*chess.Game, erro
 	repo := parts[2] // The DID
 	rkey := parts[4] // The record key
 
-	url := xrpcURL(c.pdsURL, "com.atproto.repo.getRecord", nil) + fmt.Sprintf("?repo=%s&collection=app.atchess.game&rkey=%s", repo, rkey)
-	resp, err := c.makeRequest("GET", url, nil)
+	base, ownRepo, err := c.resolveReadEndpoint(ctx, repo)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get game record: %w", err)
+	}
+	params := url.Values{"repo": {repo}, "collection": {"app.atchess.game"}, "rkey": {rkey}}
+	resp, err := c.getXRPC(ctx, base, ownRepo, "com.atproto.repo.getRecord", params)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get game record: %w", err)
 	}
@@ -839,17 +895,123 @@ func (c *Client) GetPDSURL() string {
 	return c.pdsURL
 }
 
-// ResolveHandle resolves a handle to a DID
+// SetPLCDirectoryURL overrides the PLC directory this client's DID and
+// (as a last resort) handle resolution uses in place of
+// DefaultPLCDirectoryURL -- see config.ATProtoConfig.PLCDirectoryURL. Needed
+// so the local dual-PDS test harness (which runs its own hermetic did:plc
+// server, since its accounts' DIDs do not exist on the public
+// https://plc.directory) can be pointed at that server instead. Must be
+// called before any resolution-dependent call (GetGame, ResolveHandle,
+// etc.); it is not safe to call concurrently with those.
+func (c *Client) SetPLCDirectoryURL(plcDirectoryURL string) {
+	c.plcDirectoryURL = plcDirectoryURL
+}
+
+// resolver returns the identityResolver this client uses for DID->PDS and
+// PLC-export handle resolution, shared (by plcDirectoryURL) across every
+// *Client pointed at the same directory -- see getIdentityResolver for why
+// that sharing matters given how short-lived *Client instances are in
+// internal/web.
+func (c *Client) resolver() *identityResolver {
+	return getIdentityResolver(c.plcDirectoryURL)
+}
+
+// resolveReadEndpoint returns the base PDS URL to read repoDID's records
+// from: this client's own PDS when repoDID is empty or c.did, otherwise the
+// PDS resolved from repoDID's DID document. ownRepo tells getXRPC whether it
+// is safe to attach this client's own bearer token to the request -- see
+// getXRPC.
+func (c *Client) resolveReadEndpoint(ctx context.Context, repoDID string) (base string, ownRepo bool, err error) {
+	if repoDID == "" || repoDID == c.did {
+		return c.pdsURL, true, nil
+	}
+	endpoint, err := c.resolver().resolvePDS(ctx, repoDID)
+	if err != nil {
+		return "", false, fmt.Errorf("resolving PDS for repo %s: %w", repoDID, err)
+	}
+	return endpoint, false, nil
+}
+
+// getXRPC issues an (optionally query-parameterised) GET against method on
+// base. When ownRepo is true, base is this client's own authenticated PDS:
+// the request goes through makeRequest, attaching the Bearer/DPoP
+// Authorization header (with its 401-triggered refresh-and-retry). When
+// ownRepo is false, base is a DID-resolved, possibly-foreign PDS: this
+// client's access token is NEVER sent there -- it is only valid at
+// c.pdsURL, and sending it to a third-party origin would leak it -- so the
+// request is unauthenticated, matching these com.atproto.repo.* /
+// com.atproto.identity.* endpoints being public reads.
+func (c *Client) getXRPC(ctx context.Context, base string, ownRepo bool, method string, params url.Values) (*http.Response, error) {
+	u := xrpcURL(base, method, params)
+	if ownRepo {
+		return c.makeRequest("GET", u, nil)
+	}
+	req, err := http.NewRequestWithContext(ctx, "GET", u, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+	return c.httpClient.Do(req)
+}
+
+// ResolveHandle resolves a handle to a DID. A handle can be hosted on any
+// PDS, not necessarily this client's own (c.pdsURL) -- see atchess-1c9.10 --
+// so this tries, in order:
+//  1. this client's own PDS's com.atproto.identity.resolveHandle (fast path
+//     for handles it hosts locally; also the only path that works against a
+//     PDS with no real public DNS at all, e.g. a fully offline dev setup);
+//  2. the standard AT Protocol DNS TXT record (_atproto.<handle>);
+//  3. the standard AT Protocol HTTPS well-known endpoint
+//     (https://<handle>/.well-known/atproto-did);
+//  4. a bounded PLC-export scan (see resolveHandleViaPLCExport), as a last
+//     resort for handles that are real accounts but not DNS-resolvable at
+//     all -- notably the local dual-PDS test harness's ".test" handles
+//     (RFC 2606: permanently reserved, never publicly resolvable).
+//
+// Returns an error naming the handle and every resolver tried, with each
+// one's own failure reason, if all of them fail.
 func (c *Client) ResolveHandle(ctx context.Context, handle string) (string, error) {
 	// If it's already a DID, return it
 	if strings.HasPrefix(handle, "did:") {
 		return handle, nil
 	}
 
-	// Otherwise, resolve via com.atproto.identity.resolveHandle
-	url := xrpcURL(c.pdsURL, "com.atproto.identity.resolveHandle", nil) + fmt.Sprintf("?handle=%s", handle)
+	var attempts []string
 
-	resp, err := c.makeRequest("GET", url, nil)
+	if did, err := c.resolveHandleSamePDS(ctx, handle); err == nil {
+		return did, nil
+	} else {
+		attempts = append(attempts, fmt.Sprintf("same-PDS resolveHandle (%s): %v", c.pdsURL, err))
+	}
+
+	if did, err := resolveHandleViaDNS(ctx, handle); err == nil {
+		return did, nil
+	} else {
+		attempts = append(attempts, fmt.Sprintf("DNS TXT: %v", err))
+	}
+
+	if did, err := resolveHandleViaWellKnown(ctx, c.httpClient, handle); err == nil {
+		return did, nil
+	} else {
+		attempts = append(attempts, fmt.Sprintf("HTTPS well-known: %v", err))
+	}
+
+	if did, err := c.resolver().resolveHandleViaPLCExport(ctx, handle); err == nil {
+		return did, nil
+	} else {
+		attempts = append(attempts, fmt.Sprintf("PLC export: %v", err))
+	}
+
+	return "", fmt.Errorf("failed to resolve handle %q via any resolver: %s", handle, strings.Join(attempts, "; "))
+}
+
+// resolveHandleSamePDS asks this client's own PDS to resolve handle via
+// com.atproto.identity.resolveHandle. This only succeeds for handles that
+// PDS itself hosts (or otherwise already knows how to resolve); a handle
+// hosted elsewhere returns an XRPC InvalidRequest error, which the caller
+// (ResolveHandle) treats as "try the next resolver", not a hard failure.
+func (c *Client) resolveHandleSamePDS(ctx context.Context, handle string) (string, error) {
+	params := url.Values{"handle": {handle}}
+	resp, err := c.getXRPC(ctx, c.pdsURL, true, "com.atproto.identity.resolveHandle", params)
 	if err != nil {
 		return "", fmt.Errorf("failed to resolve handle: %w", err)
 	}
@@ -857,7 +1019,7 @@ func (c *Client) ResolveHandle(ctx context.Context, handle string) (string, erro
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("failed to resolve handle: %s", string(body))
+		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(body))
 	}
 
 	var result struct {
@@ -865,6 +1027,9 @@ func (c *Client) ResolveHandle(ctx context.Context, handle string) (string, erro
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return "", fmt.Errorf("failed to decode response: %w", err)
+	}
+	if result.DID == "" {
+		return "", fmt.Errorf("response had no did")
 	}
 
 	return result.DID, nil
@@ -931,8 +1096,8 @@ func (c *Client) CreateChallengeNotification(ctx context.Context, challengedDID,
 // GetChallengeNotifications retrieves pending challenge notifications for the current user
 func (c *Client) GetChallengeNotifications(ctx context.Context) ([]*ChallengeNotification, error) {
 	// List records in the challengeNotification collection
-	url := xrpcURL(c.pdsURL, "com.atproto.repo.listRecords", nil) + fmt.Sprintf("?repo=%s&collection=app.atchess.challengeNotification&limit=100", c.did)
-	resp, err := c.makeRequest("GET", url, nil)
+	params := url.Values{"repo": {c.did}, "collection": {"app.atchess.challengeNotification"}, "limit": {"100"}}
+	resp, err := c.getXRPC(ctx, c.pdsURL, true, "com.atproto.repo.listRecords", params)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list challenge notifications: %w", err)
 	}
@@ -1140,8 +1305,12 @@ func (c *Client) RespondToDrawOffer(ctx context.Context, drawOfferURI string, ac
 	rkey := parts[4] // The record key
 
 	// Get the draw offer record
-	url := xrpcURL(c.pdsURL, "com.atproto.repo.getRecord", nil) + fmt.Sprintf("?repo=%s&collection=app.atchess.drawOffer&rkey=%s", repo, rkey)
-	resp, err := c.makeRequest("GET", url, nil)
+	base, ownRepo, err := c.resolveReadEndpoint(ctx, repo)
+	if err != nil {
+		return fmt.Errorf("failed to get draw offer record: %w", err)
+	}
+	params := url.Values{"repo": {repo}, "collection": {"app.atchess.drawOffer"}, "rkey": {rkey}}
+	resp, err := c.getXRPC(ctx, base, ownRepo, "com.atproto.repo.getRecord", params)
 	if err != nil {
 		return fmt.Errorf("failed to get draw offer record: %w", err)
 	}
@@ -1344,8 +1513,8 @@ func (c *Client) ResignGame(ctx context.Context, gameID string, reason string) e
 // GetDrawOffers retrieves pending draw offers for a game
 func (c *Client) GetDrawOffers(ctx context.Context, gameID string) ([]*DrawOffer, error) {
 	// List draw offer records
-	url := xrpcURL(c.pdsURL, "com.atproto.repo.listRecords", nil) + fmt.Sprintf("?repo=%s&collection=app.atchess.drawOffer&limit=100", c.did)
-	resp, err := c.makeRequest("GET", url, nil)
+	params := url.Values{"repo": {c.did}, "collection": {"app.atchess.drawOffer"}, "limit": {"100"}}
+	resp, err := c.getXRPC(ctx, c.pdsURL, true, "com.atproto.repo.listRecords", params)
 	if err != nil {
 		return nil, fmt.Errorf("failed to list draw offers: %w", err)
 	}
@@ -1479,8 +1648,15 @@ func (c *Client) CheckTimeViolation(ctx context.Context, gameID string) (bool, *
 				challengeRepo := challengeParts[2]
 				challengeRkey := challengeParts[4]
 
-				url := xrpcURL(c.pdsURL, "com.atproto.repo.getRecord", nil) + fmt.Sprintf("?repo=%s&collection=app.atchess.challenge&rkey=%s", challengeRepo, challengeRkey)
-				resp, err := c.makeRequest("GET", url, nil)
+				base, ownRepo, resolveErr := c.resolveReadEndpoint(ctx, challengeRepo)
+				var resp *http.Response
+				var err error
+				if resolveErr == nil {
+					params := url.Values{"repo": {challengeRepo}, "collection": {"app.atchess.challenge"}, "rkey": {challengeRkey}}
+					resp, err = c.getXRPC(ctx, base, ownRepo, "com.atproto.repo.getRecord", params)
+				} else {
+					err = resolveErr
+				}
 				if err == nil && resp.StatusCode == http.StatusOK {
 					defer resp.Body.Close()
 
@@ -1601,8 +1777,12 @@ func (c *Client) getLastMove(ctx context.Context, gameID string, excludePlayerDI
 
 	// Check moves from all players
 	for _, playerDID := range players {
-		url := xrpcURL(c.pdsURL, "com.atproto.repo.listRecords", nil) + fmt.Sprintf("?repo=%s&collection=app.atchess.move&limit=100", playerDID)
-		resp, err := c.makeRequest("GET", url, nil)
+		base, ownRepo, err := c.resolveReadEndpoint(ctx, playerDID)
+		if err != nil {
+			continue // Skip if we can't resolve this player's PDS
+		}
+		params := url.Values{"repo": {playerDID}, "collection": {"app.atchess.move"}, "limit": {"100"}}
+		resp, err := c.getXRPC(ctx, base, ownRepo, "com.atproto.repo.listRecords", params)
 		if err != nil {
 			continue // Skip if we can't access this player's moves
 		}
@@ -1802,8 +1982,15 @@ func (c *Client) GetTimeRemaining(ctx context.Context, gameID string) (time.Dura
 				challengeRepo := challengeParts[2]
 				challengeRkey := challengeParts[4]
 
-				url := xrpcURL(c.pdsURL, "com.atproto.repo.getRecord", nil) + fmt.Sprintf("?repo=%s&collection=app.atchess.challenge&rkey=%s", challengeRepo, challengeRkey)
-				resp, err := c.makeRequest("GET", url, nil)
+				base, ownRepo, resolveErr := c.resolveReadEndpoint(ctx, challengeRepo)
+				var resp *http.Response
+				var err error
+				if resolveErr == nil {
+					params := url.Values{"repo": {challengeRepo}, "collection": {"app.atchess.challenge"}, "rkey": {challengeRkey}}
+					resp, err = c.getXRPC(ctx, base, ownRepo, "com.atproto.repo.getRecord", params)
+				} else {
+					err = resolveErr
+				}
 				if err == nil && resp.StatusCode == http.StatusOK {
 					defer resp.Body.Close()
 

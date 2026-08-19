@@ -34,13 +34,13 @@ func main() {
 
 	// Setup logging
 	log.Logger = zerolog.New(os.Stdout).With().Timestamp().Logger()
-	
+
 	// Load config
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatal().Err(err).Msg("Failed to load config")
 	}
-	
+
 	// Create AT Protocol client
 	client, err := atproto.NewClientWithDPoP(
 		cfg.ATProto.PDSURL,
@@ -51,7 +51,8 @@ func main() {
 	if err != nil {
 		log.Fatal().Err(err).Msg("Failed to create AT Protocol client")
 	}
-	
+	client.SetPLCDirectoryURL(cfg.ATProto.PLCDirectoryURL)
+
 	// Create WebSocket hub
 	hub := web.NewHub()
 	go hub.Run()
@@ -61,7 +62,7 @@ func main() {
 
 	// Create service
 	service := web.NewService(client, cfg, challengeStore)
-	
+
 	// Initialize OAuth if base URL is configured
 	if cfg.Server.BaseURL != "" {
 		if err := web.InitializeOAuth(cfg.Server.BaseURL); err != nil {
@@ -71,40 +72,40 @@ func main() {
 			service.SetOAuthClient(web.GetOAuthClient())
 		}
 	}
-	
+
 	// Create firehose processor with shared challenge store
 	processor := firehose.NewEventProcessor(hub, challengeStore)
-	
+
 	// Start firehose client (optional - can be disabled in config)
 	if cfg.Firehose.Enabled {
 		firehoseClient := firehose.NewClient(
 			firehose.CreateChessEventHandler(processor),
 			firehose.WithURL(cfg.Firehose.URL),
 		)
-		
+
 		go func() {
 			log.Info().Str("url", cfg.Firehose.URL).Msg("Starting firehose client")
 			if err := firehoseClient.Start(); err != nil {
 				log.Error().Err(err).Msg("Firehose client error")
 			}
 		}()
-		
+
 		// Track the current user's games
 		processor.TrackPlayer(client.GetDID())
 	}
-	
+
 	// Setup routes
 	router := mux.NewRouter()
-	
+
 	// Add CORS middleware with origin allowlist
 	router.Use(service.GetOriginChecker().CORSMiddleware)
-	
+
 	// Root level health endpoint for load balancers and monitoring
 	router.HandleFunc("/health", service.HealthHandler).Methods("GET")
-	
+
 	// OAuth client metadata endpoint (must be before static file handler)
 	router.HandleFunc("/client-metadata.json", service.ClientMetadataHandler).Methods("GET")
-	
+
 	// API routes
 	api := router.PathPrefix("/api").Subrouter()
 
@@ -144,7 +145,7 @@ func main() {
 	authed.HandleFunc("/resign", service.ResignGameHandler).Methods("POST")
 	authed.HandleFunc("/spectator/games/{id:.*}/claim-abandonment", service.ClaimAbandonedGameHandler).Methods("POST")
 	authed.HandleFunc("/games/{id:.*}/claim-time", service.ClaimTimeVictoryHandler).Methods("POST")
-	
+
 	// Explicit OPTIONS handlers for CORS preflight requests
 	api.HandleFunc("/auth/login", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -212,14 +213,14 @@ func main() {
 	api.HandleFunc("/games/{id:.*}/time-remaining", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}).Methods("OPTIONS")
-	
+
 	// Serve static files
 	staticDir := os.Getenv("ATCHESS_STATIC_DIR")
 	if staticDir == "" {
 		staticDir = "./web/static/"
 	}
 	router.PathPrefix("/").Handler(http.FileServer(http.Dir(staticDir)))
-	
+
 	// Create server
 	srv := &http.Server{
 		Addr:         fmt.Sprintf("%s:%d", cfg.Server.Host, cfg.Server.Port),
@@ -228,7 +229,7 @@ func main() {
 		WriteTimeout: 15 * time.Second,
 		IdleTimeout:  60 * time.Second,
 	}
-	
+
 	// Start server
 	go func() {
 		log.Info().Str("addr", srv.Addr).Msg("Starting server")
@@ -236,21 +237,21 @@ func main() {
 			log.Fatal().Err(err).Msg("Failed to start server")
 		}
 	}()
-	
+
 	// Wait for interrupt signal
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 	log.Info().Msg("Shutting down server...")
-	
+
 	// Graceful shutdown
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	
+
 	if err := srv.Shutdown(ctx); err != nil {
 		log.Fatal().Err(err).Msg("Server forced to shutdown")
 	}
-	
+
 	log.Info().Msg("Server exited")
 }
 

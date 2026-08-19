@@ -9,9 +9,9 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"strings"
 	"time"
 
+	"github.com/justinabrahms/atchess/internal/atproto"
 	"github.com/justinabrahms/atchess/internal/oauth"
 	"github.com/rs/zerolog/log"
 )
@@ -240,16 +240,13 @@ func (s *Service) resolveOAuthEndpoints(handle string) (pdsURL, authEndpoint str
 		return "", "", fmt.Errorf("failed to resolve handle: %w", err)
 	}
 
-	// Get DID document to find PDS
-	didDoc, err := s.getDidDocument(did)
+	// Get DID document and extract its PDS URL. Delegates to
+	// internal/atproto.ResolvePDS (did:plc via the configured PLC
+	// directory, did:web via HTTPS well-known) rather than duplicating that
+	// resolution logic here -- see atchess-1c9.10.
+	pdsURL, err = atproto.ResolvePDS(context.Background(), did, s.config.ATProto.PLCDirectoryURL)
 	if err != nil {
-		return "", "", fmt.Errorf("failed to get DID document: %w", err)
-	}
-
-	// Extract PDS URL from DID document
-	pdsURL = s.extractPDSFromDidDoc(didDoc)
-	if pdsURL == "" {
-		return "", "", fmt.Errorf("no PDS URL in DID document")
+		return "", "", fmt.Errorf("failed to resolve PDS for %s: %w", did, err)
 	}
 
 	// Get OAuth authorization server metadata
@@ -265,54 +262,6 @@ func (s *Service) resolveOAuthEndpoints(handle string) (pdsURL, authEndpoint str
 	}
 
 	return pdsURL, authEndpoint, nil
-}
-
-func (s *Service) getDidDocument(did string) (map[string]interface{}, error) {
-	// For did:plc, use PLC directory
-	if strings.HasPrefix(did, "did:plc:") {
-		resp, err := http.Get(fmt.Sprintf("https://plc.directory/%s", did))
-		if err != nil {
-			return nil, err
-		}
-		defer resp.Body.Close()
-
-		var doc map[string]interface{}
-		if err := json.NewDecoder(resp.Body).Decode(&doc); err != nil {
-			return nil, err
-		}
-
-		return doc, nil
-	}
-
-	// For did:web, resolve via HTTPS
-	if strings.HasPrefix(did, "did:web:") {
-		// Implementation for did:web resolution
-		return nil, fmt.Errorf("did:web not yet implemented")
-	}
-
-	return nil, fmt.Errorf("unsupported DID method")
-}
-
-func (s *Service) extractPDSFromDidDoc(doc map[string]interface{}) string {
-	// Look for atproto_pds service
-	services, ok := doc["service"].([]interface{})
-	if !ok {
-		return ""
-	}
-
-	for _, svc := range services {
-		service, ok := svc.(map[string]interface{})
-		if !ok {
-			continue
-		}
-
-		if service["id"] == "#atproto_pds" {
-			endpoint, _ := service["serviceEndpoint"].(string)
-			return endpoint
-		}
-	}
-
-	return ""
 }
 
 func (s *Service) getAuthorizationServer(pdsURL string) (string, error) {

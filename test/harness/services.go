@@ -99,6 +99,65 @@ type serviceInstance struct {
 	exitedCh chan struct{}
 }
 
+// localPLCDefaultPort is the host port the CI-mode dual-PDS stack
+// (docker-compose.dual-pds.yml's local-plc service, profile "ci") publishes
+// its hermetic did:plc directory on, matching that file's
+// `${PLC_PORT:-2582}:2582` port mapping. Kept in one place, next to the
+// other harness constants, and overridable via the same PLC_PORT env var
+// used there (see resolvePLCDirectoryURL) so changing one changes both.
+const localPLCDefaultPort = "2582"
+
+// localPLCHealthTimeout bounds the one-shot probe resolvePLCDirectoryURL
+// makes to detect whether a CI-mode local-plc container is up.
+const localPLCHealthTimeout = 2 * time.Second
+
+// resolvePLCDirectoryURL determines which PLC directory the harness's
+// spawned protocol-service instances should be told to resolve did:plc
+// identities against (ATPROTO_PLC_DIRECTORY_URL; see internal/config and
+// internal/atproto.identityResolver), so the documented
+// `make test-federation-up-ci` -> `go test -tags=e2e -run TestFederation`
+// sequence is green with no manual env var (atchess-1c9.10 review gap 1).
+//
+// Resolution order:
+//  1. ATCHESS_TEST_PLC_URL, if set, is used verbatim -- a full manual
+//     override for anyone running the stack on a non-default port.
+//  2. Otherwise, derive http://localhost:<PLC_PORT> (PLC_PORT env var,
+//     defaulting to localPLCDefaultPort -- the same variable and default
+//     docker-compose.dual-pds.yml's local-plc service publishes on) and
+//     probe GET <url>/_health. If it answers healthy, this is CI mode and
+//     that URL is returned.
+//  3. If the probe fails (no local-plc container running), this is LOCAL
+//     ad-hoc mode (`make test-federation-up`), whose PDS containers are
+//     themselves configured to use the real public https://plc.directory
+//     (see docker-compose.dual-pds.yml). "" is returned so the spawned
+//     instances fall back to that same real directory, matching the mode
+//     they were actually brought up in, rather than forcing CI routing onto
+//     a stack that isn't running local-plc at all.
+func resolvePLCDirectoryURL(t *testing.T) string {
+	t.Helper()
+
+	if override := os.Getenv("ATCHESS_TEST_PLC_URL"); override != "" {
+		return override
+	}
+
+	port := os.Getenv("PLC_PORT")
+	if port == "" {
+		port = localPLCDefaultPort
+	}
+	candidate := fmt.Sprintf("http://localhost:%s", port)
+
+	client := &http.Client{Timeout: localPLCHealthTimeout}
+	resp, err := client.Get(candidate + "/_health")
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return ""
+	}
+	return candidate
+}
+
 // startProtocolService launches one protocol-service instance configured
 // for account, listening on port, and blocks until it reports healthy via
 // GET /api/health (bounded by healthTimeout) or fails.
@@ -106,9 +165,11 @@ type serviceInstance struct {
 // Configuration is passed entirely via environment variables that
 // internal/config.Load binds ahead of its own config-file defaults
 // (SERVER_PORT, ATPROTO_PDS_URL, ATPROTO_HANDLE, ATPROTO_PASSWORD,
-// ATPROTO_USE_DPOP) -- this is what makes it possible to run two instances,
-// one per PDS, from the same binary.
-func startProtocolService(t *testing.T, binPath string, account Account, port int, label string) *serviceInstance {
+// ATPROTO_USE_DPOP, and -- when a CI-mode local-plc directory was detected,
+// see resolvePLCDirectoryURL -- ATPROTO_PLC_DIRECTORY_URL) -- this is what
+// makes it possible to run two instances, one per PDS, from the same
+// binary.
+func startProtocolService(t *testing.T, binPath string, account Account, port int, label string, plcDirectoryURL string) *serviceInstance {
 	t.Helper()
 
 	url := fmt.Sprintf("http://127.0.0.1:%d", port)
@@ -125,6 +186,9 @@ func startProtocolService(t *testing.T, binPath string, account Account, port in
 		"ATPROTO_USE_DPOP=false",
 		"FIREHOSE_ENABLED=false",
 	)
+	if plcDirectoryURL != "" {
+		cmd.Env = append(cmd.Env, "ATPROTO_PLC_DIRECTORY_URL="+plcDirectoryURL)
+	}
 
 	logs := &syncBuffer{}
 	cmd.Stdout = logs
@@ -226,12 +290,13 @@ func StartServices(t *testing.T, accounts *Accounts) *Services {
 	t.Helper()
 
 	binPath := buildProtocolBinary(t)
+	plcDirectoryURL := resolvePLCDirectoryURL(t)
 
 	alicePort := freePort(t)
 	bobPort := freePort(t)
 
-	aliceInst := startProtocolService(t, binPath, accounts.Alice, alicePort, "alice")
-	bobInst := startProtocolService(t, binPath, accounts.Bob, bobPort, "bob")
+	aliceInst := startProtocolService(t, binPath, accounts.Alice, alicePort, "alice", plcDirectoryURL)
+	bobInst := startProtocolService(t, binPath, accounts.Bob, bobPort, "bob", plcDirectoryURL)
 
 	return &Services{
 		AliceURL: aliceInst.url,

@@ -80,6 +80,7 @@ func (s *Service) clientFor(r *http.Request) (*atproto.Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to build authenticated client for %s: %w", session.DID, err)
 	}
+	client.SetPLCDirectoryURL(s.config.ATProto.PLCDirectoryURL)
 	return client, nil
 }
 
@@ -603,6 +604,7 @@ func (s *Service) LoginHandler(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	userClient.SetPLCDirectoryURL(s.config.ATProto.PLCDirectoryURL)
 
 	// Ensure session store is initialized for password auth
 	if sessionStore == nil {
