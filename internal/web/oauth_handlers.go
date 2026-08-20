@@ -193,17 +193,31 @@ func (s *Service) OAuthCallbackHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Create session. PDSURL is set to the OAuth issuer: under the atproto
-	// "transition:generic" OAuth profile a user's PDS acts as its own
-	// authorization server, so iss is typically the same origin records
-	// must be written to -- but this is provisional. Actually wiring OAuth
-	// sessions through Service.clientFor (refresh, DPoP-bound requests,
-	// etc.) is atchess-1c9.12's job; recording PDSURL here just avoids
-	// leaving that bead with a session shape that has no PDS URL at all.
+	// Resolve the user's REAL PDS host from their DID document rather than
+	// assuming it from the OAuth issuer (atchess-1c9.84). Under the atproto
+	// "transition:generic" profile a user's PDS often acts as its own
+	// authorization server, making iss and the PDS host the same origin --
+	// but that is not guaranteed. bsky.social is the counterexample: iss is
+	// https://bsky.social (the entryway, acting as authorization server),
+	// while the user's repo lives on a separate *.host.bsky.network PDS.
+	// Trusting iss there would silently record the wrong host and every
+	// subsequent authenticated write (via Service.clientFor) would land in
+	// the wrong place. Resolved once, here, at session creation -- NOT
+	// per-request in clientFor -- so this doesn't add a network round trip
+	// to every authenticated call.
+	pdsURL, err := resolveSessionPDS(r.Context(), tokens.Sub, s.config.ATProto.PLCDirectoryURL)
+	if err != nil {
+		log.Error().Err(err).Str("did", tokens.Sub).Str("iss", iss).
+			Msg("Failed to resolve PDS from DID document for OAuth session; refusing to create a session with an unresolved PDS host")
+		http.Error(w, fmt.Sprintf("Failed to resolve your PDS from your DID document (did=%s): %v", tokens.Sub, err), http.StatusInternalServerError)
+		return
+	}
+
 	session := &oauth.Session{
 		DID:                  tokens.Sub,
 		Handle:               authReq.Handle,
-		PDSURL:               iss,
+		PDSURL:               pdsURL,
+		AuthServerURL:        iss,
 		AccessToken:          tokens.AccessToken,
 		RefreshToken:         tokens.RefreshToken,
 		ExpiresAt:            time.Now().Add(time.Duration(tokens.ExpiresIn) * time.Second),
@@ -308,6 +322,24 @@ func (s *Service) resolveOAuthEndpoints(handle string) (pdsURL, authServerURL st
 	return pdsURL, authServerURL, metadata, nil
 }
 
+// resolveSessionPDS resolves did's real PDS host from its DID document,
+// via internal/atproto.ResolvePDS -- the same DID -> PDS resolution used
+// elsewhere in this codebase (e.g. resolveOAuthEndpoints above), rather
+// than a second implementation. Deliberately does NOT accept or fall back
+// to the OAuth issuer on failure (atchess-1c9.84): recording a
+// plausible-but-wrong host would surface later as a write failure far from
+// this call site, looking like a permissions problem rather than a
+// resolution one. Extracted as its own function (rather than inlined into
+// OAuthCallbackHandler) so it can be exercised directly by tests without
+// driving a full authorization-code exchange.
+func resolveSessionPDS(ctx context.Context, did, plcDirectoryURL string) (string, error) {
+	pdsURL, err := atproto.ResolvePDS(ctx, did, plcDirectoryURL)
+	if err != nil {
+		return "", fmt.Errorf("resolving PDS for %s: %w", did, err)
+	}
+	return pdsURL, nil
+}
+
 func (s *Service) getAuthorizationServer(pdsURL string) (string, error) {
 	// Get resource server metadata
 	resp, err := http.Get(pdsURL + "/.well-known/oauth-protected-resource")
@@ -357,9 +389,10 @@ func getAuthServerMetadata(authServerURL string) (*authServerMetadata, error) {
 
 // getTokenEndpoint resolves issuer's token_endpoint from its authorization
 // server metadata. issuer is the OAuth "iss" value from the callback (or,
-// for a subsequent refresh, an OAuth session's recorded PDSURL -- see
-// refreshOAuthSession in session_auth.go, which is the other caller of
-// this function) -- normalized down to its bare origin, matching how the
+// for a subsequent refresh, an OAuth session's recorded AuthServerURL --
+// see refreshOAuthSession in session_auth.go, which is the other caller of
+// this function; NOT session.PDSURL, which may be a different host --
+// atchess-1c9.84) -- normalized down to its bare origin, matching how the
 // AT Protocol OAuth profile locates .well-known/oauth-authorization-server
 // (irrespective of any path component on issuer itself). Deliberately a
 // free function, not a *Service method (despite living next to Service's

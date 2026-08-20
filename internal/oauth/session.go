@@ -19,7 +19,32 @@ import (
 type Session struct {
 	DID    string `json:"did"`
 	Handle string `json:"handle"`
+
+	// PDSURL is the user's actual PDS host (resolved from their DID
+	// document, atchess-1c9.84), used for XRPC calls -- both the resource-
+	// server host app writes/reads hit, AND (for app-password sessions
+	// only, which have no separate authorization server) the refresh
+	// endpoint. See AuthServerURL below for the OAuth case, where these two
+	// are NOT always the same host.
 	PDSURL string `json:"pds_url"`
+
+	// AuthServerURL is the OAuth authorization server's origin -- the "iss"
+	// value from the callback, recorded once at login (OAuthCallbackHandler)
+	// -- used ONLY for OAuth token-endpoint discovery and refresh (see
+	// internal/web/session_auth.go's refreshOAuthSession). Empty for
+	// app-password sessions (DPoPKey == nil), which have no authorization
+	// server distinct from their PDS.
+	//
+	// This is deliberately a separate field from PDSURL rather than reusing
+	// it: under the atproto "transition:generic" profile a user's PDS often
+	// also acts as its own authorization server, so the two coincide for
+	// self-hosted/most PDSes -- but NOT for bsky.social, where iss is
+	// https://bsky.social (the entryway) while the user's repo lives on a
+	// separate *.host.bsky.network PDS. Collapsing the two into one field
+	// previously broke OAuth refresh against bsky.social: the token-endpoint
+	// discovery request landed on the PDS host, which does not serve
+	// /.well-known/oauth-authorization-server (404).
+	AuthServerURL string `json:"auth_server_url"`
 
 	AccessToken  string `json:"access_token"`
 	RefreshToken string `json:"refresh_token"`

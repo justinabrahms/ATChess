@@ -74,13 +74,16 @@ func (a *sessionAuthenticator) refreshFunc() oauth.RefreshFunc {
 
 // refreshOAuthSession performs the OAuth refresh_token grant for a
 // DPoP-bound (session.DPoPKey != nil) session, via the global oauthClient
-// (initialized by InitializeOAuth). session.PDSURL holds the OAuth issuer
-// recorded at login time (see OAuthCallbackHandler) -- under the AT
-// Protocol "transition:generic" profile this is also the authorization
-// server, so it doubles as both the token endpoint's discovery origin and
-// the client assertion's "aud". Fails closed (rather than looping or
-// silently reusing a stale token) when any of the OAuth client, the
-// session's issuer, or its refresh token is unavailable.
+// (initialized by InitializeOAuth). session.AuthServerURL holds the OAuth
+// issuer recorded at login time (see OAuthCallbackHandler) and is used for
+// BOTH the token endpoint's discovery origin and the client assertion's
+// "aud" -- deliberately NOT session.PDSURL (atchess-1c9.84): on
+// bsky.social the two are different hosts (iss is https://bsky.social, the
+// entryway acting as authorization server, while PDSURL is the user's
+// *.host.bsky.network PDS, which does not serve
+// /.well-known/oauth-authorization-server at all). Fails closed (rather
+// than looping or silently reusing a stale token) when any of the OAuth
+// client, the session's issuer, or its refresh token is unavailable.
 func refreshOAuthSession(session *oauth.Session, refreshToken string) (string, string, time.Time, error) {
 	if oauthClient == nil {
 		return "", "", time.Time{}, fmt.Errorf("OAuth client not initialized, cannot refresh OAuth session")
@@ -88,16 +91,16 @@ func refreshOAuthSession(session *oauth.Session, refreshToken string) (string, s
 	if refreshToken == "" {
 		return "", "", time.Time{}, fmt.Errorf("OAuth session has no refresh token available")
 	}
-	if session.PDSURL == "" {
+	if session.AuthServerURL == "" {
 		return "", "", time.Time{}, fmt.Errorf("OAuth session has no recorded authorization-server issuer, cannot refresh")
 	}
 
-	tokenEndpoint, err := getTokenEndpoint(session.PDSURL)
+	tokenEndpoint, err := getTokenEndpoint(session.AuthServerURL)
 	if err != nil {
 		return "", "", time.Time{}, fmt.Errorf("resolving token endpoint for OAuth refresh: %w", err)
 	}
 
-	tokens, err := oauthClient.RefreshTokens(tokenEndpoint, session.PDSURL, refreshToken, session.DPoPKey)
+	tokens, err := oauthClient.RefreshTokens(tokenEndpoint, session.AuthServerURL, refreshToken, session.DPoPKey)
 	if err != nil {
 		return "", "", time.Time{}, fmt.Errorf("OAuth token refresh failed: %w", err)
 	}
