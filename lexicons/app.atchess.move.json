@@ -54,6 +54,10 @@
             "type": "boolean",
             "description": "Whether this move is checkmate"
           },
+          "draw": {
+            "type": "boolean",
+            "description": "Whether this move results in a draw"
+          },
           "moveNumber": {
             "type": "integer",
             "description": "Move number in the game"
