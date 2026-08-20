@@ -208,6 +208,100 @@ func TestFetchDIDDocument_RejectsHostileDIDWebHostsBeforeAnyRequest(t *testing.T
 	}
 }
 
+// addrSpyClient returns an *http.Client whose Transport captures every
+// address http.Transport actually dials -- via DialContext/DialTLSContext,
+// which net/http calls with the addr AFTER its own internal IDNA
+// re-normalisation of the URL host (idnaASCII, invoked from canonicalAddr
+// inside dialConn) -- and refuses to actually connect. This is the
+// load-bearing distinction for atchess-1c9.93: validateDIDWebHost only
+// ever sees the RAW host string, but net/http separately re-normalises
+// that string immediately before dialing, so a test that inspects
+// req.URL.Host (or the string didWebDocumentURL returned) can be green
+// while the address actually dialed is a completely different, attacker-
+// steered one. DialTLSContext is exercised (not just DialContext) because
+// every did:web URL this codebase builds is https.
+func addrSpyClient() (*http.Client, *[]string) {
+	dialed := &[]string{}
+	spy := func(ctx context.Context, network, addr string) (net.Conn, error) {
+		*dialed = append(*dialed, addr)
+		return nil, fmt.Errorf("addrSpyClient: refusing to actually dial %s", addr)
+	}
+	return &http.Client{Transport: &http.Transport{
+		DialContext:    spy,
+		DialTLSContext: spy,
+	}}, dialed
+}
+
+// TestDIDWebIDNANormalizationBypass is the atchess-1c9.93 regression test:
+// FOUND BY REVIEWER during atchess-1c9.72, demonstrated with a dial spy
+// capturing the address http.Transport actually dials. validateDIDWebHost
+// validates the RAW did:web host string, but net/http's Transport
+// separately re-normalises the URL host via IDNA (idnaASCII) immediately
+// before dialing -- AFTER validation has already approved the raw string.
+// That later normalisation maps fullwidth digits (U+FF10-U+FF19) to ASCII
+// digits and several fullwidth/CJK full-stop code points (U+3002, U+FF0E,
+// U+FF61) to '.', so e.g. "did:web:169.254.169.２５４" (fullwidth digits,
+// no ASCII digit anywhere in the raw string) used to be DIALED at
+// 169.254.169.254:443 -- the cloud metadata address -- with no DNS
+// resolution involved (it is already an IP literal by the time it is
+// dialed), making this exploitable even in CGO_ENABLED=0 production
+// builds, unlike atchess-1c9.72's cgo-dependent variant.
+//
+// Every case here must be rejected by fetchDIDDocument with ZERO addresses
+// ever reaching the dialer -- proven via addrSpyClient's captured addr
+// list, not via countingRoundTripper (which only ever sees req.URL, the
+// PRE-normalisation string, and would not have caught this bug) and not
+// via didWebDocumentURL's returned string (also pre-normalisation).
+func TestDIDWebIDNANormalizationBypass(t *testing.T) {
+	hostile := []struct {
+		name string
+		did  string
+	}{
+		{"fullwidth digits spelling the cloud metadata IP's last octet", "did:web:169.254.169.２５４"},
+		{"fullwidth digits spelling the entire cloud metadata IP with fullwidth full stops", "did:web:１６９．２５４．１６９．２５４"},
+		{"fullwidth digit spelling loopback's last octet", "did:web:127.0.0.１"},
+		{"ideographic full stop (U+3002) normalises to a trailing '.'", "did:web:example.com。"},
+		{"embedded empty label (a..b)", "did:web:a..b"},
+		{"bare dot as the entire host", "did:web:."},
+		{"ordinary host with a single trailing dot (atchess-1c9.72, must stay rejected)", "did:web:example.com."},
+	}
+
+	for _, tc := range hostile {
+		t.Run(tc.name, func(t *testing.T) {
+			client, dialed := addrSpyClient()
+			r := newTestResolver(DefaultPLCDirectoryURL)
+			r.httpClient = client
+
+			if _, err := r.fetchDIDDocument(context.Background(), tc.did); err == nil {
+				t.Fatalf("fetchDIDDocument(%q) unexpectedly succeeded, want a validation error", tc.did)
+			}
+			if len(*dialed) != 0 {
+				t.Errorf("fetchDIDDocument(%q) reached the dialer with address(es) %v, want zero outbound dials (validation must reject it before any connection is attempted)", tc.did, *dialed)
+			}
+		})
+	}
+}
+
+// TestDIDWebIDNANormalizationBypass_PunycodeStillAccepted is the
+// legitimate-IDN regression guard for atchess-1c9.93's allowlist: a
+// did:web host carrying its punycode ("xn--") form -- pure ASCII -- must
+// still be accepted and reach the dialer with that exact host, proving the
+// allowlist fix does not overreach into rejecting legitimate
+// internationalised domains.
+func TestDIDWebIDNANormalizationBypass_PunycodeStillAccepted(t *testing.T) {
+	const did = "did:web:xn--80ak6aa92e.com" // punycode for пример.com-shaped IDN label
+	client, dialed := addrSpyClient()
+	r := newTestResolver(DefaultPLCDirectoryURL)
+	r.httpClient = client
+
+	if _, err := r.fetchDIDDocument(context.Background(), did); err == nil {
+		t.Fatalf("fetchDIDDocument(%q) unexpectedly succeeded (addrSpyClient always refuses the actual dial)", did)
+	}
+	if len(*dialed) != 1 || dialed == nil || (*dialed)[0] != "xn--80ak6aa92e.com:443" {
+		t.Errorf("fetchDIDDocument(%q) dialed %v, want exactly [%q] (punycode host must pass validation and reach the dialer unchanged)", did, *dialed, "xn--80ak6aa92e.com:443")
+	}
+}
+
 // TestDIDWebDocumentURL covers didWebDocumentURL's path construction
 // directly (no network), including the %3A-encoded-port and multi-segment
 // path shapes the did:web spec defines.

@@ -259,6 +259,12 @@ func didWebDocumentURL(did string) (string, error) {
 // unvalidated straight into "https://" + host + ...
 //
 // Rejects a host that:
+//   - contains any byte outside the ASCII letter/digit/'-'/'.' allowlist
+//     (atchess-1c9.93) -- see didWebHostCharRE's doc comment for why this
+//     is a whitelist rather than yet another blacklist entry;
+//   - contains an empty label -- leading, trailing, or embedded
+//     (consecutive dots), including a bare "." (atchess-1c9.72,
+//     atchess-1c9.93);
 //   - is an IP literal in ANY spelling (dotted-quad, hex, octal,
 //     short-form, or IPv6) -- via the same rejectIPLiteralSpelling logic
 //     normalizeAndValidateHandle uses for handles, so this SSRF-relevant
@@ -279,28 +285,69 @@ func validateDIDWebHost(host string) error {
 	if host == "" {
 		return fmt.Errorf("did:web host is empty")
 	}
+	// atchess-1c9.93: an ALLOWLIST, not another blacklist entry. Two
+	// bypasses in a row against this function (atchess-1c9.72's trailing
+	// dot, and this one) got through because a guard declined for a reason
+	// unrelated to the actual threat -- rejectIPLiteralSpelling's digit
+	// test inspects a specific byte, and for a hostile-but-differently-
+	// spelled input that byte simply wasn't '0'-'9'. Concretely:
+	// net/http's Transport re-normalises the request's URL host via IDNA
+	// (idnaASCII, called from canonicalAddr inside dialConn) immediately
+	// before dialing -- AFTER this validation has already run and
+	// approved the raw string -- and that normalisation maps fullwidth
+	// digits (U+FF10-U+FF19) to ASCII digits and several fullwidth/CJK
+	// full-stop code points (U+3002, U+FF0E, U+FF61) to '.'. So
+	// "did:web:169.254.169.２５４" (fullwidth digits, no ASCII digit
+	// anywhere in the raw string) is actually DIALED at
+	// 169.254.169.254:443 -- the cloud metadata address -- with zero DNS
+	// resolution involved (it is already an IP literal by the time it is
+	// dialed), so this is exploitable in CGO_ENABLED=0 production builds,
+	// unlike atchess-1c9.72's variant. Restricting the character set here
+	// to ASCII letters, digits, '-', and '.' makes every non-ASCII
+	// spelling illegal input before any of that later normalisation ever
+	// runs, rather than trying to anticipate its next output shape. This
+	// also makes the fix airtight against the specific mechanism: Go's
+	// idnaASCII is a no-op identity function for any string that is
+	// already pure ASCII (net/http/request.go: `if ascii.Is(v) { return
+	// v, nil }`), so once a host passes this allowlist, net/http's later
+	// re-normalisation is GUARANTEED to leave it byte-for-byte unchanged
+	// before dialing -- there is no second normalisation pass left to
+	// race. An internationalised did:web host must carry its punycode
+	// ("xn--") form instead -- pure ASCII, unaffected by this rule, and
+	// accepted unchanged (see
+	// TestDIDWebIDNANormalizationBypass_PunycodeStillAccepted, which
+	// asserts a punycode host reaches the DIALER -- not merely that it
+	// passes validation, which would be a hollow regression guard).
+	if !didWebHostCharRE.MatchString(host) {
+		return fmt.Errorf("did:web host %q contains a character outside the permitted ASCII letters, digits, '-', and '.'", host)
+	}
 	// A did:web host is not a hostname being resolved -- it is part of a
-	// DID identifier, and identifiers need a canonical form. A trailing
-	// dot is legitimate FQDN root-label syntax for DNS resolution, but
-	// allowing it here would let "did:web:example.com" and
-	// "did:web:example.com." name the same PDS while comparing UNEQUAL as
-	// strings everywhere this codebase compares DIDs directly (challenge
-	// and game participant/ownership checks all compare DID strings) --
-	// identifier aliasing, not a stylistic nicety. Reject any trailing dot
-	// outright, here rather than in the shared rejectIPLiteralSpelling
-	// helper: the rule is "did:web hosts must not have an empty label",
-	// not anything IP-specific, so it belongs in the function that owns
-	// did:web's identifier-shape rules, not in a helper named for IP
-	// literal spellings. This also closes atchess-1c9.72 (an IP-literal
-	// host, e.g. "169.254.169.254.", slipping past validation because a
-	// trailing dot made rejectIPLiteralSpelling's final label empty)
-	// without any IP-specific handling: it is simply not a valid did:web
-	// host shape, IP-looking or not. Handles are unaffected: the handle
-	// grammar (normalizeAndValidateHandle) already rejects a trailing dot
-	// earlier via its own empty-label check, before ever reaching
-	// rejectIPLiteralSpelling, so this is deliberately NOT added there.
-	if strings.HasSuffix(host, ".") {
-		return fmt.Errorf("did:web host %q must not end with a dot", host)
+	// DID identifier, and identifiers need a canonical form. Reject ANY
+	// empty label under one rule -- leading, trailing, or embedded
+	// (consecutive dots) -- rather than a trailing-dot-only special case:
+	// a bare "." is simultaneously a leading and trailing empty label,
+	// "a..b" has an embedded one, and "example.com." has a trailing one,
+	// and all three are the same underlying malformation. A trailing dot
+	// specifically is also an identifier-aliasing risk even though it is
+	// legitimate FQDN root-label syntax for DNS resolution: allowing it
+	// would let "did:web:example.com" and "did:web:example.com." name the
+	// same PDS while comparing UNEQUAL as strings everywhere this
+	// codebase compares DIDs directly (challenge and game
+	// participant/ownership checks all compare DID strings). This also
+	// closes atchess-1c9.72 (an IP-literal host, e.g.
+	// "169.254.169.254.", slipping past validation because a trailing dot
+	// made rejectIPLiteralSpelling's final label empty) without any
+	// IP-specific handling: it is simply not a valid did:web host shape,
+	// IP-looking or not, and likewise closes the embedded-empty-label
+	// shape ("a..b") noted during atchess-1c9.93's review. Handles are
+	// unaffected: the handle grammar (normalizeAndValidateHandle) already
+	// rejects every empty-label shape via its own check, before ever
+	// reaching rejectIPLiteralSpelling, so this is deliberately NOT added
+	// there.
+	for _, label := range strings.Split(host, ".") {
+		if label == "" {
+			return fmt.Errorf("did:web host %q contains an empty label (a leading, trailing, or consecutive dot)", host)
+		}
 	}
 	if strings.ContainsRune(host, '@') {
 		return fmt.Errorf("did:web host %q must not contain userinfo (\"@\")", host)
@@ -316,6 +363,16 @@ func validateDIDWebHost(host string) error {
 	}
 	return nil
 }
+
+// didWebHostCharRE matches only the byte set validateDIDWebHost permits in
+// a did:web host: ASCII letters, digits, '-', and '.'. This is the
+// atchess-1c9.93 allowlist -- see validateDIDWebHost's doc comment for the
+// full rationale. Every non-ASCII byte is refused by construction,
+// including the specific fullwidth-digit and fullwidth/CJK full-stop code
+// points net/http's later IDNA re-normalisation (idnaASCII) would
+// otherwise be free to reinterpret as a dotted-quad IP literal after this
+// validation has already run.
+var didWebHostCharRE = regexp.MustCompile(`^[a-zA-Z0-9.-]+$`)
 
 // --- Handle resolution -----------------------------------------------------
 //
