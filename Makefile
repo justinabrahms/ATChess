@@ -84,18 +84,36 @@ test-local-down:
 #   first and waits for it to report healthy, then starts the PDSes pointed
 #   at it instead of the public directory. Same harness/account script as
 #   local mode -- only PDS_DID_PLC_URL differs.
+#
+# Both modes below also call scripts/check-dual-pds-mode.sh (atchess-1c9.22)
+# before bringing anything up, and again to stamp a marker right after:
+# switching modes with volumes intact would otherwise let
+# create-dual-pds-accounts.sh's idempotent re-use path silently carry one
+# mode's DIDs into the other mode's account file. See that script's header
+# comment for the full rationale, including why the marker lives inside the
+# pds-alice-data volume rather than in the repo or a container label.
 test-federation-up:
 	./scripts/ensure-dual-pds-hosts.sh
 	mkdir -p certs/dual-pds
+	./scripts/check-dual-pds-mode.sh local check
 	docker compose -f docker-compose.dual-pds.yml up -d
+	# Local mode never wants the CI-only hermetic did:plc service running
+	# (atchess-1c9.22): if volumes/containers from a prior CI-mode run are
+	# still present, stop them rather than leaving them running alongside
+	# local mode's real-plc.directory PDSes. No-op (exit 0) if they were
+	# never started.
+	docker compose -f docker-compose.dual-pds.yml stop local-plc local-plc-db
+	./scripts/check-dual-pds-mode.sh local stamp
 	./scripts/extract-dual-pds-ca.sh
 	./scripts/create-dual-pds-accounts.sh
 
 test-federation-up-ci:
 	./scripts/ensure-dual-pds-hosts.sh
 	mkdir -p certs/dual-pds
+	./scripts/check-dual-pds-mode.sh ci check
 	docker compose -f docker-compose.dual-pds.yml --profile ci up -d --wait local-plc
 	ATCHESS_PLC_URL=http://local-plc:2582 docker compose -f docker-compose.dual-pds.yml --profile ci up -d
+	./scripts/check-dual-pds-mode.sh ci stamp
 	./scripts/extract-dual-pds-ca.sh
 	./scripts/create-dual-pds-accounts.sh
 
