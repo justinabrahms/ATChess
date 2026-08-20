@@ -151,8 +151,15 @@ func newRaceMockPDS(t *testing.T) *raceMockPDS {
 	return &raceMockPDS{t: t, records: map[string]map[string]map[string]*raceRecord{}}
 }
 
+// server starts m's mock PDS on a real local TLS listener and advertises a
+// validator-passing fake hostname (see newFakeHTTPSEndpoint,
+// atchess-1c9.95) rather than the listener's own http://127.0.0.1:<port>,
+// which internal/atproto.parseServiceEndpoint now refuses to accept as a
+// DID document's serviceEndpoint.
 func (m *raceMockPDS) server() *httptest.Server {
-	return httptest.NewServer(http.HandlerFunc(m.handle))
+	srv := newFakeHTTPSEndpoint(m.t, http.HandlerFunc(m.handle))
+	m.setBaseURL(srv.URL)
+	return srv
 }
 
 func (m *raceMockPDS) setBaseURL(u string) { m.mu.Lock(); m.base = u; m.mu.Unlock() }

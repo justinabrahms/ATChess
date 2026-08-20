@@ -94,8 +94,13 @@ func (m *deriveTestPDS) seed(repo, collection, rkey string, value map[string]int
 	return fmt.Sprintf("at://%s/%s/%s", repo, collection, rkey), "cid-" + rkey
 }
 
+// server starts m's mock PDS on a real local TLS listener and advertises a
+// validator-passing fake hostname (see newFakeHTTPSEndpoint,
+// atchess-1c9.95) rather than the listener's own http://127.0.0.1:<port>,
+// which parseServiceEndpoint now refuses to accept as a DID document's
+// serviceEndpoint.
 func (m *deriveTestPDS) server() *httptest.Server {
-	srv := httptest.NewServer(http.HandlerFunc(m.handle))
+	srv := newFakeHTTPSEndpoint(m.t, http.HandlerFunc(m.handle))
 	m.mu.Lock()
 	m.base = srv.URL
 	m.mu.Unlock()
@@ -242,10 +247,47 @@ func (m *deriveTestPDS) setDIDDocFail(did string) {
 	m.didDocFail[did] = true
 }
 
-// setUnreachable makes did resolve successfully to endpoint, which has
-// nothing listening on it -- simulating an opponent-PDS outage
-// (atchess-1c9.51) distinct from DID resolution itself failing.
-func (m *deriveTestPDS) setUnreachable(did, endpoint string) {
+// setUnreachable makes did resolve successfully to a serviceEndpoint that
+// PASSES atproto's fetched-endpoint validation (https, non-IP-literal host
+// -- see newUnreachableFakeHost) but has NOTHING listening behind it --
+// simulating an opponent-PDS outage (atchess-1c9.51) distinct from DID
+// resolution itself failing.
+//
+// atchess-1c9.95 fix-pass (reviewer-flagged): this used to take an
+// explicit endpoint string, and every call site passed a real, closed,
+// PLAIN-HTTP httptest.Server's address. Once parseServiceEndpoint started
+// validating serviceEndpoint (this same bead), that value started failing
+// at VALIDATION time instead of connection time -- same outcome (an
+// error), a DIFFERENT reason: the atchess-1c9.51 "opponent PDS is
+// unreachable" code path this helper exists to exercise was never
+// actually reached again, even though every assertion at each call site
+// kept passing. newUnreachableFakeHost's validator-passing-but-dead
+// address restores that: see TestGetGame_IncompleteDerivation_OpponentUnreachable_Resigned's
+// (and this file's other two setUnreachable callers') doc comments for
+// the "prove it fails for the right reason" verification this fix-pass
+// re-ran.
+func (m *deriveTestPDS) setUnreachable(t *testing.T, did string) {
+	t.Helper()
+	endpoint := newUnreachableFakeHost(t)
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.unreachableEndpoint == nil {
+		m.unreachableEndpoint = map[string]string{}
+	}
+	m.unreachableEndpoint[did] = endpoint
+}
+
+// setServiceEndpoint makes did's DID document advertise endpoint
+// VERBATIM as its serviceEndpoint, bypassing setUnreachable's own
+// validator-passing-but-dead address generation -- used by
+// atchess-1c9.95's SSRF regression tests (service_endpoint_ssrf_test.go),
+// which need to declare an ARBITRARY (including hostile) endpoint string
+// rather than a guaranteed-safe-shaped one. Shares the same underlying
+// unreachableEndpoint map as setUnreachable: the DID-document handler
+// (see handle) does not distinguish why an override was set, only that
+// one was.
+func (m *deriveTestPDS) setServiceEndpoint(did, endpoint string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.unreachableEndpoint == nil {
@@ -807,12 +849,12 @@ func TestGetGame_IncompleteDerivation_OpponentUnreachable_Resigned(t *testing.T)
 	srv := mock.server()
 	defer srv.Close()
 
-	// Nothing is listening here: a real httptest server, closed
-	// immediately, so black's DID resolves fine but every XRPC call against
-	// it fails with a connection error.
-	dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
-	dead.Close()
-	mock.setUnreachable(blackDID, dead.URL)
+	// black's DID resolves fine, to a validator-passing serviceEndpoint --
+	// but nothing is listening behind it, so every XRPC call against it
+	// fails with a connection error (atchess-1c9.95 fix-pass: see
+	// setUnreachable's doc comment for why this can no longer be a plain
+	// closed httptest.Server's own address).
+	mock.setUnreachable(t, blackDID)
 
 	gameURI := mock.seedActiveGame(t, time.Now().Add(-time.Hour), nil)
 	mock.seed(whiteDID, "app.atchess.resignation", "resign1", map[string]interface{}{
@@ -969,9 +1011,10 @@ func TestResignGame_FailsClosed_WhenDerivationIncomplete(t *testing.T) {
 	srv := mock.server()
 	defer srv.Close()
 
-	dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
-	dead.Close()
-	mock.setUnreachable(blackDID, dead.URL)
+	// atchess-1c9.95 fix-pass: see setUnreachable's doc comment -- must be
+	// a validator-passing-but-dead endpoint, not a plain closed
+	// httptest.Server's own address.
+	mock.setUnreachable(t, blackDID)
 
 	gameURI := mock.seedActiveGame(t, time.Now().Add(-time.Hour), nil)
 
@@ -1046,9 +1089,10 @@ func TestRespondToDrawOffer_FailsClosed_WhenDerivationIncomplete(t *testing.T) {
 	srv := mock.server()
 	defer srv.Close()
 
-	dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
-	dead.Close()
-	mock.setUnreachable(blackDID, dead.URL)
+	// atchess-1c9.95 fix-pass: see setUnreachable's doc comment -- must be
+	// a validator-passing-but-dead endpoint, not a plain closed
+	// httptest.Server's own address.
+	mock.setUnreachable(t, blackDID)
 
 	gameURI := mock.seedActiveGame(t, time.Now().Add(-time.Hour), nil)
 

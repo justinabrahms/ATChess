@@ -344,9 +344,44 @@ func resolveSessionPDS(ctx context.Context, did, plcDirectoryURL string) (string
 	return pdsURL, nil
 }
 
+// oauthMetadataHTTPClientTimeout bounds every fetch oauthMetadataHTTPClient
+// makes, so an unresponsive PDS/authorization-server (attacker-chosen or
+// otherwise) cannot hang a login/callback request indefinitely.
+const oauthMetadataHTTPClientTimeout = 10 * time.Second
+
+// oauthMetadataHTTPClient is the client getAuthorizationServer and
+// getAuthServerMetadata use to fetch OAuth resource-/authorization-server
+// metadata -- atchess-1c9.95, replacing the previous bare http.Get (i.e.
+// http.DefaultClient): that had no timeout at all, and followed up to 10
+// redirects with no re-validation of the Location host, mirroring exactly
+// the redirect gap atchess-1c9.94 closed for identity-resolution fetches
+// (see refuseIdentityFetchRedirect's doc comment in internal/atproto).
+// Neither an oauth-protected-resource nor an oauth-authorization-server
+// metadata document is specified to redirect, so refusing every redirect
+// outright gives up no legitimate case.
+var oauthMetadataHTTPClient = &http.Client{
+	Timeout: oauthMetadataHTTPClientTimeout,
+	CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		return fmt.Errorf("oauth metadata fetch: refusing to follow redirect to %s", req.URL)
+	},
+}
+
 func (s *Service) getAuthorizationServer(pdsURL string) (string, error) {
+	// pdsURL was resolved from the target account's DID document (see
+	// resolveOAuthEndpoints -> atproto.ResolvePDS), which atchess-1c9.95's
+	// parseServiceEndpoint already validates via
+	// atproto.ValidateFetchedEndpointURL before ever returning it. Validated
+	// again here anyway, at the actual dial site, rather than trusting that
+	// invariant to hold across every current and future caller of this
+	// method -- the whole point of atchess-1c9.95 is "validate the value
+	// immediately before it is dialed", not "validate it somewhere upstream
+	// and hope".
+	if _, err := atproto.ValidateFetchedEndpointURL(pdsURL); err != nil {
+		return "", fmt.Errorf("refusing to fetch resource-server metadata: %w", err)
+	}
+
 	// Get resource server metadata
-	resp, err := http.Get(pdsURL + "/.well-known/oauth-protected-resource")
+	resp, err := oauthMetadataHTTPClient.Get(pdsURL + "/.well-known/oauth-protected-resource")
 	if err != nil {
 		return "", err
 	}
@@ -370,10 +405,20 @@ func (s *Service) getAuthorizationServer(pdsURL string) (string, error) {
 // getAuthServerMetadata fetches and decodes an authorization server's
 // /.well-known/oauth-authorization-server document. authServerURL must
 // already be a bare origin (scheme://host[:port]), with no path -- both of
-// this function's callers (resolveOAuthEndpoints and getTokenEndpoint)
-// ensure that.
+// this function's callers (resolveOAuthEndpoints's authServerURL, itself
+// taken from the PDS's oauth-protected-resource RESPONSE BODY above, and
+// getTokenEndpoint's issuer, taken from an OAuth callback's untrusted "iss"
+// query parameter) ensure that. Neither value is something this codebase
+// chose or validated upstream -- atchess-1c9.95 -- so it is validated here,
+// at the actual dial site, via the SAME atproto.ValidateFetchedEndpointURL
+// parseServiceEndpoint uses (https, no userinfo/query/fragment/path, and a
+// host that passes the shared did:web host validator).
 func getAuthServerMetadata(authServerURL string) (*authServerMetadata, error) {
-	resp, err := http.Get(authServerURL + "/.well-known/oauth-authorization-server")
+	if _, err := atproto.ValidateFetchedEndpointURL(authServerURL); err != nil {
+		return nil, fmt.Errorf("refusing to fetch authorization-server metadata: %w", err)
+	}
+
+	resp, err := oauthMetadataHTTPClient.Get(authServerURL + "/.well-known/oauth-authorization-server")
 	if err != nil {
 		return nil, err
 	}

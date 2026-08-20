@@ -80,8 +80,15 @@ func (m *mockFederatedPDS) newRkey() string {
 	return fmt.Sprintf("rkey%d", m.rkeyN)
 }
 
+// server starts m's mock PDS on a real local TLS listener and advertises a
+// validator-passing fake hostname (see newFakeHTTPSEndpoint,
+// atchess-1c9.95) rather than the listener's own http://127.0.0.1:<port>,
+// which internal/atproto.parseServiceEndpoint now refuses to accept as a
+// DID document's serviceEndpoint.
 func (m *mockFederatedPDS) server() *httptest.Server {
-	return httptest.NewServer(http.HandlerFunc(m.handle))
+	srv := newFakeHTTPSEndpoint(m.t, http.HandlerFunc(m.handle))
+	m.setBaseURL(srv.URL)
+	return srv
 }
 
 func (m *mockFederatedPDS) handle(w http.ResponseWriter, r *http.Request) {

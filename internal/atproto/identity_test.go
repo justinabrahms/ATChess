@@ -24,7 +24,12 @@ func newTestResolver(plcDirectoryURL string) *identityResolver {
 
 // TestResolvePDS_DIDPLC covers did:plc resolution via a fake PLC directory
 // (httptest.Server), independent of the real network and of
-// https://plc.directory specifically.
+// https://plc.directory specifically. The advertised serviceEndpoint is
+// "https://pds-a.example" with no port (atchess-1c9.95: parseServiceEndpoint
+// now validates it via ValidateFetchedEndpointURL, which requires https and
+// a portless host -- this test never dials the returned endpoint itself, so
+// it only needs a value that PASSES that validation, not a live server
+// behind it).
 func TestResolvePDS_DIDPLC(t *testing.T) {
 	const did = "did:plc:abc123example"
 	requests := 0
@@ -39,7 +44,7 @@ func TestResolvePDS_DIDPLC(t *testing.T) {
 		json.NewEncoder(w).Encode(DIDDocument{
 			ID: did,
 			Service: []DIDService{
-				{ID: "#atproto_pds", Type: "AtprotoPersonalDataServer", ServiceEndpoint: "http://pds-a.example:2583"},
+				{ID: "#atproto_pds", Type: "AtprotoPersonalDataServer", ServiceEndpoint: "https://pds-a.example"},
 			},
 		})
 	}))
@@ -50,7 +55,7 @@ func TestResolvePDS_DIDPLC(t *testing.T) {
 	if err != nil {
 		t.Fatalf("resolvePDS: unexpected error: %v", err)
 	}
-	if want := "http://pds-a.example:2583"; got != want {
+	if want := "https://pds-a.example"; got != want {
 		t.Errorf("resolvePDS = %q, want %q", got, want)
 	}
 	if requests != 1 {
@@ -439,7 +444,7 @@ func TestResolvePDS_CacheExpiry(t *testing.T) {
 		json.NewEncoder(w).Encode(DIDDocument{
 			ID: did,
 			Service: []DIDService{
-				{Type: "AtprotoPersonalDataServer", ServiceEndpoint: fmt.Sprintf("http://pds.example/%d", requests)},
+				{Type: "AtprotoPersonalDataServer", ServiceEndpoint: fmt.Sprintf("https://pds%d.example", requests)},
 			},
 		})
 	}))
@@ -507,7 +512,7 @@ func TestResolvePDS_FailureNotCached(t *testing.T) {
 		json.NewEncoder(w).Encode(DIDDocument{
 			ID: did,
 			Service: []DIDService{
-				{Type: "AtprotoPersonalDataServer", ServiceEndpoint: "http://pds.example"},
+				{Type: "AtprotoPersonalDataServer", ServiceEndpoint: "https://pds.example"},
 			},
 		})
 	}))
@@ -536,7 +541,7 @@ func TestResolvePDS_FailureNotCached(t *testing.T) {
 	if requests != 2 {
 		t.Errorf("expected a fresh (non-cached) attempt after the earlier failure, got %d total requests", requests)
 	}
-	if want := "http://pds.example"; got != want {
+	if want := "https://pds.example"; got != want {
 		t.Errorf("resolvePDS = %q, want %q", got, want)
 	}
 }
@@ -640,7 +645,7 @@ func TestResolvePDS_Exported(t *testing.T) {
 		json.NewEncoder(w).Encode(DIDDocument{
 			ID: did,
 			Service: []DIDService{
-				{Type: "AtprotoPersonalDataServer", ServiceEndpoint: "http://pds.example"},
+				{Type: "AtprotoPersonalDataServer", ServiceEndpoint: "https://pds.example"},
 			},
 		})
 	}))
@@ -650,7 +655,7 @@ func TestResolvePDS_Exported(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ResolvePDS: unexpected error: %v", err)
 	}
-	if want := "http://pds.example"; got != want {
+	if want := "https://pds.example"; got != want {
 		t.Errorf("ResolvePDS = %q, want %q", got, want)
 	}
 }

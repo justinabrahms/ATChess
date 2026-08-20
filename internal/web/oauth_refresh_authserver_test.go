@@ -61,7 +61,12 @@ func TestRefreshOAuthSession_UsesAuthServerURL_NotPDSURL(t *testing.T) {
 	var assertionAud string
 	var tokenRequests, discoveryRequests int
 
-	issuer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	// atchess-1c9.95: issuer.URL is used as session.AuthServerURL, which
+	// getTokenEndpoint/getAuthServerMetadata now validate (https, no port,
+	// non-IP host) before dialing it -- see newFakeHTTPSEndpoint for why
+	// this can no longer be the httptest server's own
+	// http://127.0.0.1:<port> address.
+	issuer := newFakeHTTPSEndpoint(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case r.Method == http.MethodGet && r.URL.Path == "/.well-known/oauth-authorization-server":
 			discoveryRequests++

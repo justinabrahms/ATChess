@@ -331,6 +331,69 @@ func validateDIDWebHost(host string) error {
 	if host == "" {
 		return fmt.Errorf("did:web host is empty")
 	}
+	// A did:web host is part of a DID IDENTIFIER, not a serviceEndpoint --
+	// identifiers need a single canonical form, and the AT Protocol did:web
+	// spec's own host-segment grammar has no port component at all (a port
+	// is smuggled in only via a hostile %3A, see didWebDocumentURL's doc
+	// comment). This also catches every IPv6 literal spelling, since IPv6
+	// addresses always contain ':'. Kept HERE, not in validateHostShape,
+	// because a serviceEndpoint is a different animal: the AT Protocol
+	// identity spec explicitly permits an "optional port number" there
+	// (atchess-1c9.95 fix-pass, reviewer-flagged: reusing this rule
+	// wholesale for ValidateFetchedEndpointURL rejected spec-legal,
+	// self-hosted PDSes on a non-standard port for no SSRF-relevant
+	// reason -- a port says nothing about whether a host is internal).
+	if strings.ContainsRune(host, ':') {
+		return fmt.Errorf("did:web host %q must not specify a port (and must not be an IPv6 literal)", host)
+	}
+	if err := validateHostShape(host); err != nil {
+		return fmt.Errorf("did:web host %q is not a valid hostname: %w", host, err)
+	}
+	return nil
+}
+
+// validateHostShape is the SSRF-relevant host-shape analysis shared by
+// validateDIDWebHost (a did:web IDENTIFIER's host segment, atchess-1c9.70/
+// .72/.93 -- which additionally forbids a port, see validateDIDWebHost)
+// and ValidateFetchedEndpointURL (a serviceEndpoint/OAuth-metadata URL's
+// host, atchess-1c9.95 -- which permits a port, per the AT Protocol
+// identity spec's "optional port number" for serviceEndpoint). Extracted
+// as its own function during atchess-1c9.95's fix pass so this analysis is
+// written ONCE and shared by both shapes, rather than validateDIDWebHost
+// being reused wholesale for a shape (serviceEndpoint) it was never
+// designed to validate -- that reuse rejected spec-legal, self-hosted
+// PDSes on a non-standard port with no SSRF-relevant justification (a port
+// says nothing about whether a HOST is internal).
+//
+// Rejects a host that:
+//   - contains any byte outside the ASCII letter/digit/'-'/'.' allowlist
+//     (atchess-1c9.93) -- see didWebHostCharRE's doc comment for why this
+//     is a whitelist rather than yet another blacklist entry. This is also
+//     what closes every IPv6 literal spelling here (url.URL.Hostname()
+//     strips the "[...]" brackets net/url requires around an IPv6 host,
+//     e.g. "[::1]" -> "::1", so ValidateFetchedEndpointURL never sees the
+//     brackets -- but "::1" itself contains ':', which this charset
+//     allowlist already rejects, so no bracket-specific handling is
+//     needed at all -- see TestValidateHostShape_IPv6Literal);
+//   - contains an empty label -- leading, trailing, or embedded
+//     (consecutive dots), including a bare "." (atchess-1c9.72,
+//     atchess-1c9.93);
+//   - is an IP literal in ANY spelling (dotted-quad, hex, octal,
+//     short-form, or IPv6) -- via the same rejectIPLiteralSpelling logic
+//     normalizeAndValidateHandle uses for handles, so this SSRF-relevant
+//     analysis is written once rather than drifting between two copies;
+//   - carries userinfo ("@");
+//   - contains a path separator ("/"), including one smuggled in via a
+//     percent-encoded form that only becomes '/' after decoding (relevant
+//     to validateDIDWebHost's did:web caller; ValidateFetchedEndpointURL
+//     rejects a path on the URL itself before this ever runs).
+//
+// Deliberately NOT validated here: a port. See each caller for how it
+// handles one.
+func validateHostShape(host string) error {
+	if host == "" {
+		return fmt.Errorf("host is empty")
+	}
 	// atchess-1c9.93: an ALLOWLIST, not another blacklist entry. Two
 	// bypasses in a row against this function (atchess-1c9.72's trailing
 	// dot, and this one) got through because a guard declined for a reason
@@ -358,54 +421,38 @@ func validateDIDWebHost(host string) error {
 	// v, nil }`), so once a host passes this allowlist, net/http's later
 	// re-normalisation is GUARANTEED to leave it byte-for-byte unchanged
 	// before dialing -- there is no second normalisation pass left to
-	// race. An internationalised did:web host must carry its punycode
-	// ("xn--") form instead -- pure ASCII, unaffected by this rule, and
-	// accepted unchanged (see
-	// TestDIDWebIDNANormalizationBypass_PunycodeStillAccepted, which
-	// asserts a punycode host reaches the DIALER -- not merely that it
-	// passes validation, which would be a hollow regression guard).
+	// race. An internationalised host must carry its punycode ("xn--")
+	// form instead -- pure ASCII, unaffected by this rule, and accepted
+	// unchanged (see TestDIDWebIDNANormalizationBypass_PunycodeStillAccepted,
+	// which asserts a punycode host reaches the DIALER -- not merely that
+	// it passes validation, which would be a hollow regression guard).
 	if !didWebHostCharRE.MatchString(host) {
-		return fmt.Errorf("did:web host %q contains a character outside the permitted ASCII letters, digits, '-', and '.'", host)
+		return fmt.Errorf("host %q contains a character outside the permitted ASCII letters, digits, '-', and '.'", host)
 	}
-	// A did:web host is not a hostname being resolved -- it is part of a
-	// DID identifier, and identifiers need a canonical form. Reject ANY
-	// empty label under one rule -- leading, trailing, or embedded
-	// (consecutive dots) -- rather than a trailing-dot-only special case:
-	// a bare "." is simultaneously a leading and trailing empty label,
-	// "a..b" has an embedded one, and "example.com." has a trailing one,
-	// and all three are the same underlying malformation. A trailing dot
-	// specifically is also an identifier-aliasing risk even though it is
-	// legitimate FQDN root-label syntax for DNS resolution: allowing it
-	// would let "did:web:example.com" and "did:web:example.com." name the
-	// same PDS while comparing UNEQUAL as strings everywhere this
-	// codebase compares DIDs directly (challenge and game
-	// participant/ownership checks all compare DID strings). This also
-	// closes atchess-1c9.72 (an IP-literal host, e.g.
+	// Reject ANY empty label under one rule -- leading, trailing, or
+	// embedded (consecutive dots) -- rather than a trailing-dot-only
+	// special case: a bare "." is simultaneously a leading and trailing
+	// empty label, "a..b" has an embedded one, and "example.com." has a
+	// trailing one, and all three are the same underlying malformation.
+	// This also closes atchess-1c9.72 (an IP-literal host, e.g.
 	// "169.254.169.254.", slipping past validation because a trailing dot
 	// made rejectIPLiteralSpelling's final label empty) without any
-	// IP-specific handling: it is simply not a valid did:web host shape,
-	// IP-looking or not, and likewise closes the embedded-empty-label
-	// shape ("a..b") noted during atchess-1c9.93's review. Handles are
-	// unaffected: the handle grammar (normalizeAndValidateHandle) already
-	// rejects every empty-label shape via its own check, before ever
-	// reaching rejectIPLiteralSpelling, so this is deliberately NOT added
-	// there.
+	// IP-specific handling: it is simply not a valid host shape, IP-looking
+	// or not, and likewise closes the embedded-empty-label shape ("a..b")
+	// noted during atchess-1c9.93's review.
 	for _, label := range strings.Split(host, ".") {
 		if label == "" {
-			return fmt.Errorf("did:web host %q contains an empty label (a leading, trailing, or consecutive dot)", host)
+			return fmt.Errorf("host %q contains an empty label (a leading, trailing, or consecutive dot)", host)
 		}
 	}
 	if strings.ContainsRune(host, '@') {
-		return fmt.Errorf("did:web host %q must not contain userinfo (\"@\")", host)
-	}
-	if strings.ContainsRune(host, ':') {
-		return fmt.Errorf("did:web host %q must not specify a port (and must not be an IPv6 literal)", host)
+		return fmt.Errorf("host %q must not contain userinfo (\"@\")", host)
 	}
 	if strings.ContainsRune(host, '/') {
-		return fmt.Errorf("did:web host %q must not contain a path separator", host)
+		return fmt.Errorf("host %q must not contain a path separator", host)
 	}
 	if err := rejectIPLiteralSpelling(host); err != nil {
-		return fmt.Errorf("did:web host %q is not a valid hostname: %w", host, err)
+		return fmt.Errorf("host %q is not a valid hostname: %w", host, err)
 	}
 	return nil
 }

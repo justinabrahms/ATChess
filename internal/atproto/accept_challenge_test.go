@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
@@ -47,8 +46,12 @@ type acceptTestPDS struct {
 func newAcceptTestPDS(t *testing.T) *acceptTestPDS {
 	t.Helper()
 	p := &acceptTestPDS{records: map[string]map[string]map[string]*storedRecord{}}
-	srv := httptest.NewServer(http.HandlerFunc(p.handle))
-	t.Cleanup(srv.Close)
+	// atchess-1c9.95: p.base is both the login pdsURL passed to NewClient
+	// AND embedded as a DID document's serviceEndpoint, which
+	// parseServiceEndpoint now validates -- see newFakeHTTPSEndpoint for
+	// why this can no longer be the httptest server's own
+	// http://127.0.0.1:<port> address.
+	srv := newFakeHTTPSEndpoint(t, http.HandlerFunc(p.handle))
 	p.base = srv.URL
 	return p
 }

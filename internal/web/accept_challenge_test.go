@@ -44,8 +44,11 @@ type storedValue struct {
 func newAcceptHandlerPDS(t *testing.T) *acceptHandlerPDS {
 	t.Helper()
 	p := &acceptHandlerPDS{records: map[string]map[string]map[string]storedValue{}}
-	srv := httptest.NewServer(http.HandlerFunc(p.handle))
-	t.Cleanup(srv.Close)
+	// atchess-1c9.95: p.base is embedded as a DID document's
+	// serviceEndpoint, which internal/atproto.parseServiceEndpoint now
+	// validates -- see newFakeHTTPSEndpoint for why this can no longer be
+	// the httptest server's own http://127.0.0.1:<port> address.
+	srv := newFakeHTTPSEndpoint(t, http.HandlerFunc(p.handle))
 	p.base = srv.URL
 	return p
 }
