@@ -279,6 +279,29 @@ func validateDIDWebHost(host string) error {
 	if host == "" {
 		return fmt.Errorf("did:web host is empty")
 	}
+	// A did:web host is not a hostname being resolved -- it is part of a
+	// DID identifier, and identifiers need a canonical form. A trailing
+	// dot is legitimate FQDN root-label syntax for DNS resolution, but
+	// allowing it here would let "did:web:example.com" and
+	// "did:web:example.com." name the same PDS while comparing UNEQUAL as
+	// strings everywhere this codebase compares DIDs directly (challenge
+	// and game participant/ownership checks all compare DID strings) --
+	// identifier aliasing, not a stylistic nicety. Reject any trailing dot
+	// outright, here rather than in the shared rejectIPLiteralSpelling
+	// helper: the rule is "did:web hosts must not have an empty label",
+	// not anything IP-specific, so it belongs in the function that owns
+	// did:web's identifier-shape rules, not in a helper named for IP
+	// literal spellings. This also closes atchess-1c9.72 (an IP-literal
+	// host, e.g. "169.254.169.254.", slipping past validation because a
+	// trailing dot made rejectIPLiteralSpelling's final label empty)
+	// without any IP-specific handling: it is simply not a valid did:web
+	// host shape, IP-looking or not. Handles are unaffected: the handle
+	// grammar (normalizeAndValidateHandle) already rejects a trailing dot
+	// earlier via its own empty-label check, before ever reaching
+	// rejectIPLiteralSpelling, so this is deliberately NOT added there.
+	if strings.HasSuffix(host, ".") {
+		return fmt.Errorf("did:web host %q must not end with a dot", host)
+	}
 	if strings.ContainsRune(host, '@') {
 		return fmt.Errorf("did:web host %q must not contain userinfo (\"@\")", host)
 	}

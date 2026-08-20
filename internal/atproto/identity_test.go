@@ -82,6 +82,14 @@ func TestResolvePDS_DIDWeb(t *testing.T) {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
+		// dialRedirectClient dials the real listener regardless of the
+		// request's nominal host, so without this assertion the test would
+		// still pass even if didWebDocumentURL built the WRONG host --
+		// restoring the guarantee the pre-atchess-1c9.70 test had
+		// implicitly (found during atchess-1c9.72 review).
+		if r.Host != "example.com" {
+			t.Errorf("request Host = %q, want %q", r.Host, "example.com")
+		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(DIDDocument{
 			ID: "did:web:example",
@@ -165,6 +173,23 @@ func TestFetchDIDDocument_RejectsHostileDIDWebHostsBeforeAnyRequest(t *testing.T
 		{"percent-encoded port (%3A) on an otherwise ordinary host -- decodes to evil.example:8080", "did:web:evil.example%3A8080"},
 		{"percent-encoded path separator (%2F) injects a path segment into the host -- decodes to evil.example/..", "did:web:evil.example%2F.."},
 		{"literal userinfo (@) in the host", "did:web:attacker@evil.example"},
+		// atchess-1c9.72: validateDIDWebHost rejects ANY trailing dot on a
+		// did:web host outright (not an IP-specific rule) -- a did:web host
+		// is part of a DID identifier, not a hostname being resolved, so
+		// "did:web:example.com" and "did:web:example.com." must not be
+		// allowed to name the same PDS while comparing unequal as strings
+		// everywhere this codebase compares DIDs directly. This also
+		// closes the concrete SSRF gap that motivated the bead: a trailing
+		// dot used to make rejectIPLiteralSpelling's final label EMPTY
+		// (skipping the digit check) while net.ParseIP separately refused
+		// to parse the trailing dot too, so an IP-literal-shaped host with
+		// a trailing dot sailed through both checks untouched. See
+		// validateDIDWebHost's doc comment for the full rationale.
+		{"bare IPv4 literal with a trailing dot (FQDN root-label spelling of the cloud metadata address)", "did:web:169.254.169.254."},
+		{"hex-last-octet IPv4 spelling with a trailing dot", "did:web:169.254.169.0xfe."},
+		{"bare IPv4 literal with multiple trailing dots", "did:web:169.254.169.254.."},
+		{"ordinary (non-IP) host with a single trailing dot -- identifier-aliasing risk, not IP-specific", "did:web:example.com."},
+		{"bare dot as the entire host", "did:web:."},
 	}
 
 	for _, tc := range hostile {
@@ -214,6 +239,36 @@ func TestDIDWebDocumentURL(t *testing.T) {
 			name: "host with path segments -> <path>/did.json",
 			did:  "did:web:example.com:user:alice",
 			want: "https://example.com/user/alice/did.json",
+		},
+		{
+			// atchess-1c9.72: a did:web host is part of a DID identifier,
+			// not a hostname being resolved -- "example.com" and
+			// "example.com." must not be allowed to name the same PDS
+			// while comparing unequal as strings everywhere this codebase
+			// compares DIDs directly. Reject the trailing dot outright,
+			// even though it is legitimate FQDN syntax for DNS resolution
+			// itself -- see validateDIDWebHost's doc comment.
+			name:    "ordinary host with a single trailing dot is rejected (identifier canonical-form, not IP-specific)",
+			did:     "did:web:example.com.",
+			wantErr: true,
+		},
+		{
+			name:    "ordinary host with multiple trailing dots is rejected",
+			did:     "did:web:example.com..",
+			wantErr: true,
+		},
+		{
+			name:    "bare dot as the entire host is rejected",
+			did:     "did:web:.",
+			wantErr: true,
+		},
+		{
+			// Regression guard: an ordinary, portless, non-dotted did:web
+			// host must keep resolving normally -- this is the case the
+			// trailing-dot rejection above must not disturb.
+			name: "ordinary host, no trailing dot, still resolves",
+			did:  "did:web:example.com",
+			want: "https://example.com/.well-known/did.json",
 		},
 		{
 			name:    "empty identifier",
@@ -640,6 +695,54 @@ func TestNormalizeAndValidateHandle(t *testing.T) {
 			}
 			if got != tc.want {
 				t.Errorf("normalizeAndValidateHandle(%q) = %q, want %q", tc.handle, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestValidateDIDWebHost exercises validateDIDWebHost directly (no
+// network), covering the trailing-dot identifier-canonical-form rule
+// (atchess-1c9.72) alongside the pre-existing checks it must not disturb.
+// A did:web host is part of a DID identifier, not a hostname being
+// resolved: "example.com" and "example.com." must not both validate,
+// since callers all over this codebase compare DID strings directly for
+// ownership/participant checks, and allowing the dot would let the same
+// PDS be named by two strings that compare unequal.
+func TestValidateDIDWebHost(t *testing.T) {
+	cases := []struct {
+		name    string
+		host    string
+		wantErr bool
+	}{
+		{name: "empty host", host: "", wantErr: true},
+
+		// The core atchess-1c9.72 bug and its variants: any trailing dot
+		// is rejected outright, IP-shaped or not.
+		{name: "bare IPv4 literal with a trailing dot", host: "169.254.169.254.", wantErr: true},
+		{name: "hex-last-octet IPv4 spelling with a trailing dot", host: "169.254.169.0xfe.", wantErr: true},
+		{name: "ordinary (non-IP) host with a single trailing dot", host: "example.com.", wantErr: true},
+		{name: "multiple trailing dots on an IP literal", host: "169.254.169.254..", wantErr: true},
+		{name: "multiple trailing dots on an ordinary host", host: "example.com..", wantErr: true},
+		{name: "bare dot as the entire host", host: ".", wantErr: true},
+
+		// Regression guards: ordinary, non-dotted hosts must be unaffected.
+		{name: "ordinary host, no trailing dot, is accepted", host: "example.com", wantErr: false},
+		{name: "bare IPv4 literal, no trailing dot, still rejected as an IP literal (pre-existing atchess-1c9.70 behavior)", host: "169.254.169.254", wantErr: true},
+
+		// Pre-existing checks this fix must not disturb.
+		{name: "userinfo (@) is still rejected", host: "attacker@evil.example", wantErr: true},
+		{name: "port (:) is still rejected", host: "evil.example:8080", wantErr: true},
+		{name: "path separator (/) is still rejected", host: "evil.example/..", wantErr: true},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateDIDWebHost(tc.host)
+			if tc.wantErr && err == nil {
+				t.Fatalf("validateDIDWebHost(%q) = nil, want an error", tc.host)
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("validateDIDWebHost(%q) returned an unexpected error: %v", tc.host, err)
 			}
 		})
 	}
