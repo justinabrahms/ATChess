@@ -1,6 +1,10 @@
 package atproto
 
 import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
@@ -124,6 +128,119 @@ func TestXrpcURL_QueryValuesRoundTrip(t *testing.T) {
 	}
 	if q.Get("uri") != atURI {
 		t.Errorf("uri round-tripped as %q, want %q", q.Get("uri"), atURI)
+	}
+}
+
+// newResolveHandleMockPDS starts a mock PDS handling just enough of the
+// createSession + com.atproto.identity.resolveHandle flow for ResolveHandle
+// to succeed via its same-PDS fast path (resolveHandleSamePDS). It records
+// the raw request URL of the resolveHandle call in *gotURL.
+func newResolveHandleMockPDS(t *testing.T, gotURL *string) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/xrpc/com.atproto.server.createSession":
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"accessJwt": "test-jwt",
+				"did":       "did:plc:resolvehandletest",
+				"handle":    "resolver.test",
+			})
+		case "/xrpc/com.atproto.identity.resolveHandle":
+			*gotURL = r.URL.String()
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"did": "did:plc:resolvedtarget",
+			})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+}
+
+// TestResolveHandle_EscapesHostileHandle is a regression test for
+// atchess-1c9.35: ResolveHandle used to interpolate a caller-supplied
+// handle directly into a query string with no escaping. A handle
+// containing '&', '=' or '#' would corrupt the query structure (raw '/'
+// and ':' are syntactically legal in a query value per RFC 3986 and are
+// NOT the concern here). This asserts the produced request URL both keeps
+// the query well-formed (no spurious "admin" parameter smuggled in) and
+// round-trips the hostile handle's exact original value -- not just that
+// SOME escaping happened, which a double-escaped URL would also pass.
+func TestResolveHandle_EscapesHostileHandle(t *testing.T) {
+	const hostileHandle = "evil.example&admin=true#frag"
+
+	var gotURL string
+	mockPDS := newResolveHandleMockPDS(t, &gotURL)
+	defer mockPDS.Close()
+
+	client, err := NewClient(mockPDS.URL, "resolver.test", "password")
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
+
+	did, err := client.ResolveHandle(context.Background(), hostileHandle)
+	if err != nil {
+		t.Fatalf("ResolveHandle returned an unexpected error: %v", err)
+	}
+	if did != "did:plc:resolvedtarget" {
+		t.Errorf("ResolveHandle returned did %q, want %q", did, "did:plc:resolvedtarget")
+	}
+
+	parsed, err := url.Parse(gotURL)
+	if err != nil {
+		t.Fatalf("resolveHandle request URL %q did not parse: %v", gotURL, err)
+	}
+	q := parsed.Query()
+
+	// The round trip is the real assertion: confirm the decoded "handle"
+	// value is byte-identical to the original hostile input.
+	if got := q.Get("handle"); got != hostileHandle {
+		t.Errorf("handle round-tripped as %q, want %q", got, hostileHandle)
+	}
+
+	// Confirm the query structure was not corrupted: the embedded
+	// "admin=true" and "#frag" must not have become their own query
+	// parameter or fragment.
+	if _, ok := q["admin"]; ok {
+		t.Errorf("query %q was corrupted: unexpected standalone %q parameter smuggled in from the unescaped handle", parsed.RawQuery, "admin")
+	}
+	if parsed.Fragment != "" {
+		t.Errorf("query %q was corrupted: unexpected fragment %q smuggled in from the unescaped handle", gotURL, parsed.Fragment)
+	}
+	if len(q) != 1 {
+		t.Errorf("query %q has %d parameters, want exactly 1 (\"handle\")", parsed.RawQuery, len(q))
+	}
+}
+
+// TestResolveHandle_OrdinaryHandleURLUnchanged pins today's exact request
+// URL for an ordinary handle, so the atchess-1c9.35 escaping fix cannot
+// silently change behaviour for the common case. The expected suffix below
+// is a literal, hand-verified string (not built via xrpcURL or
+// url.Values.Encode) -- see atchess-1c9.35's done-criteria: computing the
+// expectation with the same helper the production code uses would make
+// this test tautological.
+func TestResolveHandle_OrdinaryHandleURLUnchanged(t *testing.T) {
+	// This is the request-target the server actually receives (path+query,
+	// no scheme/authority -- that's how net/http populates *http.Request.URL
+	// server-side for an ordinary, non-proxy HTTP/1.1 request).
+	const want = "/xrpc/com.atproto.identity.resolveHandle?handle=alice.test"
+
+	var gotURL string
+	mockPDS := newResolveHandleMockPDS(t, &gotURL)
+	defer mockPDS.Close()
+
+	client, err := NewClient(mockPDS.URL, "resolver.test", "password")
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
+
+	if _, err := client.ResolveHandle(context.Background(), "alice.test"); err != nil {
+		t.Fatalf("ResolveHandle returned an unexpected error: %v", err)
+	}
+
+	if gotURL != want {
+		t.Errorf("resolveHandle request URL = %q, want %q (byte-identical to today's output)", gotURL, want)
 	}
 }
 
