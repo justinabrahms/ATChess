@@ -192,6 +192,11 @@ func (s *Service) OAuthCallbackHandler(w http.ResponseWriter, r *http.Request) {
 
 	sessionID := sessionStore.CreateSession(session)
 
+	// Login-time repo-read challenge backfill (atchess-1c9.46) -- see
+	// LoginHandler's (internal/web/service.go) identical call for why this
+	// runs synchronously, before the redirect, rather than fire-and-forget.
+	s.backfillChallengesOnLogin(r.Context(), tokens.Sub)
+
 	// Redirect to main page with session
 	http.Redirect(w, r, "/?session="+sessionID, http.StatusFound)
 }

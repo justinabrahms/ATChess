@@ -54,3 +54,9 @@ test/.harness-accounts.json
 
 # Live bsky.social test credentials for atchess-1c9.14 (never commit)
 test/.live-accounts.json
+
+# Firehose cursor persistence state (atchess-1c9.46; see
+# internal/firehose.CursorStore and config.FirehoseConfig.StateDir).
+# Process-local, host-specific, and regenerated automatically -- never
+# commit.
+data/

@@ -509,16 +509,20 @@ func (c *Client) RecordMove(ctx context.Context, gameURI string, move *chess.Mov
 // failed in federation and has been removed entirely rather than retried.
 //
 // Delivery to the challenged player is instead the responsibility of the
-// discovery mechanism described in internal/challenge and
-// internal/firehose: the challenged player's own protocol-service instance
-// discovers this record by subscribing to the firehose of any PDS that
-// might host a challenger (see cmd/protocol/main.go) and indexing
+// discovery mechanism described in internal/challenge, internal/firehose,
+// and internal/backfill (see docs/firehose-and-backfill.md for the full
+// picture): the challenged player's own protocol-service instance
+// discovers this record two ways -- (1) subscribing to the firehose of any
+// PDS that might host a challenger (see cmd/protocol/main.go) and indexing
 // app.atchess.challenge commits whose "challenged" field matches its own
-// authenticated users, plus a startup backfill (an explicit cursor-0
-// resubscribe that replays each watched PDS's full commit history) for
-// challenges issued while offline. challengerHandle is embedded directly in
-// the record so a subscriber can display it without a second DID resolution
-// round trip.
+// authenticated users, with cursor persistence across restarts
+// (atchess-1c9.46) rather than a full-log replay on every boot; and (2) a
+// login-time repo-read backfill (internal/backfill), run synchronously on
+// every login, that queries known PDSes' repos directly for challenges
+// issued while that player's session wasn't around -- see that package's
+// doc comment for exactly what it can and cannot find. challengerHandle is
+// embedded directly in the record so a subscriber can display it without a
+// second DID resolution round trip.
 func (c *Client) CreateChallenge(ctx context.Context, opponentDID, color, message string) (*chess.Challenge, error) {
 	createdAt := time.Now()
 	proposedGameID := generateGameID(c.did, opponentDID, createdAt)

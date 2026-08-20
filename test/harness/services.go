@@ -25,6 +25,19 @@ import (
 type Services struct {
 	AliceURL string
 	BobURL   string
+
+	// AliceStateDir/BobStateDir are each instance's own FIREHOSE_STATE_DIR
+	// (atchess-1c9.46 review fix): each protocol-service instance gets a
+	// distinct, per-instance state directory rather than the package
+	// default (./data/firehose relative to the repo root, shared by every
+	// instance started from this repo). Without that, two instances
+	// sharing one cursors.json clobber each other -- a short-lived
+	// instance's periodic flush of "no cursor yet" (-1, which
+	// CursorStore.Store treats as a delete) for a host can erase a cursor
+	// a DIFFERENT, still-running instance legitimately persisted for that
+	// same host key. See startProtocolService.
+	AliceStateDir string
+	BobStateDir   string
 }
 
 // syncBuffer is a mutex-protected byte buffer used to capture a
@@ -89,10 +102,11 @@ func buildProtocolBinary(t *testing.T) string {
 
 // serviceInstance tracks one running protocol-service subprocess.
 type serviceInstance struct {
-	label string
-	url   string
-	cmd   *exec.Cmd
-	logs  *syncBuffer
+	label    string
+	url      string
+	stateDir string
+	cmd      *exec.Cmd
+	logs     *syncBuffer
 
 	mu       sync.Mutex
 	exited   bool
@@ -229,6 +243,16 @@ func startProtocolService(t *testing.T, binPath string, account Account, port in
 
 	url := fmt.Sprintf("http://127.0.0.1:%d", port)
 
+	// FIREHOSE_STATE_DIR (atchess-1c9.46 review fix): must be per-instance.
+	// t.TempDir() returns a fresh, unique directory on every call (even
+	// repeated calls against the same t), so alice's instance, bob's
+	// instance, and any additional instance started later in the same test
+	// (e.g. the OfflineBackfill subtest's second bob instance) each get
+	// their own cursors.json rather than sharing (and clobbering) the
+	// package-default ./data/firehose under the repo root -- see Services'
+	// doc comment for what that sharing broke.
+	stateDir := filepath.Join(t.TempDir(), "firehose-state")
+
 	cmd := exec.Command(binPath)
 	cmd.Dir = repoRootDir()
 	cmd.Env = append(os.Environ(),
@@ -241,6 +265,7 @@ func startProtocolService(t *testing.T, binPath string, account Account, port in
 		"ATPROTO_USE_DPOP=false",
 		"FIREHOSE_ENABLED=true",
 		"FIREHOSE_URL="+firehoseURLs,
+		"FIREHOSE_STATE_DIR="+stateDir,
 	)
 	if plcDirectoryURL != "" {
 		cmd.Env = append(cmd.Env, "ATPROTO_PLC_DIRECTORY_URL="+plcDirectoryURL)
@@ -254,6 +279,7 @@ func startProtocolService(t *testing.T, binPath string, account Account, port in
 	inst := &serviceInstance{
 		label:    label,
 		url:      url,
+		stateDir: stateDir,
 		cmd:      cmd,
 		logs:     logs,
 		exitedCh: make(chan struct{}),
@@ -361,12 +387,14 @@ func StartServices(t *testing.T, accounts *Accounts) *Services {
 	plcDirectoryURL := resolvePLCDirectoryURL(t)
 	firehoseURLs := AllPDSFirehoseURLs(accounts)
 
-	aliceURL := StartPlayerService(t, binPath, accounts.Alice, "alice", plcDirectoryURL, firehoseURLs)
-	bobURL := StartPlayerService(t, binPath, accounts.Bob, "bob", plcDirectoryURL, firehoseURLs)
+	aliceURL, aliceStateDir := StartPlayerService(t, binPath, accounts.Alice, "alice", plcDirectoryURL, firehoseURLs)
+	bobURL, bobStateDir := StartPlayerService(t, binPath, accounts.Bob, "bob", plcDirectoryURL, firehoseURLs)
 
 	return &Services{
-		AliceURL: aliceURL,
-		BobURL:   bobURL,
+		AliceURL:      aliceURL,
+		BobURL:        bobURL,
+		AliceStateDir: aliceStateDir,
+		BobStateDir:   bobStateDir,
 	}
 }
 
@@ -404,15 +432,16 @@ func ResolvePLCDirectoryURL(t *testing.T) string {
 // (using binPath, built by BuildProtocolBinary/buildProtocolBinary),
 // listening on a freshly allocated port, configured to watch
 // firehoseURLs (see AllPDSFirehoseURLs) for challenge delivery. It blocks
-// until the instance reports healthy and returns its base URL. Exported
+// until the instance reports healthy and returns its base URL and its own
+// (per-instance, see startProtocolService) FIREHOSE_STATE_DIR. Exported
 // (unlike the underlying startProtocolService) so tests that need to start
 // one player's instance independently of the other -- notably an
 // offline-backfill test, where one player's instance must NOT be running
 // yet when the other player issues a challenge -- can do so directly,
 // rather than only via StartServices' both-at-once topology.
-func StartPlayerService(t *testing.T, binPath string, account Account, label string, plcDirectoryURL string, firehoseURLs string) string {
+func StartPlayerService(t *testing.T, binPath string, account Account, label string, plcDirectoryURL string, firehoseURLs string) (url string, stateDir string) {
 	t.Helper()
 	port := freePort(t)
 	inst := startProtocolService(t, binPath, account, port, label, plcDirectoryURL, firehoseURLs)
-	return inst.url
+	return inst.url, inst.stateDir
 }

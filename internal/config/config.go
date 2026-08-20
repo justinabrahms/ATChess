@@ -43,17 +43,60 @@ type DevelopmentConfig struct {
 
 type FirehoseConfig struct {
 	Enabled bool `mapstructure:"enabled"`
-	// URL is one or more (comma-separated, see cmd/protocol/main.go's
-	// splitFirehoseURLs) com.atproto.sync.subscribeRepos websocket
-	// endpoints to subscribe to. Challenge delivery (atchess-1c9.11)
-	// depends on watching every PDS that might host a challenger, since a
-	// challenge record only ever lives in its author's own repo; in a real
-	// production deployment this should ultimately point at a
-	// network-wide relay/Jetstream aggregator instead of an explicit list
-	// of individual PDSes, but no such relay exists in this project's local
-	// test harness (see test/harness/services.go), which instead lists the
-	// harness's own known PDSes directly.
+	// URL is one or more (comma-separated, see SplitFirehoseURLs)
+	// com.atproto.sync.subscribeRepos websocket endpoints to subscribe to,
+	// AND (atchess-1c9.46) the closed set of PDS hosts the login-time
+	// repo-read backfill (internal/backfill) is allowed to enumerate --
+	// see that package's doc comment for why it is bounded to exactly this
+	// list rather than attempting to search the whole network.
+	//
+	// For a real single-PDS deployment (e.g. testing against one real
+	// bsky.social account), this should point at that PDS's own
+	// subscribeRepos endpoint, or -- once a genuine network-wide relay is
+	// in front of it -- wss://bsky.network/xrpc/com.atproto.sync.subscribeRepos
+	// (the real, public AT Protocol relay; NOT bsky.social, which is a
+	// single very large PDS, not a relay). See docs/firehose-and-backfill.md.
+	//
+	// The comma-separated multi-URL form exists for test topologies with
+	// more than one PDS and no relay in front of them (this project's local
+	// dual-PDS harness, see test/harness/services.go, which lists its own
+	// known PDSes directly since no relay exists there) -- it is not
+	// expected to be used in a real deployment against the public network.
 	URL string `mapstructure:"url"`
+
+	// StateDir is the directory used to persist each watched host's last
+	// processed firehose sequence number across process restarts
+	// (atchess-1c9.46; see internal/firehose.CursorStore), so a restart
+	// resumes from where it left off instead of either replaying a host's
+	// entire retained commit log (the defect this field's addition fixes)
+	// or silently discarding history by always starting at the live tip.
+	// This project has no database (see CLAUDE.md), so a small file under
+	// this directory is the natural fit. Must be writable by the process;
+	// created if it does not exist.
+	StateDir string `mapstructure:"state_dir"`
+}
+
+// SplitFirehoseURLs parses raw (see FirehoseConfig.URL's doc comment) as a
+// comma-separated list of com.atproto.sync.subscribeRepos websocket URLs,
+// trimming whitespace and dropping empty entries. Shared by
+// cmd/protocol/main.go (which subscribes to each one) and internal/web
+// (which bounds the login-time repo-read backfill to the same closed list)
+// so the two "which PDSes does this deployment know about" answers can
+// never drift apart. Lives here, in the leaf config package, rather than in
+// internal/firehose or internal/backfill, specifically to avoid an import
+// cycle: internal/firehose imports internal/web (EventProcessor uses
+// web.Hub), so internal/web cannot import internal/firehose, and
+// internal/backfill must be importable from internal/web without also
+// being reachable from internal/firehose.
+func SplitFirehoseURLs(raw string) []string {
+	var urls []string
+	for _, part := range strings.Split(raw, ",") {
+		u := strings.TrimSpace(part)
+		if u != "" {
+			urls = append(urls, u)
+		}
+	}
+	return urls
 }
 
 func Load() (*Config, error) {
@@ -82,6 +125,7 @@ func Load() (*Config, error) {
 	viper.BindEnv("development.log_level", "DEVELOPMENT_LOG_LEVEL", "ATCHESS_DEVELOPMENT_LOG_LEVEL")
 	viper.BindEnv("firehose.enabled", "FIREHOSE_ENABLED", "ATCHESS_FIREHOSE_ENABLED")
 	viper.BindEnv("firehose.url", "FIREHOSE_URL", "ATCHESS_FIREHOSE_URL")
+	viper.BindEnv("firehose.state_dir", "FIREHOSE_STATE_DIR", "ATCHESS_FIREHOSE_STATE_DIR")
 
 	// Set defaults
 	viper.SetDefault("server.host", "localhost")
@@ -93,6 +137,7 @@ func Load() (*Config, error) {
 	viper.SetDefault("development.log_level", "info")
 	viper.SetDefault("firehose.enabled", false)
 	viper.SetDefault("firehose.url", "wss://bsky.social/xrpc/com.atproto.sync.subscribeRepos")
+	viper.SetDefault("firehose.state_dir", "./data/firehose")
 
 	// Read config
 	if err := viper.ReadInConfig(); err != nil {
@@ -126,8 +171,9 @@ func loadDefaults() *Config {
 			LogLevel: "info",
 		},
 		Firehose: FirehoseConfig{
-			Enabled: false,
-			URL:     "wss://bsky.social/xrpc/com.atproto.sync.subscribeRepos",
+			Enabled:  false,
+			URL:      "wss://bsky.social/xrpc/com.atproto.sync.subscribeRepos",
+			StateDir: "./data/firehose",
 		},
 	}
 }

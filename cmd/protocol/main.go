@@ -7,7 +7,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
 
@@ -77,6 +76,17 @@ func main() {
 	// Create firehose processor with shared challenge store
 	processor := firehose.NewEventProcessor(hub, challengeStore)
 
+	// firehoseClients/firehoseClientURLs and cursorStore are declared here
+	// (rather than scoped to the `if cfg.Firehose.Enabled` block below) so
+	// the graceful-shutdown code further down can flush final cursor
+	// positions and stop the clients; they stay nil/empty when firehose is
+	// disabled.
+	var (
+		firehoseClients    []*firehose.Client
+		firehoseClientURLs []string
+		cursorStore        *firehose.CursorStore
+	)
+
 	// Start firehose client(s) (optional -- can be disabled in config).
 	// Challenge delivery (atchess-1c9.11) depends on this: a challenge
 	// record only ever lives in its CHALLENGER's own repo (AT Protocol
@@ -90,31 +100,84 @@ func main() {
 	// firehose.Client (sequence numbers, and therefore cursors, are
 	// per-source), all reporting into the same shared processor/challengeStore.
 	if cfg.Firehose.Enabled {
-		urls := splitFirehoseURLs(cfg.Firehose.URL)
+		urls := config.SplitFirehoseURLs(cfg.Firehose.URL)
 		if len(urls) == 0 {
 			log.Warn().Msg("firehose enabled but no URL(s) configured; challenge delivery will not work")
 		}
+
+		// Cursor persistence (atchess-1c9.46): resume each watched host
+		// from wherever this process last got to, instead of either
+		// replaying that host's ENTIRE retained commit log on every boot
+		// (WithCursor(0), unconditionally, on every process start -- the
+		// defect this fixes: against a production-scale host such as the
+		// shipped default wss://bsky.social, that is an unbounded replay
+		// of a huge commit log on every single restart) or silently
+		// discarding history by always starting at the live tip. A failure
+		// to initialize the cursor store (e.g. an unwritable state dir) is
+		// logged and degrades to "no persistence this run" rather than
+		// failing startup -- firehose subscription and login backfill both
+		// still work, just without cross-restart cursor resumption.
+		var err error
+		cursorStore, err = firehose.NewCursorStore(cfg.Firehose.StateDir, log.Logger)
+		if err != nil {
+			log.Error().Err(err).Str("stateDir", cfg.Firehose.StateDir).Msg("failed to initialize firehose cursor store; continuing without cursor persistence for this run")
+			cursorStore = nil
+		}
+
 		for _, u := range urls {
 			u := u
+
+			// WithLogger (atchess-1c9.46 review fix): without this, Client
+			// falls back to zerolog.Nop() (see firehose.NewClient) and
+			// every #info/OutdatedCursor/FutureCursor/error-frame log this
+			// bead added -- the only diagnostic signal for atchess-1c9.16's
+			// runbook and atchess-1c9.14's live-network validation -- is
+			// silently discarded. Tagged with the host's URL so multi-host
+			// deployments (this harness watches more than one PDS) can
+			// tell which client emitted a given line.
+			opts := []firehose.Option{
+				firehose.WithURL(u),
+				firehose.WithLogger(log.Logger.With().Str("firehoseURL", u).Logger()),
+			}
+
+			// BOUNDED INITIAL BACKFILL (atchess-1c9.46): when there is no
+			// persisted cursor for this host (first run against it, or a
+			// cursor that was cleared -- see CursorStore.Store and
+			// firehose.Client's FutureCursor handling), this process does
+			// NOT request cursor 0. Requesting 0 means "replay this host's
+			// entire retained commit log from the very beginning", which
+			// for a production-scale host is unbounded and exactly the
+			// defect this bead fixes; it is not "backfill", it is "replay
+			// everything, every boot". Instead, the client starts at the
+			// live tip (no WithCursor option at all -- see
+			// firehose.Client's lastSequence field doc comment for why -1
+			// means exactly that), and the HISTORICAL side of "don't miss
+			// a challenge issued while offline" is handled by a much more
+			// targeted mechanism: the login-time repo-read backfill
+			// (internal/backfill, invoked from internal/web's
+			// LoginHandler/OAuthCallbackHandler), which reads directly and
+			// specifically for the logging-in user rather than replaying
+			// every record for every user on the host.
+			if cursorStore != nil {
+				if stored, ok := cursorStore.Get(u); ok {
+					opts = append(opts, firehose.WithCursor(stored))
+					log.Info().Str("url", u).Int64("cursor", stored).Msg("resuming firehose subscription from persisted cursor")
+				} else {
+					log.Info().Str("url", u).Msg("no persisted cursor for this host; starting at the live tip (no historical replay) -- history is instead covered by the login-time repo-read backfill (internal/backfill)")
+				}
+			} else {
+				log.Info().Str("url", u).Msg("cursor persistence unavailable this run; starting at the live tip (no historical replay)")
+			}
+
 			firehoseClient := firehose.NewClient(
 				firehose.CreateChessEventHandler(processor),
-				firehose.WithURL(u),
-				// WithCursor(0) forces THIS process's first connection to
-				// every watched PDS to replay from the very beginning of
-				// its commit log, not just the live tip -- this is
-				// atchess-1c9.11's backfill-on-login: a challenge issued
-				// while this process was not running is still discovered
-				// once it starts and (re)subscribes, rather than only ever
-				// seeing challenges created after that moment. Every
-				// subsequent reconnect resumes from whatever sequence was
-				// actually last processed (see firehose.Client.LastSequence),
-				// not cursor 0 again, once at least one message has been
-				// processed.
-				firehose.WithCursor(0),
+				opts...,
 			)
+			firehoseClients = append(firehoseClients, firehoseClient)
+			firehoseClientURLs = append(firehoseClientURLs, u)
 
 			go func() {
-				log.Info().Str("url", u).Msg("Starting firehose client (backfill-from-beginning + live subscription)")
+				log.Info().Str("url", u).Msg("Starting firehose client")
 				if err := firehoseClient.Start(); err != nil {
 					log.Error().Err(err).Str("url", u).Msg("Firehose client error")
 				}
@@ -123,6 +186,24 @@ func main() {
 
 		// Track the current user's games
 		processor.TrackPlayer(client.GetDID())
+	}
+
+	// Periodically persist each watched host's last-processed sequence
+	// number (atchess-1c9.46), rather than on every single processed
+	// frame: a write (fsync-adjacent rename, see CursorStore.saveLocked)
+	// per firehose message would be needless I/O pressure against a
+	// busy/production-scale host, and it is not necessary for correctness
+	// -- a restart that resumes from a cursor up to
+	// firehoseCursorPersistInterval (plus the final flush performed during
+	// graceful shutdown below) old will, at worst, reprocess a handful of
+	// already-seen events, which is safe: challenge.Store.Add dedups by
+	// challenge URI, so reprocessing is a no-op there, and every other
+	// event type this processor handles is itself naturally idempotent
+	// (see internal/firehose.EventProcessor).
+	var stopCursorPersist chan struct{}
+	if cursorStore != nil && len(firehoseClients) > 0 {
+		stopCursorPersist = make(chan struct{})
+		go persistFirehoseCursorsPeriodically(cursorStore, firehoseClients, firehoseClientURLs, stopCursorPersist)
 	}
 
 	// Setup routes
@@ -275,6 +356,23 @@ func main() {
 	<-quit
 	log.Info().Msg("Shutting down server...")
 
+	// Stop the periodic cursor-persistence loop and do one final flush so
+	// the on-disk cursor is as fresh as possible at shutdown (bounding the
+	// replay-on-restart window to whatever happened in the last instant
+	// before this flush, rather than up to firehoseCursorPersistInterval
+	// stale).
+	if stopCursorPersist != nil {
+		close(stopCursorPersist)
+	}
+	if cursorStore != nil {
+		flushFirehoseCursors(cursorStore, firehoseClients, firehoseClientURLs)
+	}
+	for _, c := range firehoseClients {
+		if err := c.Stop(); err != nil {
+			log.Warn().Err(err).Msg("error stopping firehose client during shutdown")
+		}
+	}
+
 	// Graceful shutdown
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -286,18 +384,38 @@ func main() {
 	log.Info().Msg("Server exited")
 }
 
-// splitFirehoseURLs parses cfg.Firehose.URL (see FirehoseConfig.URL's doc
-// comment) as a comma-separated list of com.atproto.sync.subscribeRepos
-// websocket URLs, trimming whitespace and dropping empty entries.
-func splitFirehoseURLs(raw string) []string {
-	var urls []string
-	for _, part := range strings.Split(raw, ",") {
-		u := strings.TrimSpace(part)
-		if u != "" {
-			urls = append(urls, u)
+// firehoseCursorPersistInterval bounds how often each watched host's
+// last-processed sequence number is written to disk -- see the comment
+// where persistFirehoseCursorsPeriodically is started in main() for why a
+// bounded interval (rather than every processed frame) was chosen.
+const firehoseCursorPersistInterval = 5 * time.Second
+
+// persistFirehoseCursorsPeriodically writes each client's current
+// LastSequence to store, keyed by its corresponding URL in urls (same
+// index), every firehoseCursorPersistInterval until stop is closed.
+func persistFirehoseCursorsPeriodically(store *firehose.CursorStore, clients []*firehose.Client, urls []string, stop <-chan struct{}) {
+	ticker := time.NewTicker(firehoseCursorPersistInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			flushFirehoseCursors(store, clients, urls)
+		case <-stop:
+			return
 		}
 	}
-	return urls
+}
+
+// flushFirehoseCursors writes each client's current LastSequence to store
+// immediately (used both by the periodic loop and by the final shutdown
+// flush).
+func flushFirehoseCursors(store *firehose.CursorStore, clients []*firehose.Client, urls []string) {
+	for i, c := range clients {
+		seq := c.LastSequence()
+		if err := store.Store(urls[i], seq); err != nil {
+			log.Error().Err(err).Str("url", urls[i]).Msg("failed to persist firehose cursor")
+		}
+	}
 }
 
 func showHelpMessage() {

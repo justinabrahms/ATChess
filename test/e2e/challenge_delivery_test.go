@@ -54,14 +54,26 @@
 //     internal/firehose.Client (LastSequence/setLastSequence,
 //     pre-atchess-1c9.11) and is unchanged here.
 //
-//  4. Backfill on login: every firehose.Client cmd/protocol/main.go starts
-//     is given firehose.WithCursor(0), which forces its FIRST connection to
-//     each watched PDS to request cursor 0 -- a full replay of that PDS's
-//     commit log from the very beginning, not just the live tip. This is
-//     how a challenge issued while a player's protocol-service instance was
-//     not running yet is still discovered once that instance starts and
-//     (re)subscribes: see the OfflineBackfill subtest below, which starts
-//     bob's instance strictly AFTER alice's challenge already exists.
+//  4. Backfill on login (REDESIGNED under atchess-1c9.46 -- see that bead
+//     and docs/firehose-and-backfill.md): firehose.Client no longer
+//     defaults to WithCursor(0) on every process start -- that forced a
+//     full replay of the ENTIRE watched PDS's commit log on every single
+//     boot, which is unbounded against a production-scale host and was
+//     itself the defect atchess-1c9.46 fixes. cmd/protocol/main.go now
+//     persists each host's cursor across restarts and, with no persisted
+//     cursor (e.g. this test's freshly built instances), starts each
+//     firehose.Client at the LIVE TIP instead. The offline-delivery case
+//     below is instead covered by internal/backfill: a repo-read backfill
+//     run synchronously by internal/web's LoginHandler on every login,
+//     which queries com.atproto.sync.listRepos +
+//     com.atproto.repo.listRecords directly against every PDS named in
+//     FIREHOSE_URL for app.atchess.challenge records addressed to the
+//     logging-in user -- independent of the firehose entirely. This is why
+//     the OfflineBackfill subtest below passes: NOT because bob's second
+//     instance replays PDS-A's history via the firehose (it does not, by
+//     design), but because harness.NewPlayer's login call
+//     (POST /api/auth/login) triggers that repo-read backfill before the
+//     login response is even returned.
 //
 //  5. Decline is expressed without writing to the challenger's repo: DELETE
 //     /api/challenge-notifications/{key} (key = the challenge's full at://
@@ -77,6 +89,8 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -154,6 +168,34 @@ func pollForChallenge(t *testing.T, player *harness.Player, wantURI string, dead
 		}
 		if elapsed >= deadline {
 			return
+		}
+		time.Sleep(interval)
+	}
+}
+
+// pollForNonEmptyCursorFile polls path (a protocol-service instance's own
+// FIREHOSE_STATE_DIR/cursors.json) until it exists, parses as a non-empty
+// JSON object, and returns the decoded map. cmd/protocol/main.go flushes
+// cursors every firehoseCursorPersistInterval (5s) rather than on every
+// processed event, so this must tolerate that delay rather than checking
+// once; deadline should comfortably exceed 5s.
+func pollForNonEmptyCursorFile(t *testing.T, path string, deadline time.Duration) map[string]int64 {
+	t.Helper()
+	start := time.Now()
+	interval := 500 * time.Millisecond
+	for {
+		data, err := os.ReadFile(path)
+		if err == nil {
+			var cursors map[string]int64
+			if jsonErr := json.Unmarshal(data, &cursors); jsonErr == nil && len(cursors) > 0 {
+				return cursors
+			}
+		}
+		if time.Since(start) >= deadline {
+			if err != nil {
+				t.Fatalf("cursors.json at %s never appeared/became non-empty within %s: last read error: %v", path, deadline, err)
+			}
+			t.Fatalf("cursors.json at %s never became non-empty within %s: last contents: %s", path, deadline, string(data))
 		}
 		time.Sleep(interval)
 	}
@@ -409,13 +451,20 @@ func TestChallengeDelivery(t *testing.T) {
 			// protocol-service instance did not exist, and therefore was
 			// not subscribed to anything, at the time the challenge above
 			// was created. StartPlayerService blocks until it reports
-			// healthy; cmd/protocol/main.go gives its firehose.Client(s)
-			// firehose.WithCursor(0), so their FIRST connection to each
-			// watched PDS replays that PDS's full commit history rather
-			// than starting at the live tip -- this is the backfill.
-			bobSecondURL := harness.StartPlayerService(t, binPath, accounts.Bob, "bob-second-instance-offline-backfill", plcDirectoryURL, firehoseURLs)
+			// healthy; its firehose.Client(s) start at the LIVE TIP (no
+			// stored cursor, see atchess-1c9.46) so they do NOT see this
+			// already-past challenge via the firehose at all. Discovery
+			// instead happens inside harness.NewPlayer below: its call to
+			// POST /api/auth/login runs internal/backfill's synchronous
+			// repo-read backfill (querying PDS-A -- alice's host -- and
+			// PDS-B directly, independent of the firehose) BEFORE the
+			// login response is returned, which is what actually finds
+			// this challenge. See this file's header comment, point 4, for
+			// the full explanation of why this subtest now passes for a
+			// different reason than it originally did.
+			bobSecondURL, _ := harness.StartPlayerService(t, binPath, accounts.Bob, "bob-second-instance-offline-backfill", plcDirectoryURL, firehoseURLs)
 			bobSecond := harness.NewPlayer(t, accounts.Bob, bobSecondURL)
-			t.Logf("bob's second instance started (simulating his client coming online after being offline): %s", bobSecondURL)
+			t.Logf("bob's second instance started (simulating his client coming online after being offline); login (which triggers the repo-read backfill) has already completed: %s", bobSecondURL)
 
 			status, notifications, body, elapsed, found := pollForChallenge(t, bobSecond, offlineChallengeURI, 15*time.Second)
 			if status != http.StatusOK {
@@ -426,6 +475,81 @@ func TestChallengeDelivery(t *testing.T) {
 			}
 			t.Logf("OK: bob's second instance discovered the offline-issued challenge via backfill after %s: %+v", elapsed, *found)
 		})
+	})
+
+	// ---------------------------------------------------------------
+	// CursorPersistence (atchess-1c9.46 review fix, defect 2): each
+	// instance's OWN cursors.json (under its own per-instance
+	// FIREHOSE_STATE_DIR -- see Services' doc comment) must actually be
+	// non-empty and correct after a full run, proving cursor persistence
+	// is not being silently wiped by another instance sharing the same
+	// state directory (the defect: the harness previously never set
+	// FIREHOSE_STATE_DIR at all, so every instance shared one file).
+	// ---------------------------------------------------------------
+	t.Run("CursorPersistence_PerInstanceStateDirIsNotClobbered", func(t *testing.T) {
+		// Guard 1 (atchess-1c9.46 second review fix): assert the two
+		// instances were actually given DISTINCT state directories BEFORE
+		// doing anything else. Without this, the checks below can pass
+		// for the wrong reason -- see the next comment -- and this
+		// subtest would prove nothing about "not clobbered" despite its
+		// name. This alone fails immediately (not after any poll window)
+		// if the per-instance FIREHOSE_STATE_DIR wiring in
+		// test/harness/services.go is ever removed or reverted to a
+		// single shared directory for every instance.
+		if services.AliceStateDir == "" || services.BobStateDir == "" {
+			t.Fatalf("services.AliceStateDir=%q services.BobStateDir=%q: per-instance FIREHOSE_STATE_DIR was not wired up (empty)", services.AliceStateDir, services.BobStateDir)
+		}
+		if services.AliceStateDir == services.BobStateDir {
+			t.Fatalf("services.AliceStateDir == services.BobStateDir == %q: alice's and bob's instances were given the SAME state directory -- this is exactly the defect this subtest exists to catch (see Services' doc comment); everything below would be checking one shared file, not two independent ones", services.AliceStateDir)
+		}
+
+		aliceCursorsPath := filepath.Join(services.AliceStateDir, "cursors.json")
+		bobCursorsPath := filepath.Join(services.BobStateDir, "cursors.json")
+
+		aliceCursors := pollForNonEmptyCursorFile(t, aliceCursorsPath, 20*time.Second)
+		bobCursors := pollForNonEmptyCursorFile(t, bobCursorsPath, 20*time.Second)
+
+		t.Logf("alice's instance cursors.json (%s): %+v", aliceCursorsPath, aliceCursors)
+		t.Logf("bob's instance cursors.json (%s): %+v", bobCursorsPath, bobCursors)
+
+		// Guard 2: prove the two paths above resolved to two physically
+		// DIFFERENT files on disk, not merely two different path strings
+		// that happen to end up pointing at the same inode (e.g. via a
+		// symlink) or, more to the point, two strings that our own Go
+		// code computed distinctly while the actual subprocess ignored
+		// FIREHOSE_STATE_DIR and both wrote to one shared default file
+		// instead (in which case one or both of the reads above would
+		// never have observed a non-empty file at all and already failed
+		// -- see pollForNonEmptyCursorFile -- but this closes the gap for
+		// any path where they don't). This is the check that actually
+		// exercises "not clobbered": with content-based checks alone
+		// (non-empty, no negative values), a single shared file kept
+		// alive by two still-running instances self-heals within the
+		// poll window above regardless of whether clobbering occurred,
+		// which is exactly how this subtest previously passed even after
+		// the per-instance state dir wiring was removed entirely.
+		aliceInfo, err := os.Stat(aliceCursorsPath)
+		if err != nil {
+			t.Fatalf("os.Stat(%s) failed after successfully reading it: %v", aliceCursorsPath, err)
+		}
+		bobInfo, err := os.Stat(bobCursorsPath)
+		if err != nil {
+			t.Fatalf("os.Stat(%s) failed after successfully reading it: %v", bobCursorsPath, err)
+		}
+		if os.SameFile(aliceInfo, bobInfo) {
+			t.Fatalf("alice's cursors.json (%s) and bob's cursors.json (%s) are the SAME underlying file on disk -- their instances are clobbering each other's persisted cursors", aliceCursorsPath, bobCursorsPath)
+		}
+
+		for _, seq := range aliceCursors {
+			if seq < 0 {
+				t.Errorf("alice's instance persisted a negative cursor %d (should have been deleted, not stored, by CursorStore.Store)", seq)
+			}
+		}
+		for _, seq := range bobCursors {
+			if seq < 0 {
+				t.Errorf("bob's instance persisted a negative cursor %d (should have been deleted, not stored, by CursorStore.Store)", seq)
+			}
+		}
 	})
 
 	t.Logf("SUMMARY: challengeURI=%s bobDeclined=true", challengeURI)

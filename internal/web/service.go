@@ -11,12 +11,31 @@ import (
 
 	"github.com/gorilla/mux"
 	"github.com/justinabrahms/atchess/internal/atproto"
+	"github.com/justinabrahms/atchess/internal/backfill"
 	"github.com/justinabrahms/atchess/internal/challenge"
 	"github.com/justinabrahms/atchess/internal/chess"
 	"github.com/justinabrahms/atchess/internal/config"
 	"github.com/justinabrahms/atchess/internal/oauth"
 	"github.com/rs/zerolog/log"
 )
+
+// loginBackfillTimeout bounds how long the login-time repo-read challenge
+// backfill (internal/backfill, atchess-1c9.46) is allowed to run IN TOTAL,
+// across every configured host, before a login request proceeds anyway.
+// Login must never hang indefinitely on a slow or unreachable PDS; the
+// backfill is a best-effort convenience (the live firehose subscription,
+// once running, is the ongoing source of truth), not a precondition for
+// authentication succeeding.
+//
+// This is an overall ceiling, not a per-host budget: internal/backfill's
+// Backfiller ALSO enforces its own per-host timeout (see that package's
+// defaultPerHostTimeout) so that one wedged/unresponsive host cannot
+// consume this entire budget by itself and leave every other configured
+// host unattempted (atchess-1c9.46 review fix, defect 3) -- with N
+// configured hosts each individually capped well below
+// loginBackfillTimeout, every host gets a real attempt even if an earlier
+// one is completely unresponsive, up to this overall ceiling.
+const loginBackfillTimeout = 8 * time.Second
 
 type Service struct {
 	// serverClient is this protocol-service instance's own static
@@ -32,6 +51,19 @@ type Service struct {
 	oauthClient    OAuthClientInterface
 	challengeStore *challenge.Store
 	originChecker  *OriginChecker
+
+	// backfiller performs the login-time repo-read challenge backfill
+	// (atchess-1c9.46). May be nil (e.g. a Service built directly as
+	// &Service{...} by a test rather than via NewService); callers must
+	// nil-check before use.
+	backfiller *backfill.Backfiller
+	// backfillHostURLs is the closed list of PDS hosts (same list given to
+	// the firehose subscriptions, see config.FirehoseConfig.URL's doc
+	// comment) the login backfill is bounded to. Empty when firehose is
+	// not configured/enabled, in which case the backfill is skipped
+	// entirely -- there would be nothing to challenge-delivery against
+	// anyway.
+	backfillHostURLs []string
 }
 
 // OAuthClientInterface defines the methods we need from the OAuth client
@@ -44,12 +76,81 @@ func NewService(serverClient *atproto.Client, cfg *config.Config, challengeStore
 	if len(origins) == 0 {
 		origins = AllowedOriginsFromBaseURL(cfg.Server.BaseURL)
 	}
-	return &Service{
-		serverClient:   serverClient,
-		config:         cfg,
-		challengeStore: challengeStore,
-		originChecker:  NewOriginChecker(origins),
+
+	var hostURLs []string
+	if cfg.Firehose.Enabled {
+		hostURLs = config.SplitFirehoseURLs(cfg.Firehose.URL)
 	}
+
+	return &Service{
+		serverClient:     serverClient,
+		config:           cfg,
+		challengeStore:   challengeStore,
+		originChecker:    NewOriginChecker(origins),
+		backfiller:       backfill.New(challengeStore, log.Logger),
+		backfillHostURLs: hostURLs,
+	}
+}
+
+// backfillChallengesOnLogin runs the login-time repo-read challenge
+// backfill (atchess-1c9.46) for the newly authenticated userDID, bounded by
+// loginBackfillTimeout, and logs a summary. Never returns an error to the
+// caller: a failed/degraded backfill must not fail login (see
+// internal/backfill's package doc comment for exactly what this can and
+// cannot find).
+func (s *Service) backfillChallengesOnLogin(ctx context.Context, userDID string) {
+	if s.backfiller == nil || len(s.backfillHostURLs) == 0 {
+		return
+	}
+
+	bctx, cancel := context.WithTimeout(ctx, loginBackfillTimeout)
+	defer cancel()
+
+	result := s.backfiller.BackfillChallengesForUser(bctx, userDID, s.backfillHostURLs)
+	logEvt := log.Info()
+	for _, h := range result.Hosts {
+		if h.Err != nil || h.Capped {
+			logEvt = log.Warn()
+		}
+	}
+	logEvt.
+		Str("did", userDID).
+		Int("totalFound", result.TotalFound()).
+		Interface("hosts", loggableHostResults(result.Hosts)).
+		Msg("login backfill: repo-read challenge discovery complete")
+}
+
+// loggableHostResult mirrors backfill.HostResult for logging purposes only,
+// with Err rendered as a string. Go's built-in error interface has no
+// MarshalJSON, so passing []backfill.HostResult directly to
+// zerolog.Event.Interface serializes every Err as "{}" -- an operator
+// reading the log sees that a host failed with no indication why
+// (atchess-1c9.46 review fix, defect 4).
+type loggableHostResult struct {
+	Host            string `json:"host"`
+	ReposScanned    int    `json:"reposScanned"`
+	ChallengesFound int    `json:"challengesFound"`
+	Capped          bool   `json:"capped"`
+	Err             string `json:"err,omitempty"`
+}
+
+// loggableHostResults converts hosts into their loggable (string-erred)
+// form -- see loggableHostResult.
+func loggableHostResults(hosts []backfill.HostResult) []loggableHostResult {
+	out := make([]loggableHostResult, len(hosts))
+	for i, h := range hosts {
+		lr := loggableHostResult{
+			Host:            h.Host,
+			ReposScanned:    h.ReposScanned,
+			ChallengesFound: h.ChallengesFound,
+			Capped:          h.Capped,
+		}
+		if h.Err != nil {
+			lr.Err = h.Err.Error()
+		}
+		out[i] = lr
+	}
+	return out
 }
 
 // clientFor returns an *atproto.Client that authenticates as the caller
@@ -695,6 +796,16 @@ func (s *Service) LoginHandler(w http.ResponseWriter, r *http.Request) {
 		AccessTokenExpiresAt: accessExpiresAt,
 	}
 	sessionID := sessionStore.CreateSession(session)
+
+	// Login-time repo-read challenge backfill (atchess-1c9.46): run BEFORE
+	// responding, not fire-and-forget in a goroutine, so that by the time
+	// this handler's caller sees a successful login, any challenge this
+	// backfill can find (see internal/backfill's package doc comment for
+	// the precise scope) is already indexed and visible via
+	// GET /api/challenge-notifications -- no polling race between "login
+	// succeeded" and "backfill finished" for callers to work around.
+	// Bounded by loginBackfillTimeout and never fails the login itself.
+	s.backfillChallengesOnLogin(r.Context(), userClient.GetDID())
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(AuthResponse{

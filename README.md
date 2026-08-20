@@ -228,6 +228,7 @@ curl -X POST http://localhost:8080/api/games/GAME_ID/moves \
 
 - **[Local PDS Setup](docs/local-pds-setup.md)** - Setting up AT Protocol server for development
 - **[Testing Guide](docs/testing-guide.md)** - Comprehensive testing instructions
+- **[Firehose & Challenge Backfill](docs/firehose-and-backfill.md)** - `FIREHOSE_URL`/relay configuration, cursor persistence across restarts, and what the login-time challenge backfill can and cannot find
 - **[CLAUDE.md](CLAUDE.md)** - Development guidelines and architecture notes
 
 ## Dependencies

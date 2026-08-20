@@ -206,11 +206,14 @@ func (p *EventProcessor) processResignationEvent(ctx context.Context, event Even
 }
 
 // processChallengeEvent handles challenge records discovered via a watched
-// PDS's firehose (live, cursor-resumed, or a startup backfill resubscribe --
-// see cmd/protocol/main.go) and indexes them into the shared challenge.Store
-// CACHE (never a write path -- see that package's doc comment) so
-// GET /api/challenge-notifications can serve them without a repo round trip
-// per request.
+// PDS's firehose (live, or resumed from a persisted cursor across a
+// restart -- see internal/firehose.CursorStore and cmd/protocol/main.go,
+// atchess-1c9.46; the OFFLINE case -- a challenge issued while this
+// process wasn't running -- is instead covered by internal/backfill's
+// login-time repo-read backfill, not by the firehose) and indexes them
+// into the shared challenge.Store CACHE (never a write path -- see that
+// package's doc comment) so GET /api/challenge-notifications can serve
+// them without a repo round trip per request.
 func (p *EventProcessor) processChallengeEvent(ctx context.Context, event Event) error {
 	record, ok := event.Record.(map[string]interface{})
 	if !ok {

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -346,6 +347,18 @@ func (c *Client) listen(connCtx context.Context) error {
 			}
 
 			if err := c.processMessage(data); err != nil {
+				var errFrame *firehoseErrorFrame
+				if errors.As(err, &errFrame) {
+					// A firehose error frame (e.g. FutureCursor) means the
+					// host has rejected this connection/cursor outright.
+					// handleErrorFrame already logged and reacted (e.g.
+					// resetting the cursor); returning here propagates up
+					// to run(), which reconnects immediately rather than
+					// waiting on the underlying socket to also close,
+					// which the protocol does not guarantee happens
+					// synchronously with the error frame.
+					return err
+				}
 				c.logger.Error().Err(err).Msg("Error processing message")
 				// Continue processing other messages
 			}
@@ -398,6 +411,18 @@ func (c *Client) processCBORMessage(data []byte) error {
 		return nil
 	}
 
+	// op == -1 is an AT Protocol firehose "error frame" (no "t" field at
+	// all -- {op: -1, ...} followed by a body {error, message}), sent when
+	// the host rejects this connection outright, notably FutureCursor: our
+	// requested cursor is beyond what the host has ever produced (e.g. a
+	// stale/corrupt persisted cursor, or a host whose sequence counter was
+	// reset). Handled explicitly (atchess-1c9.46) rather than silently
+	// falling through to the "unknown message" case below and looping
+	// forever retrying the same rejected cursor.
+	if op == -1 {
+		return c.handleErrorFrame(data[boundary:])
+	}
+
 	// Extract t field
 	tNode, err := headerNode.LookupByString("t")
 	if err != nil {
@@ -405,6 +430,21 @@ func (c *Client) processCBORMessage(data []byte) error {
 	}
 	msgType, err := tNode.AsString()
 	if err != nil {
+		return nil
+	}
+
+	// #info frames (op: 1, t: "#info") are advisory, not fatal -- notably
+	// OutdatedCursor: our requested cursor is older than the host's
+	// retention window, so the host is about to start streaming from the
+	// earliest point it still has rather than from our exact cursor
+	// (atchess-1c9.46's "a cursor the host rejects as too old" case). The
+	// connection stays open; logged loudly because it means some events
+	// between our old cursor and the host's retention floor were
+	// unrecoverably missed by this subscription (the login-time repo-read
+	// backfill, internal/backfill, is the intended mitigation for exactly
+	// this gap).
+	if op == 1 && msgType == "#info" {
+		c.handleInfoFrame(data[boundary:])
 		return nil
 	}
 
@@ -532,6 +572,100 @@ func (c *Client) processCBORMessage(data []byte) error {
 	}
 
 	return nil
+}
+
+// firehoseErrorFrame represents an AT Protocol firehose error frame
+// (header {op: -1}, body {error, message}) -- see processCBORMessage's
+// op == -1 branch. Returned (not merely logged) from processMessage so
+// listen() can react explicitly -- notably by reconnecting immediately --
+// rather than depending on the host also closing the underlying TCP/WS
+// connection, which the spec does not guarantee happens synchronously with
+// the error frame.
+type firehoseErrorFrame struct {
+	Code    string
+	Message string
+}
+
+func (e *firehoseErrorFrame) Error() string {
+	return fmt.Sprintf("firehose error frame: %s: %s", e.Code, e.Message)
+}
+
+// handleErrorFrame decodes an error frame body ({error: string, message:
+// string}, per com.atproto.sync.subscribeRepos) and reacts to known error
+// codes. FutureCursor -- the host rejected our requested cursor as beyond
+// anything it has ever produced, most plausibly a stale/corrupt persisted
+// cursor (see internal/firehose.CursorStore) or a host whose sequence
+// counter was reset -- clears this client's in-memory cursor back to "none
+// established" (-1) so the next reconnect (triggered by returning a
+// non-nil error here) requests the live tip instead of retrying the same
+// rejected cursor forever. cmd/protocol/main.go's periodic cursor
+// persistence then propagates that reset to disk too (CursorStore.Store
+// treats a negative sequence as "clear"), so a subsequent process restart
+// does not immediately hit the same FutureCursor rejection again.
+func (c *Client) handleErrorFrame(body []byte) error {
+	bodyBuilder := basicnode.Prototype.Any.NewBuilder()
+	if err := dagcbor.Decode(bodyBuilder, bytes.NewReader(body)); err != nil {
+		c.logger.Error().Err(err).Msg("Received a firehose error frame but failed to decode its body")
+		return &firehoseErrorFrame{Code: "unknown", Message: "(undecodable error frame body)"}
+	}
+	bodyNode := bodyBuilder.Build()
+
+	code := "unknown"
+	if n, err := bodyNode.LookupByString("error"); err == nil {
+		if s, err := n.AsString(); err == nil {
+			code = s
+		}
+	}
+	message := ""
+	if n, err := bodyNode.LookupByString("message"); err == nil {
+		if s, err := n.AsString(); err == nil {
+			message = s
+		}
+	}
+
+	c.logger.Error().Str("code", code).Str("message", message).Str("url", c.url).Msg("Firehose host sent an error frame")
+
+	if code == "FutureCursor" {
+		c.logger.Warn().Str("url", c.url).Msg("Cursor rejected as FutureCursor; resetting to live tip (no cursor) for the next reconnect instead of retrying the same cursor")
+		c.setLastSequence(-1)
+	}
+
+	return &firehoseErrorFrame{Code: code, Message: message}
+}
+
+// handleInfoFrame decodes an #info frame body ({name: string, message:
+// string}, per com.atproto.sync.subscribeRepos) and logs it. Unlike error
+// frames, #info frames are advisory: the connection stays open and this
+// method never returns an error. OutdatedCursor specifically is logged at
+// Warn (not Info) because it means this subscription has a gap: the host
+// is skipping forward to the earliest point it still retains, past our
+// requested cursor.
+func (c *Client) handleInfoFrame(body []byte) {
+	bodyBuilder := basicnode.Prototype.Any.NewBuilder()
+	if err := dagcbor.Decode(bodyBuilder, bytes.NewReader(body)); err != nil {
+		c.logger.Debug().Err(err).Msg("Received a firehose #info frame but failed to decode its body")
+		return
+	}
+	bodyNode := bodyBuilder.Build()
+
+	name := "unknown"
+	if n, err := bodyNode.LookupByString("name"); err == nil {
+		if s, err := n.AsString(); err == nil {
+			name = s
+		}
+	}
+	message := ""
+	if n, err := bodyNode.LookupByString("message"); err == nil {
+		if s, err := n.AsString(); err == nil {
+			message = s
+		}
+	}
+
+	logEvt := c.logger.Info()
+	if name == "OutdatedCursor" {
+		logEvt = c.logger.Warn()
+	}
+	logEvt.Str("name", name).Str("message", message).Str("url", c.url).Msg("Firehose host sent an #info frame")
 }
 
 func (c *Client) processTestMessage(data []byte) error {

@@ -1,5 +1,14 @@
 # Challenge Discovery in ATChess
 
+> **SUPERSEDED (atchess-1c9.11 / atchess-1c9.46)**: the "Current Limitation"
+> and "Option 1/2" design discussion below predates the actual
+> implementation and no longer reflects the current system. Challenge
+> discovery IS implemented: a live firehose subscription plus a login-time
+> repo-read backfill. See **[docs/firehose-and-backfill.md](firehose-and-backfill.md)**
+> for how it actually works, including `FIREHOSE_URL` configuration, cursor
+> persistence across restarts, and exactly what the login backfill can and
+> cannot find. The rest of this file is kept for historical context only.
+
 ## Current Limitation
 
 **ATChess currently lacks a challenge discovery mechanism**. While the system can create challenges, there's no implemented way for users to discover challenges directed at them. This is a critical gap for cross-PDS gameplay.

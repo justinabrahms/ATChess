@@ -30,12 +30,18 @@ type PendingChallenge struct {
 // challenges are addressed to me" from scratch on every request: it is
 // populated by (1) internal/firehose.EventProcessor as
 // app.atchess.challenge commits arrive live, subscribed directly against
-// every watched PDS, with cursor-based resumption across reconnects, and
-// (2) an explicit backfill resubscribe (cursor 0) performed at startup so
-// challenges issued while this process was not running are not missed --
-// see cmd/protocol/main.go. Because it is only a cache, losing it (e.g. a
-// process restart) is not data loss: the next backfill resubscribe
-// rebuilds it from the same repo records.
+// every watched PDS, with cursor-based resumption persisted across
+// restarts (see internal/firehose.CursorStore and cmd/protocol/main.go,
+// atchess-1c9.46), and (2) internal/backfill's login-time repo-read
+// backfill, run synchronously on every login (see
+// internal/web.LoginHandler/OAuthCallbackHandler), so challenges issued
+// while this process -- or this player's session -- was not around are
+// still discovered without depending on a full-log firehose replay. See
+// docs/firehose-and-backfill.md for the full picture, including what the
+// login backfill can and cannot find. Because this Store is only a cache,
+// losing it (e.g. a process restart) is not data loss: the live
+// subscription and the next login's backfill both rebuild it from the same
+// repo records.
 type Store struct {
 	mu sync.RWMutex
 	// challenges indexed by challenged DID

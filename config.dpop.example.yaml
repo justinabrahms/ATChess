@@ -16,4 +16,24 @@ development:
 
 firehose:
   enabled: false
+  # For a real single-PDS deployment, point this at that PDS's own
+  # subscribeRepos endpoint (e.g. wss://bsky.social/xrpc/com.atproto.sync.subscribeRepos
+  # if your account lives there). Once this deployment sits behind a real,
+  # network-wide relay, point it at the relay instead:
+  #   wss://bsky.network/xrpc/com.atproto.sync.subscribeRepos
+  # bsky.network is the real, public AT Protocol relay -- NOT bsky.social,
+  # which is a single (very large) PDS, not a relay. See
+  # docs/firehose-and-backfill.md for the full picture, including why the
+  # login-time repo-read backfill is bounded to exactly the host(s) listed
+  # here.
+  #
+  # The comma-separated multi-URL form below (url: "wss://a/..., wss://b/...")
+  # is for MULTI-PDS TEST TOPOLOGIES with no relay in front of them (this
+  # project's local dual-PDS harness, test/harness/services.go) -- it is
+  # not expected to be used against the public network.
   url: wss://bsky.social/xrpc/com.atproto.sync.subscribeRepos
+  # Directory used to persist each watched host's last-processed firehose
+  # sequence number across restarts, so a restart resumes instead of either
+  # replaying that host's full commit history or silently losing history.
+  # Created automatically if missing; must be writable by the process.
+  state_dir: ./data/firehose
