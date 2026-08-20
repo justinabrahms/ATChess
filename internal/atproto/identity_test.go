@@ -463,3 +463,88 @@ func TestResolveHandleViaPLCExport_RunsAgainstNonDefaultDirectory(t *testing.T) 
 		t.Errorf("resolveHandleViaPLCExport = %q, want %q", got, want)
 	}
 }
+
+// TestNormalizeAndValidateHandle is table-driven coverage of the AT
+// Protocol handle grammar enforced by normalizeAndValidateHandle
+// (atchess-1c9.69), independent of any resolver/network. See
+// TestResolveHandle_RejectsHostileHandlesBeforeAnyRequest and
+// TestResolveHandle_ValidHandlesStillResolve (url_test.go) for the
+// end-to-end proof that this is actually wired into Client.ResolveHandle
+// and blocks real requests.
+func TestNormalizeAndValidateHandle(t *testing.T) {
+	cases := []struct {
+		name    string
+		handle  string
+		want    string // expected normalized return value; ignored if wantErr
+		wantErr bool
+	}{
+		{name: "empty", handle: "", wantErr: true},
+		{name: "single label with no dot", handle: "alice", wantErr: true},
+		{name: "leading hyphen in a label", handle: "-alice.test", wantErr: true},
+		{name: "trailing hyphen in a label", handle: "alice-.test", wantErr: true},
+		{name: "label consisting of a single hyphen", handle: "-.test", wantErr: true},
+		{name: "consecutive dots (empty label)", handle: "alice..test", wantErr: true},
+		{name: "leading dot (empty label)", handle: ".alice.test", wantErr: true},
+		{name: "trailing dot (empty label)", handle: "alice.test.", wantErr: true},
+		{name: "label over 63 bytes", handle: strings.Repeat("a", 64) + ".test", wantErr: true},
+		{name: "label at exactly 63 bytes is allowed", handle: strings.Repeat("a", 63) + ".test", want: strings.Repeat("a", 63) + ".test"},
+		{name: "total length over 253 bytes", handle: strings.Repeat("a", 250) + "." + strings.Repeat("b", 10) + ".test", wantErr: true},
+		{name: "contains a slash", handle: "alice.test/evil", wantErr: true},
+		{name: "contains an at-sign", handle: "alice@evil.test", wantErr: true},
+		{name: "contains a colon", handle: "alice.test:8080", wantErr: true},
+		{name: "contains whitespace", handle: "alice test.example", wantErr: true},
+		{name: "bare IPv4 literal", handle: "127.0.0.1", wantErr: true},
+		// ":" is not in handleLabelRE's character class, so this is actually
+		// rejected at the label-regexp step (the colons never even survive
+		// strings.Split into label candidates that look IP-shaped) -- NOT by
+		// the net.ParseIP check below it, despite the name suggesting
+		// otherwise. Named for what actually rejects it, per the
+		// atchess-1c9.69 fix-pass review: any IPv6 form contains ':', which
+		// dies at the regexp first.
+		{name: "IPv6 literal is rejected by the label-character regexp (colon is not a valid label character), not by net.ParseIP", handle: "::1", wantErr: true},
+
+		// The following five are all rejected by the final-label-must-not-
+		// start-with-a-digit rule (see normalizeAndValidateHandle's doc
+		// comment) -- NOT by net.ParseIP, which only recognizes plain
+		// dotted-quad/IPv6 syntax and would let every one of these through.
+		// Each resolves to a real, sensitive address under glibc's
+		// (cgo-backed) numeric-address parsing, which Go selects
+		// automatically on nsswitch configs carrying mdns/resolve entries
+		// (plausible on the Ubuntu 24.04 deploy host).
+		{name: "hex-last-octet form of the cloud metadata address (glibc inet_aton resolves this to 169.254.169.254)", handle: "169.254.169.0xfe", wantErr: true},
+		{name: "all-hex-octet form of the cloud metadata address (glibc inet_aton resolves this to 169.254.169.254)", handle: "0xa9.0xfe.0xa9.0xfe", wantErr: true},
+		{name: "short-form loopback (glibc inet_aton resolves this to 127.0.0.1)", handle: "127.1", wantErr: true},
+		{name: "hex-first-octet form of loopback (glibc inet_aton resolves this to 127.0.0.1)", handle: "0x7f.0.0.1", wantErr: true},
+		{name: "octal-octet form (glibc inet_aton resolves this to 8.8.8.8)", handle: "010.010.010.010", wantErr: true},
+
+		{name: "ordinary two-label handle", handle: "alice.test", want: "alice.test"},
+		{name: "ordinary three-label handle", handle: "alice.bsky.social", want: "alice.bsky.social"},
+		{name: "handle with a hyphen mid-label is allowed", handle: "my-handle.test", want: "my-handle.test"},
+		{name: "uppercase is normalized to lowercase, not rejected", handle: "Alice.Bsky.Social", want: "alice.bsky.social"},
+		{name: "punycode (IDN) final label is allowed", handle: "xn--80ak6aa92e.com", want: "xn--80ak6aa92e.com"},
+		{name: "digits in a non-final label are allowed (only the FINAL label may not start with a digit)", handle: "user123.example.com", want: "user123.example.com"},
+		// Deliberate choice: the AT Protocol spec's final-label rule only
+		// forbids the final label from STARTING with a digit -- a digit
+		// elsewhere in the final label (not in the leading position) is
+		// still spec-legal, so this is accepted, not rejected.
+		{name: "digit in the final label that is not its first character is allowed", handle: "example.c0m", want: "example.c0m"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := normalizeAndValidateHandle(tc.handle)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("normalizeAndValidateHandle(%q) = %q, nil; want an error", tc.handle, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("normalizeAndValidateHandle(%q) returned an unexpected error: %v", tc.handle, err)
+			}
+			if got != tc.want {
+				t.Errorf("normalizeAndValidateHandle(%q) = %q, want %q", tc.handle, got, tc.want)
+			}
+		})
+	}
+}

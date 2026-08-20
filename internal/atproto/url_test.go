@@ -158,20 +158,76 @@ func newResolveHandleMockPDS(t *testing.T, gotURL *string) *httptest.Server {
 	}))
 }
 
-// TestResolveHandle_EscapesHostileHandle is a regression test for
-// atchess-1c9.35: ResolveHandle used to interpolate a caller-supplied
-// handle directly into a query string with no escaping. A handle
-// containing '&', '=' or '#' would corrupt the query structure (raw '/'
-// and ':' are syntactically legal in a query value per RFC 3986 and are
-// NOT the concern here). This asserts the produced request URL both keeps
-// the query well-formed (no spurious "admin" parameter smuggled in) and
-// round-trips the hostile handle's exact original value -- not just that
-// SOME escaping happened, which a double-escaped URL would also pass.
-func TestResolveHandle_EscapesHostileHandle(t *testing.T) {
+// TestXrpcURL_EscapesQueryMetacharacters is a regression test for
+// atchess-1c9.35, kept at the xrpcURL level (rather than driven through
+// ResolveHandle, as it originally was) after atchess-1c9.69: as of .69, a
+// value containing '&', '=' or '#' can no longer reach ResolveHandle's
+// query-building at all, because it is not a syntactically valid AT
+// Protocol handle and normalizeAndValidateHandle now rejects it before any
+// URL is built (see TestResolveHandle_RejectsHandleWithQueryMetacharacters
+// below). xrpcURL itself is still shared by every other query-string-
+// building call site in this package (repo/rkey/uri params, none of which
+// go through handle validation), so its escaping behavior is still worth
+// pinning directly.
+func TestXrpcURL_EscapesQueryMetacharacters(t *testing.T) {
+	const hostileValue = "evil.example&admin=true#frag"
+
+	got := xrpcURL("http://localhost:2583", "com.atproto.repo.getRecord", url.Values{
+		"rkey": {hostileValue},
+	})
+
+	parsed, err := url.Parse(got)
+	if err != nil {
+		t.Fatalf("xrpcURL produced an unparseable URL %q: %v", got, err)
+	}
+	q := parsed.Query()
+
+	// The round trip is the real assertion: confirm the decoded "rkey"
+	// value is byte-identical to the original hostile input.
+	if gotVal := q.Get("rkey"); gotVal != hostileValue {
+		t.Errorf("rkey round-tripped as %q, want %q", gotVal, hostileValue)
+	}
+
+	// Confirm the query structure was not corrupted: the embedded
+	// "admin=true" and "#frag" must not have become their own query
+	// parameter or fragment.
+	if _, ok := q["admin"]; ok {
+		t.Errorf("query %q was corrupted: unexpected standalone %q parameter smuggled in from the unescaped value", parsed.RawQuery, "admin")
+	}
+	if parsed.Fragment != "" {
+		t.Errorf("query %q was corrupted: unexpected fragment %q smuggled in from the unescaped value", got, parsed.Fragment)
+	}
+	if len(q) != 1 {
+		t.Errorf("query %q has %d parameters, want exactly 1 (\"rkey\")", parsed.RawQuery, len(q))
+	}
+}
+
+// TestResolveHandle_RejectsHandleWithQueryMetacharacters supersedes what
+// was formerly TestResolveHandle_EscapesHostileHandle (atchess-1c9.35): a
+// handle containing '&', '=' or '#' is not a syntactically valid AT
+// Protocol handle (see normalizeAndValidateHandle), so as of atchess-1c9.69
+// it is rejected outright, before ResolveHandle ever builds a query string
+// from it -- a strictly stronger guarantee than merely escaping it
+// correctly. This asserts both the error and that zero requests reach the
+// mock PDS.
+func TestResolveHandle_RejectsHandleWithQueryMetacharacters(t *testing.T) {
 	const hostileHandle = "evil.example&admin=true#frag"
 
-	var gotURL string
-	mockPDS := newResolveHandleMockPDS(t, &gotURL)
+	requests := 0
+	mockPDS := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/xrpc/com.atproto.server.createSession":
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"accessJwt": "test-jwt",
+				"did":       "did:plc:resolvehandletest",
+				"handle":    "resolver.test",
+			})
+		default:
+			requests++
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
 	defer mockPDS.Close()
 
 	client, err := NewClient(mockPDS.URL, "resolver.test", "password")
@@ -179,37 +235,11 @@ func TestResolveHandle_EscapesHostileHandle(t *testing.T) {
 		t.Fatalf("failed to create client: %v", err)
 	}
 
-	did, err := client.ResolveHandle(context.Background(), hostileHandle)
-	if err != nil {
-		t.Fatalf("ResolveHandle returned an unexpected error: %v", err)
+	if _, err := client.ResolveHandle(context.Background(), hostileHandle); err == nil {
+		t.Fatalf("ResolveHandle(%q) unexpectedly succeeded, want a validation error", hostileHandle)
 	}
-	if did != "did:plc:resolvedtarget" {
-		t.Errorf("ResolveHandle returned did %q, want %q", did, "did:plc:resolvedtarget")
-	}
-
-	parsed, err := url.Parse(gotURL)
-	if err != nil {
-		t.Fatalf("resolveHandle request URL %q did not parse: %v", gotURL, err)
-	}
-	q := parsed.Query()
-
-	// The round trip is the real assertion: confirm the decoded "handle"
-	// value is byte-identical to the original hostile input.
-	if got := q.Get("handle"); got != hostileHandle {
-		t.Errorf("handle round-tripped as %q, want %q", got, hostileHandle)
-	}
-
-	// Confirm the query structure was not corrupted: the embedded
-	// "admin=true" and "#frag" must not have become their own query
-	// parameter or fragment.
-	if _, ok := q["admin"]; ok {
-		t.Errorf("query %q was corrupted: unexpected standalone %q parameter smuggled in from the unescaped handle", parsed.RawQuery, "admin")
-	}
-	if parsed.Fragment != "" {
-		t.Errorf("query %q was corrupted: unexpected fragment %q smuggled in from the unescaped handle", gotURL, parsed.Fragment)
-	}
-	if len(q) != 1 {
-		t.Errorf("query %q has %d parameters, want exactly 1 (\"handle\")", parsed.RawQuery, len(q))
+	if requests != 0 {
+		t.Errorf("ResolveHandle(%q) made %d request(s) beyond client construction, want 0 (validation must reject it before any resolver runs)", hostileHandle, requests)
 	}
 }
 
@@ -241,6 +271,108 @@ func TestResolveHandle_OrdinaryHandleURLUnchanged(t *testing.T) {
 
 	if gotURL != want {
 		t.Errorf("resolveHandle request URL = %q, want %q (byte-identical to today's output)", gotURL, want)
+	}
+}
+
+// TestResolveHandle_RejectsHostileHandlesBeforeAnyRequest is the core
+// regression test for atchess-1c9.69: resolveHandleViaWellKnown (and, in
+// the same shape, resolveHandleViaDNS) used to interpolate a caller-
+// supplied handle directly into the HOST/PATH of a server-side fetch, or
+// the hostname of a DNS query -- a hostile value could steer WHERE the
+// fetch/lookup went, not merely corrupt a query parameter (that was
+// atchess-1c9.35, addressed above). The handle is user-supplied from HTTP
+// request bodies (internal/web/oauth_handlers.go login,
+// internal/web/service.go challenge-opponent).
+//
+// This proves each of a handle containing '/', '@', ':' and a bare IP
+// literal is rejected by Client.ResolveHandle BEFORE any resolution
+// strategy runs -- not merely that an error comes back, but that ZERO
+// requests reach the same-PDS resolveHandle endpoint. Because
+// normalizeAndValidateHandle is called once at ResolveHandle's entry point
+// before ANY strategy is tried, zero requests to this one instrumented
+// strategy proves zero requests were attempted by every strategy,
+// including the DNS TXT and HTTPS well-known ones a real SSRF attempt
+// would actually be targeting (those use net.DefaultResolver / a plain
+// http.Client against a real hostname derived from the handle, so they
+// cannot be safely instrumented the same way in a unit test without
+// performing a real DNS lookup / HTTPS request -- which is precisely what
+// this test proves never happens).
+func TestResolveHandle_RejectsHostileHandlesBeforeAnyRequest(t *testing.T) {
+	hostileHandles := []struct {
+		name   string
+		handle string
+	}{
+		{"contains slash (path injection into well-known fetch)", "evil.example/../../admin"},
+		{"contains at-sign (userinfo injection, changes fetch host)", "attacker@evil.example"},
+		{"contains colon (port/scheme injection, changes fetch host)", "evil.example:8080"},
+		{"bare IPv4 literal (direct SSRF target, e.g. cloud metadata IP shape)", "169.254.169.254"},
+		// Not a plain dotted-quad, so net.ParseIP alone would miss it --
+		// caught only by the final-label-must-not-start-with-a-digit rule
+		// (atchess-1c9.69 fix-pass). glibc's inet_aton (the cgo resolver)
+		// resolves this exact string to 169.254.169.254, the cloud metadata
+		// address.
+		{"hex-last-octet IPv4 spelling of the cloud metadata address (bypasses a dotted-quad-only net.ParseIP check)", "169.254.169.0xfe"},
+	}
+
+	for _, tc := range hostileHandles {
+		t.Run(tc.name, func(t *testing.T) {
+			requests := 0
+			mockPDS := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/xrpc/com.atproto.server.createSession":
+					w.Header().Set("Content-Type", "application/json")
+					json.NewEncoder(w).Encode(map[string]interface{}{
+						"accessJwt": "test-jwt",
+						"did":       "did:plc:resolvehandletest",
+						"handle":    "resolver.test",
+					})
+				default:
+					requests++
+					w.WriteHeader(http.StatusNotFound)
+				}
+			}))
+			defer mockPDS.Close()
+
+			client, err := NewClient(mockPDS.URL, "resolver.test", "password")
+			if err != nil {
+				t.Fatalf("failed to create client: %v", err)
+			}
+
+			if _, err := client.ResolveHandle(context.Background(), tc.handle); err == nil {
+				t.Fatalf("ResolveHandle(%q) unexpectedly succeeded, want a validation error", tc.handle)
+			}
+			if requests != 0 {
+				t.Errorf("ResolveHandle(%q) made %d request(s) beyond client construction, want 0 (validation must reject it before any resolver runs)", tc.handle, requests)
+			}
+		})
+	}
+}
+
+// TestResolveHandle_ValidHandlesStillResolve is the required control for
+// TestResolveHandle_RejectsHostileHandlesBeforeAnyRequest: it proves
+// normalizeAndValidateHandle is not simply rejecting everything by
+// confirming ordinary, well-formed handles still resolve successfully
+// through Client.ResolveHandle's normal (same-PDS) path.
+func TestResolveHandle_ValidHandlesStillResolve(t *testing.T) {
+	for _, handle := range []string{"alice.test", "alice.bsky.social"} {
+		t.Run(handle, func(t *testing.T) {
+			var gotURL string
+			mockPDS := newResolveHandleMockPDS(t, &gotURL)
+			defer mockPDS.Close()
+
+			client, err := NewClient(mockPDS.URL, "resolver.test", "password")
+			if err != nil {
+				t.Fatalf("failed to create client: %v", err)
+			}
+
+			did, err := client.ResolveHandle(context.Background(), handle)
+			if err != nil {
+				t.Fatalf("ResolveHandle(%q) returned an unexpected error: %v", handle, err)
+			}
+			if did != "did:plc:resolvedtarget" {
+				t.Errorf("ResolveHandle(%q) = %q, want %q", handle, did, "did:plc:resolvedtarget")
+			}
+		})
 	}
 }
 

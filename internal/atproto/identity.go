@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -241,6 +242,123 @@ const (
 	resolveHandleDNSTimeout       = 5 * time.Second
 	resolveHandleWellKnownTimeout = 5 * time.Second
 )
+
+// handleLabelMaxLength/handleMaxLength bound how long a single dot-separated
+// label of a handle -- and the handle as a whole -- may be, per the AT
+// Protocol handle grammar (https://atproto.com/specs/handle), which mirrors
+// RFC 1035's domain name label/name length limits.
+const (
+	handleLabelMaxLength = 63
+	handleMaxLength      = 253
+)
+
+// handleLabelRE matches one dot-separated label of a valid AT Protocol
+// handle: ASCII letters, digits and hyphens only, and it must not start or
+// end with a hyphen (so a bare "-" label is also rejected, since it both
+// starts and ends with one). Being anchored and restricted to this
+// character class also means no non-ASCII byte, and none of '/', '@', ':',
+// whitespace, or any other URL/authority-delimiting character, can ever
+// pass this check.
+var handleLabelRE = regexp.MustCompile(`^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$`)
+
+// normalizeAndValidateHandle validates handle against the AT Protocol
+// handle grammar -- dot-separated labels of ASCII letters/digits/hyphens,
+// at least two labels, each label <= 63 bytes, the whole handle
+// <= 253 bytes, no scheme/port/userinfo/path characters, the FINAL label
+// must not start with a digit, and no bare IP literal -- and returns it
+// normalized to lowercase.
+//
+// The final-label-must-not-start-with-a-digit rule
+// (https://atproto.com/specs/handle: "the final domain label must not
+// start with a digit") is not cosmetic: it is what makes a bare IP literal
+// -- in ANY of the forms a resolver's address parser might accept, not
+// just dotted-quad -- structurally unable to satisfy the handle grammar at
+// all, closing off a whole class of bypass that a dotted-quad-only
+// net.ParseIP check (below) cannot catch. glibc's resolver (which cgo's
+// name resolution uses, selected automatically by Go on many nsswitch
+// configs) accepts numeric-address forms far looser than dotted-quad,
+// e.g.: "169.254.169.0xfe" and "0xa9.0xfe.0xa9.0xfe" both resolve to
+// 169.254.169.254 (the cloud metadata address), "127.1" and "0x7f.0.0.1"
+// both resolve to 127.0.0.1, and "010.010.010.010" resolves to 8.8.8.8 (its
+// octets are octal). Every one of those has a final label beginning with a
+// digit, so this rule rejects all of them even though net.ParseIP does
+// not recognize any of those forms as an IP and would let them through.
+//
+// This is the single choke point called from Client.ResolveHandle
+// (atchess-1c9.69) before ANY resolution strategy runs. Every strategy --
+// same-PDS resolveHandle (query param), DNS TXT lookup (hostname),
+// HTTPS well-known (host + path), and the PLC export scan (match target) --
+// is only ever invoked with the already-validated, already-normalized
+// return value, so a hostile handle is rejected before it can steer any of
+// their outbound host/path/DNS-query construction.
+//
+// Case handling: AT Protocol handles are explicitly case-insensitive and
+// the spec says implementations should normalize to lowercase
+// (https://atproto.com/specs/handle#normalization-and-validation). This
+// function normalizes to lowercase rather than rejecting mixed-case input,
+// so a handle typed/pasted as "Alice.Bsky.Social" still resolves instead of
+// failing on a cosmetic difference no real client would surface to a user.
+//
+// A trailing dot (e.g. "alice.test.") is deliberately rejected rather than
+// stripped: it splits into a trailing empty label, which the empty-label
+// check below already catches, and this project takes no position on
+// FQDN-style trailing-dot handles being equivalent to their non-dotted
+// form -- treating them as invalid avoids that ambiguity entirely.
+func normalizeAndValidateHandle(handle string) (string, error) {
+	if handle == "" {
+		return "", fmt.Errorf("invalid handle %q: empty", handle)
+	}
+	if len(handle) > handleMaxLength {
+		return "", fmt.Errorf("invalid handle %q: exceeds maximum length of %d bytes", handle, handleMaxLength)
+	}
+
+	normalized := strings.ToLower(handle)
+
+	labels := strings.Split(normalized, ".")
+	if len(labels) < 2 {
+		return "", fmt.Errorf("invalid handle %q: must have at least two dot-separated labels", handle)
+	}
+	for _, label := range labels {
+		if label == "" {
+			return "", fmt.Errorf("invalid handle %q: contains an empty label (consecutive dots, or a leading/trailing dot)", handle)
+		}
+		if len(label) > handleLabelMaxLength {
+			return "", fmt.Errorf("invalid handle %q: label %q exceeds maximum length of %d bytes", handle, label, handleLabelMaxLength)
+		}
+		if !handleLabelRE.MatchString(label) {
+			return "", fmt.Errorf("invalid handle %q: label %q must contain only ASCII letters, digits and hyphens, and must not start or end with a hyphen", handle, label)
+		}
+	}
+
+	// Per the AT Protocol spec, the FINAL label must not start with an
+	// ASCII digit. See the doc comment above for why this matters well
+	// beyond spec conformance: it is what makes hex/octal/short-form IP
+	// address spellings (e.g. "169.254.169.0xfe", "0xa9.0xfe.0xa9.0xfe",
+	// "127.1", "0x7f.0.0.1", "010.010.010.010" -- all of which some
+	// resolvers, including glibc's, parse as numeric addresses) structurally
+	// unrepresentable as a valid handle, closing off a bypass class the
+	// dotted-quad-only net.ParseIP check just below cannot catch on its
+	// own. Do not remove this thinking net.ParseIP alone is sufficient.
+	finalLabel := labels[len(labels)-1]
+	if finalLabel[0] >= '0' && finalLabel[0] <= '9' {
+		return "", fmt.Errorf("invalid handle %q: final label %q must not start with a digit", handle, finalLabel)
+	}
+
+	// A handle that is syntactically a bare IP literal (e.g. "127.0.0.1" or
+	// an IPv6 literal) would otherwise satisfy the label grammar above --
+	// digits are valid label characters -- while still being exactly the
+	// SSRF-relevant shape this validation exists to close off: it would
+	// steer a server-side fetch straight at an attacker-chosen IP address
+	// instead of resolving through real handle infrastructure at all. This
+	// is a belt-and-braces guard for plain dotted-quad/IPv6 literals; the
+	// final-label-digit rule above is what actually closes off the wider
+	// class of alternate numeric-address spellings.
+	if net.ParseIP(normalized) != nil {
+		return "", fmt.Errorf("invalid handle %q: bare IP literals are not valid handles", handle)
+	}
+
+	return normalized, nil
+}
 
 // resolveHandleViaDNS looks up the "_atproto.<handle>" TXT record per the AT
 // Protocol handle resolution spec (https://atproto.com/specs/handle) and

@@ -1592,6 +1592,17 @@ func (c *Client) ResolveHandle(ctx context.Context, handle string) (string, erro
 		return handle, nil
 	}
 
+	// Validate (and normalize to lowercase) BEFORE any resolution strategy
+	// runs -- see normalizeAndValidateHandle's doc comment. This is the
+	// single choke point every strategy below shares, so none of them ever
+	// builds a URL/hostname/DNS query from an unvalidated handle
+	// (atchess-1c9.69).
+	validated, err := normalizeAndValidateHandle(handle)
+	if err != nil {
+		return "", err
+	}
+	handle = validated
+
 	var attempts []string
 
 	if did, err := c.resolveHandleSamePDS(ctx, handle); err == nil {
