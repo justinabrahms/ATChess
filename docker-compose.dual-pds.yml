@@ -164,7 +164,18 @@ services:
   # reference implementation that runs the real https://plc.directory.
   local-plc:
     build:
-      context: https://github.com/did-method-plc/did-method-plc.git
+      # Pinned to upstream refs/heads/main as of 2026-08-20 (upstream
+      # publishes no tags, so a commit SHA is the only stable reference).
+      # To update deliberately:
+      #   git ls-remote https://github.com/did-method-plc/did-method-plc.git refs/heads/main
+      # then replace the SHA below, re-run
+      #   docker compose -f docker-compose.dual-pds.yml --profile ci build --no-cache local-plc
+      # and re-run the federation suite (make test-federation-up-ci +
+      # go test -tags=e2e ./test/e2e/... ./test/harness/...) before trusting
+      # the bump. Also re-verify the `command:` below still points at a
+      # valid dist/bin.js path for the new commit -- upstream layout is not
+      # guaranteed stable across commits.
+      context: https://github.com/did-method-plc/did-method-plc.git#2ed82a5ccf1b424aa5e2f6c5b461dc0ee133278b
       dockerfile: packages/server/Dockerfile
     profiles: ["ci"]
     depends_on:
