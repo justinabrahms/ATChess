@@ -3,8 +3,8 @@
 #
 # Creates (or re-uses, if already present) one test account on each of two
 # independently-running PDS instances started via docker-compose.dual-pds.yml:
-#   - alice on PDS-A (default http://localhost:2583)
-#   - bob   on PDS-B (default http://localhost:2584)
+#   - alice on PDS-A (default https://alice.pds.test)
+#   - bob   on PDS-B (default https://bob.pds.test)
 #
 # Writes machine-readable account data (handle, did, pdsUrl, password) for
 # both players to test/.harness-accounts.json, consumed by downstream test
@@ -21,8 +21,25 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-PDS_A_URL="${PDS_A_URL:-http://localhost:2583}"
-PDS_B_URL="${PDS_B_URL:-http://localhost:2584}"
+# atchess-1c9.24: alice and bob are now published at distinct HTTPS
+# hostnames (no port) behind a TLS-terminating proxy, matching production
+# PDS shape -- see docker-compose.dual-pds.yml's header comment. The
+# hostnames require host-side DNS resolution (scripts/ensure-dual-pds-hosts.sh,
+# invoked by the Makefile before this script) and a trusted CA
+# (scripts/extract-dual-pds-ca.sh, also invoked first): DUAL_PDS_CACERT
+# below points curl at that CA so these calls do REAL TLS verification
+# rather than -k/--insecure.
+PDS_A_URL="${PDS_A_URL:-https://alice.pds.test}"
+PDS_B_URL="${PDS_B_URL:-https://bob.pds.test}"
+DUAL_PDS_CACERT="${DUAL_PDS_CACERT:-$REPO_ROOT/certs/dual-pds/ca.pem}"
+
+CURL_CA_ARGS=()
+if [ -f "$DUAL_PDS_CACERT" ]; then
+    CURL_CA_ARGS=(--cacert "$DUAL_PDS_CACERT")
+elif [ "${PDS_A_URL#https://}" != "$PDS_A_URL" ] || [ "${PDS_B_URL#https://}" != "$PDS_B_URL" ]; then
+    echo "ERROR: PDS_A_URL/PDS_B_URL use https but no CA certificate was found at $DUAL_PDS_CACERT. Run scripts/extract-dual-pds-ca.sh (or 'make test-federation-up'/'test-federation-up-ci', which runs it for you) first." >&2
+    exit 1
+fi
 
 ALICE_HANDLE="alice.test"
 ALICE_EMAIL="alice@chess.test"
@@ -52,7 +69,7 @@ wait_for_pds() {
 
     while [ "$SECONDS" -lt "$deadline" ]; do
         last_status=$(curl -s -o /dev/null -w "%{http_code}" \
-            --max-time 5 \
+            --max-time 5 "${CURL_CA_ARGS[@]}" \
             "$url/xrpc/com.atproto.server.describeServer" 2>/dev/null) || curl_exit=$?
         if [ "$curl_exit" -eq 0 ] && [ "$last_status" = "200" ]; then
             echo "$name is up (HTTP 200)." >&2
@@ -94,7 +111,7 @@ ensure_account() {
     local http_code body did curl_exit
 
     curl_exit=0
-    body=$(curl -s -w '\n%{http_code}' --max-time 15 \
+    body=$(curl -s -w '\n%{http_code}' --max-time 15 "${CURL_CA_ARGS[@]}" \
         -X POST "$pds_url/xrpc/com.atproto.server.createAccount" \
         -H "Content-Type: application/json" \
         -d "{\"email\":\"$(json_escape "$email")\",\"handle\":\"$(json_escape "$handle")\",\"password\":\"$(json_escape "$password")\"}") || curl_exit=$?
@@ -123,7 +140,7 @@ ensure_account() {
 
         curl_exit=0
         local session_body session_http
-        session_body=$(curl -s -w '\n%{http_code}' --max-time 15 \
+        session_body=$(curl -s -w '\n%{http_code}' --max-time 15 "${CURL_CA_ARGS[@]}" \
             -X POST "$pds_url/xrpc/com.atproto.server.createSession" \
             -H "Content-Type: application/json" \
             -d "{\"identifier\":\"$(json_escape "$handle")\",\"password\":\"$(json_escape "$password")\"}") || curl_exit=$?

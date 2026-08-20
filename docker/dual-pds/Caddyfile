@@ -1,0 +1,29 @@
+# Caddyfile for the dual-PDS local/CI test harness (docker-compose.dual-pds.yml).
+#
+# Terminates TLS on 443 for two distinct hostnames -- alice.pds.test and
+# bob.pds.test -- and reverse-proxies each to its own PDS container over
+# plain HTTP inside the compose network. This is what lets the PDS image
+# (@atproto/pds 0.5.27, see docker-compose.dual-pds.yml's header comment for
+# the full derivation) publish serviceEndpoint = https://<hostname> with NO
+# port -- the real, production shape -- instead of the old
+# http://localhost:<port> workaround.
+#
+# `tls internal` tells Caddy to mint (and self-manage) its OWN local
+# certificate authority and per-site leaf certificates instead of attempting
+# public ACME issuance, which would never succeed for these non-public,
+# non-resolvable test hostnames anyway. Caddy stores that CA under
+# /data/caddy/pki/authorities/local/ (see the `caddy_data` volume below);
+# scripts/extract-dual-pds-ca.sh pulls the root certificate out of that path
+# so everything else that must talk to these hostnames -- the Go test
+# harness's spawned protocol-service subprocesses, curl in
+# scripts/create-dual-pds-accounts.sh, etc -- can trust it explicitly rather
+# than disabling TLS verification.
+alice.pds.test:443 {
+	tls internal
+	reverse_proxy pds-alice:{$PDS_PORT_ALICE:2583}
+}
+
+bob.pds.test:443 {
+	tls internal
+	reverse_proxy pds-bob:{$PDS_PORT_BOB:2584}
+}

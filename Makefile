@@ -1,4 +1,4 @@
-.PHONY: build protocol web run-protocol run-web dev-protocol dev-web dev test test-protocol test-web test-integration test-e2e test-local test-local-up test-local-down test-federation-up test-federation-up-ci test-federation-down lint fmt clean
+.PHONY: build protocol web run-protocol run-web dev-protocol dev-web dev test test-protocol test-web test-integration test-e2e test-local test-local-up test-local-down test-federation-up test-federation-up-ci test-federation-down test-federation-hosts-clean lint fmt clean
 
 # Build commands
 build: protocol web
@@ -67,6 +67,15 @@ test-local-down:
 
 # Dual-PDS federated test harness (two independent PDS instances + two accounts)
 #
+# Both modes below (atchess-1c9.24) additionally: (1) ensure the host
+# resolves alice.pds.test/bob.pds.test (scripts/ensure-dual-pds-hosts.sh),
+# and (2) extract the TLS proxy's local CA once it is up
+# (scripts/extract-dual-pds-ca.sh) before creating accounts, since
+# create-dual-pds-accounts.sh now talks to both PDSes over real,
+# CA-verified HTTPS at those hostnames instead of plain
+# http://localhost:<port>. See docker-compose.dual-pds.yml's header comment
+# for the full topology.
+#
 # test-federation-up: LOCAL mode. Uses the real, public https://plc.directory
 #   (see docker-compose.dual-pds.yml for why). Convenient for ad-hoc dev runs;
 #   do not loop this repeatedly, it permanently publishes DID documents.
@@ -76,16 +85,29 @@ test-local-down:
 #   at it instead of the public directory. Same harness/account script as
 #   local mode -- only PDS_DID_PLC_URL differs.
 test-federation-up:
+	./scripts/ensure-dual-pds-hosts.sh
+	mkdir -p certs/dual-pds
 	docker compose -f docker-compose.dual-pds.yml up -d
+	./scripts/extract-dual-pds-ca.sh
 	./scripts/create-dual-pds-accounts.sh
 
 test-federation-up-ci:
+	./scripts/ensure-dual-pds-hosts.sh
+	mkdir -p certs/dual-pds
 	docker compose -f docker-compose.dual-pds.yml --profile ci up -d --wait local-plc
 	ATCHESS_PLC_URL=http://local-plc:2582 docker compose -f docker-compose.dual-pds.yml --profile ci up -d
+	./scripts/extract-dual-pds-ca.sh
 	./scripts/create-dual-pds-accounts.sh
 
 test-federation-down:
 	docker compose -f docker-compose.dual-pds.yml --profile ci down -v
+
+# Explicit, manual cleanup of the /etc/hosts entries scripts/ensure-dual-pds-hosts.sh
+# adds. NOT called by test-federation-down -- see scripts/remove-dual-pds-hosts.sh's
+# header comment for why automatic removal on every down would be actively harmful
+# (repeated /etc/hosts rewrites, and multiple harnesses fighting over shared host state).
+test-federation-hosts-clean:
+	./scripts/remove-dual-pds-hosts.sh
 
 # Code quality
 lint:

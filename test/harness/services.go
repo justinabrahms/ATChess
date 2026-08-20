@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -111,6 +112,38 @@ const localPLCDefaultPort = "2582"
 // makes to detect whether a CI-mode local-plc container is up.
 const localPLCHealthTimeout = 2 * time.Second
 
+// dualPDSCABundleRelPath is where scripts/extract-dual-pds-ca.sh (invoked
+// by `make test-federation-up`/`test-federation-up-ci`) writes the combined
+// system-CA-bundle + dual-PDS-proxy-local-CA bundle used to verify
+// alice.pds.test/bob.pds.test's TLS certificates (see
+// docker-compose.dual-pds.yml's CERTIFICATES comment for the full
+// derivation, and that script for why a COMBINED bundle -- not just the bare
+// CA -- is required for Go's SSL_CERT_FILE, which replaces rather than adds
+// to the default trust store).
+const dualPDSCABundleRelPath = "certs/dual-pds/ca-bundle.pem"
+
+// dualPDSCACertEnv returns the SSL_CERT_FILE override needed for the
+// spawned protocol-service subprocess to do real TLS verification against
+// pdsURL, if pdsURL is https. Fails the test loudly (rather than silently
+// falling through to the system default trust store, which would produce a
+// confusing "certificate signed by unknown authority" failure much later,
+// deep inside a move/challenge call) if pdsURL is https but the CA bundle
+// scripts/extract-dual-pds-ca.sh produces has not been generated yet.
+func dualPDSCACertEnv(t *testing.T, pdsURL string) []string {
+	t.Helper()
+
+	if !strings.HasPrefix(pdsURL, "https://") {
+		return nil
+	}
+
+	bundlePath := filepath.Join(repoRootDir(), dualPDSCABundleRelPath)
+	if _, err := os.Stat(bundlePath); err != nil {
+		t.Fatalf("protocol-service instance needs SSL_CERT_FILE to verify %s over TLS, but the CA bundle %s does not exist (%v). Run scripts/extract-dual-pds-ca.sh (or 'make test-federation-up'/'test-federation-up-ci', which runs it for you) before this test.", pdsURL, bundlePath, err)
+	}
+
+	return []string{"SSL_CERT_FILE=" + bundlePath}
+}
+
 // resolvePLCDirectoryURL determines which PLC directory the harness's
 // spawned protocol-service instances should be told to resolve did:plc
 // identities against (ATPROTO_PLC_DIRECTORY_URL; see internal/config and
@@ -189,6 +222,7 @@ func startProtocolService(t *testing.T, binPath string, account Account, port in
 	if plcDirectoryURL != "" {
 		cmd.Env = append(cmd.Env, "ATPROTO_PLC_DIRECTORY_URL="+plcDirectoryURL)
 	}
+	cmd.Env = append(cmd.Env, dualPDSCACertEnv(t, account.PDSURL)...)
 
 	logs := &syncBuffer{}
 	cmd.Stdout = logs

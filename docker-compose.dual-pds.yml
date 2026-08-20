@@ -1,72 +1,112 @@
-# Dual PDS setup for local E2E testing
-# Two independent PDS instances, each hosting one test player.
-# Uses HTTP (no SSL) for simplicity in local development.
+# Dual PDS setup for local/CI E2E testing (atchess-1c9.24 topology).
+# Two independent PDS instances, each hosting one test player, reachable at
+# distinct hostnames (alice.pds.test / bob.pds.test) over HTTPS via a
+# TLS-terminating Caddy reverse proxy on 443 -- the same production shape
+# real Bluesky PDSes use (https, no port), and the shape that lets this
+# harness catch bugs that a shared-loopback/same-hostname topology cannot.
 #
 # Usage: docker compose -f docker-compose.dual-pds.yml up -d
 #        ./scripts/test-local.sh
 #
-# NETWORKING (see atchess-1c9.17 for the bug this fixes, and its bead notes
-# for the empirical investigation behind this design):
+# NETWORKING -- HISTORY AND WHY THIS CHANGED (atchess-1c9.24; supersedes the
+# network_mode: "service:pds-alice" shared-namespace design from
+# atchess-1c9.17, whose empirical findings below still stand and shaped this
+# design):
 #
-# The official PDS image (@atproto/pds dist/config/config.js, envToCfg())
-# derives its published serviceEndpoint *only* from PDS_HOSTNAME/PDS_PORT,
-# and only supports two shapes -- there is no env var that sets an arbitrary
-# publicUrl directly:
+# The official PDS image (@atproto/pds 0.5.27 dist/config/config.js,
+# envToCfg()) derives its published serviceEndpoint *only* from
+# PDS_HOSTNAME/PDS_PORT, and only supports two shapes -- there is no env var
+# that sets an arbitrary publicUrl directly:
 #   - PDS_HOSTNAME=localhost       -> serviceEndpoint = http://localhost:${PDS_PORT}
 #   - PDS_HOSTNAME=<anything else> -> serviceEndpoint = https://<hostname>
-#     (no port at all -- assumes a TLS-terminating reverse proxy on 443)
-# For a local, plain-HTTP, two-PDS setup we are therefore locked into the
-# first shape: the literal hostname "localhost" is unconditionally baked into
-# each published serviceEndpoint, and the only thing that can differ between
-# alice and bob is the port (PDS_PORT_ALICE=2583 vs PDS_PORT_BOB=2584).
+#     (no port at all -- assumes a TLS-terminating reverse proxy on 443,
+#     which is exactly what this file now provides)
+# atchess-1c9.17 chose the "localhost" shape (both players differing only by
+# port, alice publishing both ports and bob sharing her network namespace)
+# because "localhost" cannot be redirected via ordinary compose-level DNS
+# tricks -- empirically, `extra_hosts: ["localhost:host-gateway"]` is
+# silently ignored for the literal name "localhost" (both glibc- and
+# musl-based images special-case it, independent of /etc/hosts content).
+# That topology worked, but atchess-1c9.24 (reviewer-found, during .17)
+# recorded five things it could never catch: hostname-keyed (vs
+# host+port-keyed) bugs invisible; peer-IP-keyed behaviour untestable (both
+# players were one IP); bob had no compose DNS name; restarting alice
+# destroyed bob's network stack (shared netns); and third-party containers
+# on the compose network could not reach either endpoint at all (their own
+# loopback != alice's).
 #
-# That literal "localhost" creates a genuine conflict between our two
-# reachability requirements:
-#   1. The host (where Go tests run) must be able to reach both endpoints.
-#   2. Containers in the compose network (e.g. one PDS resolving and calling
-#      the other's published serviceEndpoint, as real federation will do)
-#      must ALSO be able to reach both endpoints, using that same literal
-#      "http://localhost:<port>" string -- a client that only knows a DID
-#      cannot rewrite the hostname it resolved.
-# "localhost" cannot be redirected by ordinary compose-level DNS tricks:
-# empirically (tested against this harness's actual container images),
-# `extra_hosts: ["localhost:host-gateway"]` is silently ignored for the name
-# "localhost" specifically (both glibc- and musl-based images special-case
-# it independently of /etc/hosts content -- this is not the case for other,
-# ordinary hostnames, which extra_hosts overrides normally). And
-# `network_mode: host` -- which would make "localhost" mean the same
-# real machine everywhere -- does not reliably proxy container ports back to
-# the actual host in every Docker setup (confirmed here: with
-# network_mode: host, `curl http://localhost:<port>` from the real host got
-# "Connection refused", while the identical port published the ordinary way
-# with `ports:` worked correctly), so it cannot be relied on to satisfy
-# requirement 1.
+# THIS DESIGN removes all five at once, using the SECOND shape above
+# instead: pds-alice and pds-bob each get PDS_HOSTNAME set to a real,
+# non-"localhost" hostname (alice.pds.test / bob.pds.test) -- unlike
+# "localhost", `extra_hosts` DOES work for ordinary hostnames (reviewer-
+# confirmed in atchess-1c9.24), so both containers and the host can be told
+# where those names live without any special-casing. Each PDS gets its own,
+# completely ordinary bridge network stack (no more network_mode sharing),
+# its own compose DNS name, and is unaffected by the other being recreated.
+# A Caddy reverse proxy (`proxy`, this project's production reverse proxy
+# too -- see CLAUDE.md -- kept for consistency) terminates TLS on 443 for
+# both hostnames and forwards to each PDS's plain-HTTP internal port
+# (Docker's own service-name DNS resolves pds-alice/pds-bob for that hop;
+# no extra_hosts needed there, only for the two custom hostnames below).
 #
-# Resolution: pds-alice keeps ordinary bridge networking and publishes BOTH
-# players' ports to the host (`ports:` maps 2583:2583 and 2584:2584) --
-# this alone satisfies requirement 1 for both players, since Docker's own
-# host<->container port forwarding is a real kernel/netns-level mechanism,
-# not a DNS trick. pds-bob then joins pds-alice's network namespace via
-# `network_mode: "service:pds-alice"` instead of getting its own. Inside that
-# *shared* namespace, "localhost" genuinely is the same loopback for both
-# processes (alice bound to :2583, bob bound to :2584), so
-# `docker exec <either container> curl http://localhost:<either port>`
-# reaches the right PDS regardless of which container you exec into --
-# satisfying requirement 2 without touching the "localhost" special-case at
-# all (no extra_hosts override needed; this is Docker's own namespace-sharing
-# primitive, doing exactly what network_mode: host would do but scoped to
-# just these two containers instead of the real host, so it works
-# regardless of whether host networking is reliable in a given environment).
-# pds-bob deliberately has no `ports:` of its own (invalid together with
-# network_mode; alice's `ports:` already covers bob's port) and no separate
-# `volumes`/`healthcheck` restriction -- those remain per-container as usual,
-# only the network stack is shared.
+# THE TRAP THAT FORCED THE ORIGINAL "localhost" WORKAROUND, NOW HANDLED
+# EXPLICITLY: @atproto/pds 0.5.27 branches on hostname in a SECOND place
+# besides publicUrl -- serviceHandleDomains (dist/config/config.js, and
+# dist/config/env.js's envList('PDS_SERVICE_HANDLE_DOMAINS'), confirmed by
+# reading the running image, not just the docs):
+#   hostname === 'localhost' ? ['.test'] : [`.${hostname}`]
+# so switching PDS_HOSTNAME away from "localhost" would silently break the
+# alice.test/bob.test handles unless PDS_SERVICE_HANDLE_DOMAINS is set
+# explicitly. Both services below set it to ".test" so the handles this
+# harness and its downstream consumers (test/harness/accounts.go,
+# scripts/create-dual-pds-accounts.sh) already depend on keep working
+# unchanged. PDS_SERVICE_HANDLE_DOMAINS is a comma-separated envList; each
+# entry must start with "." (confirmed by reading env.js/config.js).
+#
+# CERTIFICATES: the proxy uses Caddy's `tls internal` directive (see
+# docker/dual-pds/Caddyfile), which makes Caddy mint and self-manage its OWN
+# local certificate authority instead of attempting public ACME issuance
+# (which could never succeed for these non-public, non-resolvable test
+# hostnames). scripts/extract-dual-pds-ca.sh pulls that CA's root
+# certificate out of the `caddy-data` volume so everything that must trust
+# alice.pds.test/bob.pds.test -- the Go test harness's spawned
+# protocol-service subprocesses (test/harness/services.go sets
+# SSL_CERT_FILE to a combined system+this-CA bundle), curl in
+# scripts/create-dual-pds-accounts.sh (--cacert) -- can do REAL TLS
+# verification against a real CA, deliberately NOT InsecureSkipVerify: this
+# is one of the few places this harness can exercise TLS verification at
+# all, so giving that up would be a real loss of coverage, not just a
+# convenience.
+#
+# EXTRA_HOSTS AND THE PROXY'S STATIC IP: pds-alice and pds-bob need
+# alice.pds.test/bob.pds.test to resolve to the proxy container (so that if
+# either PDS process, or a script/tool, ever makes an outbound call to
+# either published hostname, it reaches the proxy and not nowhere). Compose
+# `extra_hosts` entries must be literal IPs (or the special `host-gateway`),
+# not container/service names, so the `default` network below is pinned to
+# a fixed subnet and the proxy is given a static address on it
+# (172.28.90.10) purely so extra_hosts has something stable to point at.
+# The SAME technique is used ad hoc (via `docker run --add-host=...`) to
+# demonstrate that a throwaway THIRD-PARTY container on this network can now
+# reach both endpoints by hostname -- see the runbook/PR notes for
+# atchess-1c9.24 for that demonstration; nothing in this compose file
+# depends on it.
+#
+# HOST RESOLUTION: the host machine (where `go test` and
+# scripts/create-dual-pds-accounts.sh run) also needs
+# alice.pds.test/bob.pds.test to resolve, to 127.0.0.1 (where the proxy
+# publishes 443). `extra_hosts` is a per-container compose directive and has
+# no effect on the host's own resolver, so this is handled by
+# scripts/ensure-dual-pds-hosts.sh instead -- see that script for why it
+# uses a docker-mounted /etc/hosts write rather than requiring an
+# interactive `sudo` (not available non-interactively in every environment
+# this harness runs in, including some CI/sandboxed agent environments).
 #
 # local-plc/local-plc-db do not need any of this: PDS_DID_PLC_URL and
 # DATABASE_URL are plain outbound client config we set ourselves (not
 # derived/locked by the PDS image's hostname branching above), so they use
 # normal compose service-name DNS ("local-plc", "local-plc-db") exactly as
-# before -- no "localhost" involved, no conflict.
+# before -- no extra_hosts, no hostname trickery.
 #
 # PLC directory mode (see ATCHESS_PLC_URL below and docs/local-pds-setup.md):
 #   - LOCAL (default, `make test-federation-up`): PDS_DID_PLC_URL points at the
@@ -80,6 +120,18 @@
 #     published publicly and there is no dependency on a third party ATChess
 #     does not operate. Both modes run the identical harness/account script --
 #     only this URL differs.
+
+networks:
+  # Fixed subnet purely so the proxy container can be given a stable static
+  # IP (see EXTRA_HOSTS comment above) for pds-alice/pds-bob's extra_hosts
+  # entries to target. Every service below still resolves every other
+  # service by its ordinary compose service name via Docker's embedded DNS,
+  # exactly as on the un-pinned default network -- this only adds a fixed
+  # address for the proxy on top of that.
+  default:
+    ipam:
+      config:
+        - subnet: 172.28.90.0/24
 
 services:
   # Throwaway Postgres for the local-plc service below. CI mode only (profile
@@ -138,15 +190,64 @@ services:
     restart: "no"
     container_name: atchess-local-plc
 
-  # Network-namespace owner for both PDSes -- see the NETWORKING comment
-  # above. Publishes both alice's and bob's ports to the host.
+  # TLS-terminating reverse proxy for both PDSes -- see the NETWORKING and
+  # CERTIFICATES comments above. Publishes 443 to the host; internally
+  # forwards alice.pds.test -> pds-alice and bob.pds.test -> pds-bob over
+  # plain HTTP (Docker's own service-name DNS resolves those targets, no
+  # extra_hosts needed for that hop). Not profile-restricted: both LOCAL and
+  # CI modes need it.
+  proxy:
+    image: caddy:2.8-alpine
+    networks:
+      default:
+        ipv4_address: 172.28.90.10
+    ports:
+      - "${PDS_PROXY_PORT:-443}:443"
+    environment:
+      # Caddyfile placeholder substitution (`{$VAR:default}`) so the proxy
+      # keeps forwarding to the right internal port even if
+      # PDS_PORT_ALICE/PDS_PORT_BOB are overridden.
+      - PDS_PORT_ALICE=${PDS_PORT_ALICE:-2583}
+      - PDS_PORT_BOB=${PDS_PORT_BOB:-2584}
+    volumes:
+      - ./docker/dual-pds/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+    healthcheck:
+      # Caddy's local admin API (plain HTTP, no TLS, enabled by default) --
+      # deliberately NOT probing the HTTPS vhosts here, since that would
+      # itself need CA trust/SNI plumbing this healthcheck doesn't need.
+      # 127.0.0.1, not "localhost": this alpine image's wget resolves
+      # "localhost" to ::1 first and the admin API's IPv6 loopback listener
+      # refuses the connection (confirmed empirically), even though the
+      # IPv4 listener answers fine.
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:2019/config/"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    restart: "no"
+    container_name: atchess-dual-pds-proxy
+
   pds-alice:
     image: ghcr.io/bluesky-social/pds:latest
+    networks:
+      - default
+    # Own, ordinary network stack (no more network_mode sharing -- see
+    # NETWORKING comment above). Port still published directly to the host
+    # too, purely for scripts/test-local.sh and ad hoc debugging that talk
+    # to a PDS's own port directly; the harness's real, hostname-shaped
+    # traffic goes through `proxy` on 443 instead.
     ports:
       - "${PDS_PORT_ALICE:-2583}:${PDS_PORT_ALICE:-2583}"
-      - "${PDS_PORT_BOB:-2584}:${PDS_PORT_BOB:-2584}"
+    extra_hosts:
+      - "alice.pds.test:172.28.90.10"
+      - "bob.pds.test:172.28.90.10"
+    depends_on:
+      proxy:
+        condition: service_healthy
     environment:
-      - PDS_HOSTNAME=localhost
+      - PDS_HOSTNAME=alice.pds.test
+      - PDS_SERVICE_HANDLE_DOMAINS=.test
       - PDS_PORT=${PDS_PORT_ALICE:-2583}
       - PDS_JWT_SECRET=atchess-test-jwt-alice
       - PDS_ADMIN_PASSWORD=admin-alice
@@ -162,10 +263,17 @@ services:
       - LOG_ENABLED=true
       - PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX=1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef
       - PDS_REPO_SIGNING_KEY_K256_PRIVATE_KEY_HEX=abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890
-      - PDS_SERVICE_DID=did:web:localhost%3A2583
       - PDS_DEV_MODE=true
+      # Additive to Node's default trusted CA set (unlike Go's SSL_CERT_FILE,
+      # NODE_EXTRA_CA_CERTS ADDS to, not replaces, the system store -- see
+      # CERTIFICATES comment above), so PDS_CRAWLERS/PDS_DID_PLC_URL's real
+      # public HTTPS targets keep working unchanged even with this set. Only
+      # takes effect once scripts/extract-dual-pds-ca.sh has written this
+      # file; harmless (Node just warns) if it doesn't exist yet.
+      - NODE_EXTRA_CA_CERTS=/dual-pds-ca/ca.pem
     volumes:
       - pds-alice-data:/pds
+      - ./certs/dual-pds:/dual-pds-ca:ro
     healthcheck:
       test: ["CMD-SHELL", "wget -q --spider http://localhost:${PDS_PORT_ALICE:-2583}/xrpc/_health || exit 1"]
       interval: 5s
@@ -175,18 +283,21 @@ services:
     restart: "no"
     container_name: atchess-pds-alice
 
-  # Shares pds-alice's network namespace instead of getting its own -- see
-  # the NETWORKING comment above for why. No `ports:` here: that is invalid
-  # together with `network_mode`, and pds-alice's `ports:` already publishes
-  # bob's port too.
   pds-bob:
     image: ghcr.io/bluesky-social/pds:latest
-    network_mode: "service:pds-alice"
+    networks:
+      - default
+    ports:
+      - "${PDS_PORT_BOB:-2584}:${PDS_PORT_BOB:-2584}"
+    extra_hosts:
+      - "alice.pds.test:172.28.90.10"
+      - "bob.pds.test:172.28.90.10"
     depends_on:
-      pds-alice:
-        condition: service_started
+      proxy:
+        condition: service_healthy
     environment:
-      - PDS_HOSTNAME=localhost
+      - PDS_HOSTNAME=bob.pds.test
+      - PDS_SERVICE_HANDLE_DOMAINS=.test
       - PDS_PORT=${PDS_PORT_BOB:-2584}
       - PDS_JWT_SECRET=atchess-test-jwt-bob
       - PDS_ADMIN_PASSWORD=admin-bob
@@ -202,10 +313,11 @@ services:
       - LOG_ENABLED=true
       - PDS_PLC_ROTATION_KEY_K256_PRIVATE_KEY_HEX=fedcba0987654321fedcba0987654321fedcba0987654321fedcba0987654321
       - PDS_REPO_SIGNING_KEY_K256_PRIVATE_KEY_HEX=0987654321fedcba0987654321fedcba0987654321fedcba0987654321fedcba
-      - PDS_SERVICE_DID=did:web:localhost%3A2584
       - PDS_DEV_MODE=true
+      - NODE_EXTRA_CA_CERTS=/dual-pds-ca/ca.pem
     volumes:
       - pds-bob-data:/pds
+      - ./certs/dual-pds:/dual-pds-ca:ro
     healthcheck:
       test: ["CMD-SHELL", "wget -q --spider http://localhost:${PDS_PORT_BOB:-2584}/xrpc/_health || exit 1"]
       interval: 5s
@@ -219,4 +331,6 @@ volumes:
   pds-alice-data:
     driver: local
   pds-bob-data:
+    driver: local
+  caddy-data:
     driver: local
