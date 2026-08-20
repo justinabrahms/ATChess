@@ -128,7 +128,7 @@ func TestBuildAuthorizationURLAuto_SelectsPARWhenAdvertised(t *testing.T) {
 	client := testOAuthClient(t)
 	dpopKey := testDPoPKey(t)
 
-	authURL, err := client.BuildAuthorizationURLAuto("https://as.example.com/authorize", server.URL, "https://as.example.com", "alice.test", "state1", "chal1", dpopKey)
+	authURL, err := client.BuildAuthorizationURLAuto("https://as.example.com/authorize", server.URL, "https://as.example.com", "alice.test", "state1", "chal1", dpopKey, true)
 	if err != nil {
 		t.Fatalf("BuildAuthorizationURLAuto: %v", err)
 	}
@@ -150,7 +150,7 @@ func TestBuildAuthorizationURLAuto_FallsBackWhenNoPAREndpoint(t *testing.T) {
 	client := testOAuthClient(t)
 	dpopKey := testDPoPKey(t)
 
-	authURL, err := client.BuildAuthorizationURLAuto("https://as.example.com/authorize", "", "https://as.example.com", "alice.test", "state1", "chal1", dpopKey)
+	authURL, err := client.BuildAuthorizationURLAuto("https://as.example.com/authorize", "", "https://as.example.com", "alice.test", "state1", "chal1", dpopKey, false)
 	if err != nil {
 		t.Fatalf("BuildAuthorizationURLAuto: %v", err)
 	}
@@ -354,6 +354,53 @@ func TestRefreshTokens_EmptyRefreshTokenFailsImmediately(t *testing.T) {
 	_, err := client.RefreshTokens("https://as.example.com/token", "https://as.example.com", "", dpopKey)
 	if err == nil {
 		t.Fatal("expected an error for an empty refresh token")
+	}
+}
+
+// TestExchangeCodeForTokens_NonceRetry_SignsDistinctJTIPerAttempt pins
+// atchess-1c9.86 item 3: postFormWithDPoPRetry (client.go ~337) signs a
+// fresh DPoP proof on every attempt, including the retry, rather than
+// reusing a proof built for an earlier attempt -- which is what prevents
+// stale-iat rejection under clock skew (see dpop.CreateProof's doc
+// comment). jti, not iat, is the primary signal here: RFC 9449 requires a
+// proof's jti be unique, and unlike iat it doesn't depend on wall-clock
+// granularity -- a regression that hoists/reuses the proof would still be
+// caught even if both attempts complete within the same second.
+func TestExchangeCodeForTokens_NonceRetry_SignsDistinctJTIPerAttempt(t *testing.T) {
+	var firstJTI, secondJTI string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		claims, err := decodeJWTPayloadUnverified(r.Header.Get("DPoP"))
+		if err != nil {
+			t.Fatalf("decoding DPoP proof: %v", err)
+		}
+		jti, _ := claims["jti"].(string)
+		if firstJTI == "" {
+			firstJTI = jti
+			w.Header().Set("DPoP-Nonce", "nonce-1")
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":"use_dpop_nonce"}`))
+			return
+		}
+		secondJTI = jti
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"access_token":"tok","token_type":"DPoP","expires_in":3600,"refresh_token":"rt","scope":"atproto","sub":"did:example:test"}`))
+	}))
+	defer server.Close()
+
+	client := testOAuthClient(t)
+	dpopKey := testDPoPKey(t)
+
+	_, err := client.ExchangeCodeForTokens(server.URL, "https://as.example.com", "code123", "verifier123", dpopKey)
+	if err != nil {
+		t.Fatalf("ExchangeCodeForTokens: %v", err)
+	}
+	if firstJTI == "" || secondJTI == "" {
+		t.Fatalf("expected both attempts to carry a jti claim, got first=%q second=%q", firstJTI, secondJTI)
+	}
+	if firstJTI == secondJTI {
+		t.Errorf("both attempts' DPoP proofs carried the SAME jti (%q) -- the proof was reused/hoisted instead of freshly signed per attempt", firstJTI)
 	}
 }
 

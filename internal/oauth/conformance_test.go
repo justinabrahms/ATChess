@@ -293,7 +293,8 @@ func TestConformance_PARIsAttemptedWhenRequired(t *testing.T) {
 	// PushAuthorizationRequest actually POSTs to the live PAR endpoint.
 	authURL, buildErr := client.BuildAuthorizationURLAuto(
 		metadata.AuthorizationEndpoint, metadata.PushedAuthorizationRequestEndpoint,
-		authServerURL, conformanceTestHandle, state, challenge, dpopKey)
+		authServerURL, conformanceTestHandle, state, challenge, dpopKey,
+		metadata.RequirePushedAuthorizationRequests)
 
 	switch {
 	case buildErr == nil:

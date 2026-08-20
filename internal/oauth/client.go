@@ -7,6 +7,7 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/rs/zerolog/log"
 
 	"github.com/justinabrahms/atchess/internal/dpop"
 )
@@ -181,6 +183,16 @@ func (c *OAuthClient) ExchangeCodeForTokens(tokenEndpoint, issuer, code, codeVer
 // dpopKey, when non-nil, DPoP-binds the PAR request (and, from here
 // onward, every token this authorization eventually yields) the same way
 // ExchangeCodeForTokens does, including the same nonce-retry behaviour.
+//
+// Failures originating from the PAR exchange itself are returned as a
+// *PARError, carrying the HTTP status the authorization server responded
+// with (or 0 if the request never got a response at all -- a network error
+// or timeout). Failures BEFORE or AFTER that exchange -- building the
+// client assertion, decoding the response body, a 201 with no request_uri
+// -- are returned as plain errors, which BuildAuthorizationURLAuto treats
+// as non-transient and hard-fails on. See
+// PARError.Transient and BuildAuthorizationURLAuto's doc comment for why
+// callers need to be able to tell those apart (atchess-1c9.86).
 func (c *OAuthClient) PushAuthorizationRequest(parEndpoint, issuer, handle, state, codeChallenge string, dpopKey *ecdsa.PrivateKey) (requestURI string, err error) {
 	clientAssertion, err := c.CreateClientAssertion(issuer)
 	if err != nil {
@@ -204,13 +216,27 @@ func (c *OAuthClient) PushAuthorizationRequest(parEndpoint, issuer, handle, stat
 		return data
 	})
 	if err != nil {
-		return "", fmt.Errorf("pushed authorization request failed: %w", err)
+		// resp can still be non-nil here even though err != nil (e.g.
+		// postFormWithDPoPRetry's "server requires a DPoP nonce but
+		// didn't supply one" case, which returns both) -- prefer its
+		// status code when present so PARError.Transient() is exact; 0
+		// (no response reached at all -- a network error/timeout) is
+		// the correct default for genuinely response-less failures and
+		// is itself transient.
+		status := 0
+		if resp != nil {
+			status = resp.StatusCode
+		}
+		return "", &PARError{StatusCode: status, Err: fmt.Errorf("pushed authorization request failed: %w", err)}
 	}
 	// RFC 9126 s2.2: a successful PAR response is 201 Created. Some
 	// deployments have been observed returning 200; accept both, reject
 	// everything else.
 	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("pushed authorization request failed: HTTP %d - %s", resp.StatusCode, string(body))
+		return "", &PARError{
+			StatusCode: resp.StatusCode,
+			Err:        fmt.Errorf("pushed authorization request failed: HTTP %d - %s", resp.StatusCode, string(body)),
+		}
 	}
 
 	var parResp struct {
@@ -224,6 +250,48 @@ func (c *OAuthClient) PushAuthorizationRequest(parEndpoint, issuer, handle, stat
 		return "", fmt.Errorf("PAR response did not include a request_uri: %s", string(body))
 	}
 	return parResp.RequestURI, nil
+}
+
+// PARError describes why a Pushed Authorization Request
+// (PushAuthorizationRequest) failed, carrying enough information for a
+// caller to decide whether the failure could plausibly be worked around
+// (e.g. by falling back to a plain, non-PAR /authorize URL) or not. See
+// BuildAuthorizationURLAuto's doc comment for the policy this type exists
+// to support (atchess-1c9.86).
+type PARError struct {
+	// StatusCode is the HTTP status the authorization server's PAR
+	// endpoint returned, or 0 if the request never reached a response at
+	// all (a network error or timeout talking to the endpoint).
+	StatusCode int
+	Err        error
+}
+
+func (e *PARError) Error() string { return e.Err.Error() }
+func (e *PARError) Unwrap() error { return e.Err }
+
+// Transient reports whether this PAR failure is the kind a fresh attempt
+// -- or a fallback to a differently-shaped request -- could plausibly
+// overcome: no response was received at all (StatusCode == 0: a network
+// error or timeout), or the authorization server itself failed (a 5xx).
+// It is NOT transient for most 4xx: the authorization server received and
+// understood the request well enough to actively reject it, so retrying
+// -- or falling back to the plain /authorize URL, which is a differently
+// shaped but still fallible request -- would likely be rejected the same
+// way.
+//
+// 408 and 429 are the exceptions, and they matter. Neither says anything
+// about our request being WRONG: 408 is a timeout the server noticed
+// before we did, and 429 means "correct, but not right now". Treating
+// them as fatal would hard-fail a login for exactly the reason the
+// require=false fallback exists to survive, and /authorize is typically
+// rate-limited separately from the PAR endpoint. Falling back may simply
+// relocate a 429 to the redirect, but that is a cosmetic loss where
+// hard-failing is a real one.
+func (e *PARError) Transient() bool {
+	if e.StatusCode == http.StatusRequestTimeout || e.StatusCode == http.StatusTooManyRequests {
+		return true
+	}
+	return e.StatusCode == 0 || e.StatusCode >= 500
 }
 
 // BuildAuthorizationURLFromRequestURI builds the /authorize redirect target
@@ -247,19 +315,61 @@ func (c *OAuthClient) BuildAuthorizationURLFromRequestURI(authEndpoint, requestU
 // is used as the client assertion's "aud" for the PAR call; it is unused
 // when parEndpoint is empty.
 //
+// requirePAR should be the authorization server's advertised
+// require_pushed_authorization_requests metadata field, and governs what
+// happens when a PAR attempt (parEndpoint != "") fails -- this is
+// atchess-1c9.86's PAR-FAILURE POLICY, decided deliberately rather than
+// left as the previous unconditional hard-fail:
+//
+//   - requirePAR == true: HARD-FAIL on ANY PushAuthorizationRequest error,
+//     transient or not. A fallback to the plain /authorize URL would be
+//     pointless here -- the server has told us via metadata that it
+//     REQUIRES PAR, so it will, by definition, reject a plain
+//     authorization request too. Falling back would just move an
+//     already-certain failure somewhere less legible (a confusing
+//     authorize-endpoint rejection instead of a clear PAR error).
+//   - requirePAR == false AND the failure is transient (*PARError with
+//     Transient() == true: a network error/timeout, or the authorization
+//     server itself erroring with a 5xx): FALL BACK to the plain
+//     /authorize URL, logged at warn. The server accepts a plain request
+//     by definition when it doesn't require PAR, and a momentary PAR
+//     outage on the server's end shouldn't block a login that would
+//     otherwise work.
+//   - requirePAR == false AND the failure is NOT transient (a 4xx, or any
+//     other error shape): HARD-FAIL. A 4xx means the authorization server
+//     understood our PAR request well enough to actively refuse it --
+//     that points at a defect in what we're sending, not at PAR being
+//     temporarily unavailable, and the plain /authorize URL would likely
+//     be built from the same (wrong) parameters and get refused too.
+//     Falling back would silently mask that defect instead of surfacing
+//     it -- exactly the class of masking atchess-1c9.76 and .85 were
+//     about.
+//
+// In short: fall back only when availability -- not correctness -- is in
+// question, and only when the server's own metadata says a fallback could
+// possibly succeed.
+//
 // This is the single production entry point atchess-1c9.12's login handler
 // (internal/web's OAuthLoginHandler) uses, and is exercised directly (with
-// both a populated and an empty parEndpoint) by this package's own unit
-// tests -- see client_par_test.go -- rather than only indirectly through
-// internal/web, since a full web-layer test would additionally require
-// mocking the handle/DID/PDS resolution chain PAR selection itself does
-// not depend on.
-func (c *OAuthClient) BuildAuthorizationURLAuto(authEndpoint, parEndpoint, issuer, handle, state, codeChallenge string, dpopKey *ecdsa.PrivateKey) (string, error) {
+// both a populated and an empty parEndpoint, and all four requirePAR x
+// transient/4xx combinations) by this package's own unit tests -- see
+// client_par_test.go -- rather than only indirectly through internal/web,
+// since a full web-layer test would additionally require mocking the
+// handle/DID/PDS resolution chain PAR selection itself does not depend on.
+func (c *OAuthClient) BuildAuthorizationURLAuto(authEndpoint, parEndpoint, issuer, handle, state, codeChallenge string, dpopKey *ecdsa.PrivateKey, requirePAR bool) (string, error) {
 	if parEndpoint == "" {
 		return c.BuildAuthorizationURL(authEndpoint, handle, state, codeChallenge), nil
 	}
 	requestURI, err := c.PushAuthorizationRequest(parEndpoint, issuer, handle, state, codeChallenge, dpopKey)
 	if err != nil {
+		if !requirePAR {
+			var parErr *PARError
+			if errors.As(err, &parErr) && parErr.Transient() {
+				log.Warn().Err(err).Str("parEndpoint", parEndpoint).
+					Msg("Pushed Authorization Request failed transiently and the authorization server does not require PAR; falling back to a plain (non-PAR) authorization URL")
+				return c.BuildAuthorizationURL(authEndpoint, handle, state, codeChallenge), nil
+			}
+		}
 		return "", err
 	}
 	return c.BuildAuthorizationURLFromRequestURI(authEndpoint, requestURI), nil

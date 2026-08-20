@@ -9,11 +9,13 @@ package atproto
 // is defined there and reused here (same package).
 
 import (
+	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -249,5 +251,97 @@ func TestDoRequest_DPoP_ReusesNonceStoredByAnotherClientInstance(t *testing.T) {
 	}
 	if resp2.StatusCode != http.StatusOK {
 		t.Errorf("expected client2's single attempt to succeed, got HTTP %d", resp2.StatusCode)
+	}
+}
+
+// TestCreateGame_PersistentDPoPNonceChallenge_RotatingNonce_ExactlyTwoAttempts
+// pins atchess-1c9.86 item 2: makeRequest (~334-357) is structurally safe
+// against a resource server that NEVER accepts our nonce -- it returns a
+// FRESH DPoP-Nonce on every single response, so a naive "retry while we
+// got a new nonce" implementation would spin forever. The current code is
+// non-recursive and each branch returns, making at most one extra request
+// -- this test pins that so a future refactor toward a retry loop can't
+// silently reintroduce an unbounded loop here.
+//
+// CreateGame (rather than calling makeRequest directly, as the other
+// tests in this file do) is used specifically so a genuine error()
+// propagates to the caller -- makeRequest itself just returns the second
+// (still-401) response with err == nil; it's the caller's status-code
+// check that turns a persistent 401 into an actual Go error.
+func TestCreateGame_PersistentDPoPNonceChallenge_RotatingNonce_ExactlyTwoAttempts(t *testing.T) {
+	var attempts int32
+	mockPDS := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := atomic.AddInt32(&attempts, 1)
+		// A DIFFERENT nonce on every single response -- the retry can
+		// never converge on a nonce the server will accept, so if the
+		// implementation ever starts looping "while we got a fresh
+		// nonce", this server will never stop feeding it one.
+		w.Header().Set("DPoP-Nonce", fmt.Sprintf("resource-nonce-%d", n))
+		w.WriteHeader(http.StatusUnauthorized)
+	}))
+	defer mockPDS.Close()
+
+	dpopKey := newTestDPoPKey(t)
+	auth := &fakeAuthenticator{token: "test-access-token", refreshToken: "should-not-be-used"}
+	client, err := NewClientFromSession(mockPDS.URL, "did:plc:test", "test.handle", true, dpopKey, auth)
+	if err != nil {
+		t.Fatalf("NewClientFromSession: %v", err)
+	}
+
+	_, err = client.CreateGame(context.Background(), "did:plc:opponent", "white")
+	if err == nil {
+		t.Fatal("expected an error from a persistent 401 (rotating nonce), got nil")
+	}
+	if got := atomic.LoadInt32(&attempts); got != 2 {
+		t.Fatalf("expected EXACTLY 2 attempts (no unbounded retry loop chasing the rotating nonce), got %d", got)
+	}
+	if got := atomic.LoadInt32(&auth.refreshCalls); got != 0 {
+		t.Errorf("expected ForceRefresh NOT to be called (every 401 carried a DPoP-Nonce, so the nonce-challenge branch -- not the ForceRefresh branch -- handles it), got %d call(s)", got)
+	}
+}
+
+// TestMakeRequest_DPoP_NonceChallenge_SignsDistinctJTIPerAttempt pins
+// atchess-1c9.86 item 3 at the resource-server layer: doRequest
+// (~internal/atproto/client.go:405) signs a fresh DPoP proof on every
+// call, including the retry, rather than reusing one built for an earlier
+// attempt -- which is what prevents stale-iat rejection under clock skew.
+// jti is asserted (rather than iat) because RFC 9449 requires it be
+// unique per proof and, unlike iat, it doesn't depend on wall-clock
+// granularity -- so this test can't flake by completing both attempts
+// within the same second.
+func TestMakeRequest_DPoP_NonceChallenge_SignsDistinctJTIPerAttempt(t *testing.T) {
+	var firstJTI, secondJTI string
+	mockPDS := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		jti, _ := decodeDPoPProofUnverified(t, r.Header.Get("DPoP"))["jti"].(string)
+		if firstJTI == "" {
+			firstJTI = jti
+			w.Header().Set("DPoP-Nonce", "resource-nonce-1")
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		secondJTI = jti
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"uri":"at://x","cid":"y"}`))
+	}))
+	defer mockPDS.Close()
+
+	dpopKey := newTestDPoPKey(t)
+	auth := &fakeAuthenticator{token: "test-access-token"}
+	client, err := NewClientFromSession(mockPDS.URL, "did:plc:test", "test.handle", true, dpopKey, auth)
+	if err != nil {
+		t.Fatalf("NewClientFromSession: %v", err)
+	}
+
+	resp, err := client.makeRequest("POST", mockPDS.URL+"/xrpc/some.method", []byte(`{}`))
+	if err != nil {
+		t.Fatalf("makeRequest: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if firstJTI == "" || secondJTI == "" {
+		t.Fatalf("expected both attempts to carry a jti claim, got first=%q second=%q", firstJTI, secondJTI)
+	}
+	if firstJTI == secondJTI {
+		t.Errorf("both attempts' DPoP proofs carried the SAME jti (%q) -- the proof was reused/hoisted instead of freshly signed per attempt", firstJTI)
 	}
 }

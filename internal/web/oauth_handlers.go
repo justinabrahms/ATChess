@@ -124,11 +124,15 @@ func (s *Service) OAuthLoginHandler(w http.ResponseWriter, r *http.Request) {
 	// -- the authorization server actually advertises a PAR endpoint: PAR
 	// is not universal (e.g. the local dual-PDS test harness's
 	// authorization server does not advertise one), and unconditionally
-	// requiring it would break every server that doesn't support it. See
-	// that method's doc comment for the exact selection rule.
+	// requiring it would break every server that doesn't support it.
+	// metadata.RequirePushedAuthorizationRequests is passed through so
+	// BuildAuthorizationURLAuto can apply atchess-1c9.86's PAR-failure
+	// policy (hard-fail vs. fall back to the plain /authorize URL) -- see
+	// that method's doc comment for the exact selection and failure-policy
+	// rules.
 	authURL, err := oauthClient.BuildAuthorizationURLAuto(
 		metadata.AuthorizationEndpoint, metadata.PushedAuthorizationRequestEndpoint,
-		authServerURL, req.Handle, state, challenge, dpopKey)
+		authServerURL, req.Handle, state, challenge, dpopKey, metadata.RequirePushedAuthorizationRequests)
 	if err != nil {
 		authStore.GetAndDeleteAuthorization(state) //nolint:errcheck // best-effort cleanup of the request we just stored
 		log.Error().Err(err).Str("handle", req.Handle).Str("parEndpoint", metadata.PushedAuthorizationRequestEndpoint).
