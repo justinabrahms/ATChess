@@ -52,6 +52,24 @@ type deriveTestPDS struct {
 	// HTTP 500, "malformed" returns HTTP 200 with a body that is not valid
 	// JSON.
 	listFail map[string]string
+
+	// writeCalls counts every com.atproto.repo.createRecord/putRecord
+	// request this server has actually received, regardless of outcome.
+	// Used by RespondToDrawOffer's terminal-game guard tests
+	// (atchess-1c9.56) to prove a rejected response performed ZERO writes
+	// -- asserting on requests actually observed by the fake server, not
+	// on RespondToDrawOffer's return value. rkeySeq generates rkeys for
+	// writes that don't specify one (createRecord never does).
+	writeCalls int
+	rkeySeq    int
+}
+
+// writeCallCount returns the number of com.atproto.repo.createRecord/
+// putRecord requests this server has received so far.
+func (m *deriveTestPDS) writeCallCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.writeCalls
 }
 
 func newDeriveTestPDS(t *testing.T) *deriveTestPDS {
@@ -163,6 +181,48 @@ func (m *deriveTestPDS) handle(w http.ResponseWriter, r *http.Request) {
 			recs = append(recs, rec{URI: fmt.Sprintf("at://%s/%s/%s", repo, collection, rkey), CID: "cid-" + rkey, Value: val})
 		}
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{"records": recs})
+		return
+
+	case "/xrpc/com.atproto.repo.createRecord", "/xrpc/com.atproto.repo.putRecord":
+		// Minimal write support, added for RespondToDrawOffer's
+		// terminal-game guard tests (atchess-1c9.56): every request here
+		// is counted in writeCalls (regardless of outcome) so tests can
+		// assert on requests actually observed by this server, and the
+		// record is stored so a legitimate accept-in-an-active-game test
+		// can observe a real success end to end.
+		var body struct {
+			Repo       string                 `json:"repo"`
+			Collection string                 `json:"collection"`
+			Rkey       string                 `json:"rkey"`
+			Record     map[string]interface{} `json:"record"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			m.mu.Lock()
+			m.writeCalls++
+			m.mu.Unlock()
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "InvalidRequest"})
+			return
+		}
+		m.mu.Lock()
+		m.writeCalls++
+		rkey := body.Rkey
+		if rkey == "" {
+			m.rkeySeq++
+			rkey = fmt.Sprintf("auto%d", m.rkeySeq)
+		}
+		if m.records[body.Repo] == nil {
+			m.records[body.Repo] = map[string]map[string]interface{}{}
+		}
+		if m.records[body.Repo][body.Collection] == nil {
+			m.records[body.Repo][body.Collection] = map[string]interface{}{}
+		}
+		m.records[body.Repo][body.Collection][rkey] = body.Record
+		m.mu.Unlock()
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"uri": fmt.Sprintf("at://%s/%s/%s", body.Repo, body.Collection, rkey),
+			"cid": "cid-" + rkey,
+		})
 		return
 
 	default:
@@ -784,5 +844,123 @@ func TestResignGame_FailsClosed_WhenDerivationIncomplete(t *testing.T) {
 	}
 	if !errors.Is(err, ErrIncompleteDerivation) {
 		t.Errorf("expected errors.Is(err, ErrIncompleteDerivation), got: %v", err)
+	}
+}
+
+// --- RespondToDrawOffer terminal-game guard tests (atchess-1c9.56) ---
+//
+// RespondToDrawOffer used to gate only on the draw-offer record's own
+// "status" field, never on the derived game status -- unlike OfferDraw,
+// ResignGame and CheckTimeViolation. So a draw could be accepted into a
+// game that had already ended (e.g. after the opponent resigned),
+// producing two competing terminal events for one game. These tests seed
+// the offer in whiteDID's own repo and respond as the white client (the
+// only identity this harness's createSession stub can log in as -- see
+// newDeriveTestClient); RespondToDrawOffer places no restriction on who
+// may respond to whose offer, so this exercises the guard without needing
+// a second client identity.
+
+// TestRespondToDrawOffer_RejectedInResignedGame proves an accept is
+// refused, and performs ZERO writes, once the game has already ended via
+// resignation.
+func TestRespondToDrawOffer_RejectedInResignedGame(t *testing.T) {
+	mock := newDeriveTestPDS(t)
+	srv := mock.server()
+	defer srv.Close()
+
+	gameURI := mock.seedActiveGame(t, time.Now().Add(-time.Hour), nil)
+
+	offerURI, _ := mock.seed(whiteDID, "app.atchess.drawOffer", "offer1", map[string]interface{}{
+		"$type":     "app.atchess.drawOffer",
+		"createdAt": time.Now().Format(time.RFC3339),
+		"game":      map[string]interface{}{"uri": gameURI, "cid": "cid-game1"},
+		"offeredBy": whiteDID,
+		"status":    "pending",
+	})
+
+	// White resigns after making the offer -- the game is now terminal
+	// (black_won) even though the drawOffer record itself still says
+	// "pending".
+	mock.seed(whiteDID, "app.atchess.resignation", "resign1", map[string]interface{}{
+		"$type":           "app.atchess.resignation",
+		"createdAt":       time.Now().Format(time.RFC3339),
+		"game":            map[string]interface{}{"uri": gameURI},
+		"resigningPlayer": whiteDID,
+	})
+
+	client := newDeriveTestClient(t, mock)
+	err := client.RespondToDrawOffer(context.Background(), offerURI, true)
+	if err == nil {
+		t.Fatalf("expected RespondToDrawOffer to reject an accept into a resigned (terminal) game, got nil error")
+	}
+	if got := mock.writeCallCount(); got != 0 {
+		t.Errorf("expected ZERO createRecord/putRecord writes when the accept is rejected, got %d", got)
+	}
+}
+
+// TestRespondToDrawOffer_FailsClosed_WhenDerivationIncomplete proves an
+// accept is refused, and performs ZERO writes, when the game's derived
+// status cannot be verified at all (here: black's PDS is unreachable),
+// matching the fail-closed pattern OfferDraw/ResignGame/CheckTimeViolation
+// already use (atchess-1c9.51).
+func TestRespondToDrawOffer_FailsClosed_WhenDerivationIncomplete(t *testing.T) {
+	mock := newDeriveTestPDS(t)
+	srv := mock.server()
+	defer srv.Close()
+
+	dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	dead.Close()
+	mock.setUnreachable(blackDID, dead.URL)
+
+	gameURI := mock.seedActiveGame(t, time.Now().Add(-time.Hour), nil)
+
+	offerURI, _ := mock.seed(whiteDID, "app.atchess.drawOffer", "offer1", map[string]interface{}{
+		"$type":     "app.atchess.drawOffer",
+		"createdAt": time.Now().Format(time.RFC3339),
+		"game":      map[string]interface{}{"uri": gameURI, "cid": "cid-game1"},
+		"offeredBy": whiteDID,
+		"status":    "pending",
+	})
+
+	client := newDeriveTestClient(t, mock)
+	err := client.RespondToDrawOffer(context.Background(), offerURI, true)
+	if err == nil {
+		t.Fatalf("expected RespondToDrawOffer to fail closed when the game's status could not be verified (black's PDS unreachable), got nil error")
+	}
+	if !errors.Is(err, ErrIncompleteDerivation) {
+		t.Errorf("expected errors.Is(err, ErrIncompleteDerivation), got: %v", err)
+	}
+	if got := mock.writeCallCount(); got != 0 {
+		t.Errorf("expected ZERO createRecord/putRecord writes when derivation is incomplete, got %d", got)
+	}
+}
+
+// TestRespondToDrawOffer_Accept_ActiveGame_Succeeds is the required
+// negative control: a legitimate accept in a still-active game must still
+// succeed, so the new guard is not simply blocking everything.
+func TestRespondToDrawOffer_Accept_ActiveGame_Succeeds(t *testing.T) {
+	mock := newDeriveTestPDS(t)
+	srv := mock.server()
+	defer srv.Close()
+
+	gameURI := mock.seedActiveGame(t, time.Now().Add(-time.Hour), nil)
+
+	offerURI, _ := mock.seed(whiteDID, "app.atchess.drawOffer", "offer1", map[string]interface{}{
+		"$type":     "app.atchess.drawOffer",
+		"createdAt": time.Now().Format(time.RFC3339),
+		"game":      map[string]interface{}{"uri": gameURI, "cid": "cid-game1"},
+		"offeredBy": whiteDID,
+		"status":    "pending",
+	})
+
+	client := newDeriveTestClient(t, mock)
+	err := client.RespondToDrawOffer(context.Background(), offerURI, true)
+	if err != nil {
+		t.Fatalf("expected a legitimate accept in an active game to succeed, got error: %v", err)
+	}
+	// createRecord for the drawResponse, plus putRecord to refresh the
+	// cached game record's status (white owns the game record here).
+	if got := mock.writeCallCount(); got == 0 {
+		t.Errorf("expected the accept to actually reach the fake server's write path, got %d writes", got)
 	}
 }

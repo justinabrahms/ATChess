@@ -1809,6 +1809,23 @@ func (c *Client) RespondToDrawOffer(ctx context.Context, drawOfferURI string, ac
 	// happened since), but good enough for a decline (see below).
 	offerGameCID, _ := gameRef["cid"].(string)
 
+	// Verify the game hasn't already reached a terminal state by some
+	// OTHER event (e.g. the opponent resigned, or the game timed out)
+	// since this offer was made. Unlike OfferDraw/ResignGame/
+	// CheckTimeViolation, this check used to be missing entirely here --
+	// RespondToDrawOffer only ever looked at the offer record's own
+	// "status" field, never the derived game status -- so a draw could be
+	// accepted into a game that had already ended, producing two
+	// competing terminal events (atchess-1c9.56). Uses the derived status
+	// (GetGame), not the raw cached game record status -- see OfferDraw's
+	// comment (atchess-1c9.48 review). Fail closed if the status could
+	// not be verified at all (atchess-1c9.51).
+	if status, statusErr := c.currentGameStatus(ctx, gameURI); statusErr != nil {
+		return fmt.Errorf("cannot verify game is still active: %w", statusErr)
+	} else if status != chess.StatusActive {
+		return fmt.Errorf("cannot respond to draw offer in a game with status: %s", status)
+	}
+
 	// Record the response. AT Protocol never permits writing into another
 	// account's repository, and the draw offer record (drawOfferURI) lives
 	// in the OFFERING player's repo -- which, for the ordinary case of the
