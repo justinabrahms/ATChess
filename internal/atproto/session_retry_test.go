@@ -71,7 +71,7 @@ func TestMakeRequest_Persistent401_ExactlyTwoAttemptsOneForceRefresh(t *testing.
 	defer mockPDS.Close()
 
 	auth := &fakeAuthenticator{token: "stale-token", refreshToken: "still-stale-token"}
-	client, err := NewClientFromSession(mockPDS.URL, "did:plc:test", "test.handle", false, auth)
+	client, err := NewClientFromSession(mockPDS.URL, "did:plc:test", "test.handle", false, nil, auth)
 	if err != nil {
 		t.Fatalf("NewClientFromSession failed: %v", err)
 	}
@@ -129,7 +129,7 @@ func TestMakeRequest_401ThenSuccess_RetriesWithFullBodyAndRefreshedToken(t *test
 	defer mockPDS.Close()
 
 	auth := &fakeAuthenticator{token: "stale-token", refreshToken: "fresh-token"}
-	client, err := NewClientFromSession(mockPDS.URL, "did:plc:test", "test.handle", false, auth)
+	client, err := NewClientFromSession(mockPDS.URL, "did:plc:test", "test.handle", false, nil, auth)
 	if err != nil {
 		t.Fatalf("NewClientFromSession failed: %v", err)
 	}
@@ -182,7 +182,7 @@ func TestMakeRequest_401_RefreshFailure_SurfacesErrorWithoutFallback(t *testing.
 
 	refreshErr := errors.New("refresh token revoked")
 	auth := &fakeAuthenticator{token: "stale-token", refreshErr: refreshErr}
-	client, err := NewClientFromSession(mockPDS.URL, "did:plc:test", "test.handle", false, auth)
+	client, err := NewClientFromSession(mockPDS.URL, "did:plc:test", "test.handle", false, nil, auth)
 	if err != nil {
 		t.Fatalf("NewClientFromSession failed: %v", err)
 	}

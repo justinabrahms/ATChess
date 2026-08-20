@@ -75,8 +75,10 @@ func (s *Service) OAuthLoginHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Resolve handle to get PDS URL and OAuth endpoints
-	pdsURL, authEndpoint, err := s.resolveOAuthEndpoints(req.Handle)
+	// Resolve handle to get PDS URL and OAuth authorization server metadata
+	// (including, per atchess-1c9.12, the PAR fields the pre-atchess-1c9.12
+	// resolution chain discarded).
+	pdsURL, authServerURL, metadata, err := s.resolveOAuthEndpoints(req.Handle)
 	if err != nil {
 		log.Error().Err(err).Str("handle", req.Handle).Msg("Failed to resolve OAuth endpoints")
 		http.Error(w, "Failed to resolve authentication server", http.StatusInternalServerError)
@@ -97,7 +99,11 @@ func (s *Service) OAuthLoginHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Generate DPoP key for this session
+	// Generate the DPoP key for this session. This SAME key is used for
+	// the (optional) PAR call below, the eventual token exchange, and
+	// every request/refresh made with the tokens that flow from it -- DPoP
+	// binds a token to the specific proof key that first requested it, so
+	// the key must not change partway through.
 	dpopKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		http.Error(w, "Failed to generate DPoP key", http.StatusInternalServerError)
@@ -113,8 +119,23 @@ func (s *Service) OAuthLoginHandler(w http.ResponseWriter, r *http.Request) {
 		DPoPKey:      dpopKey,
 	})
 
-	// Build authorization URL
-	authURL := oauthClient.BuildAuthorizationURL(authEndpoint, req.Handle, state, challenge)
+	// Build the authorization URL. oauthClient.BuildAuthorizationURLAuto
+	// uses Pushed Authorization Requests (RFC 9126) when -- and only when
+	// -- the authorization server actually advertises a PAR endpoint: PAR
+	// is not universal (e.g. the local dual-PDS test harness's
+	// authorization server does not advertise one), and unconditionally
+	// requiring it would break every server that doesn't support it. See
+	// that method's doc comment for the exact selection rule.
+	authURL, err := oauthClient.BuildAuthorizationURLAuto(
+		metadata.AuthorizationEndpoint, metadata.PushedAuthorizationRequestEndpoint,
+		authServerURL, req.Handle, state, challenge, dpopKey)
+	if err != nil {
+		authStore.GetAndDeleteAuthorization(state) //nolint:errcheck // best-effort cleanup of the request we just stored
+		log.Error().Err(err).Str("handle", req.Handle).Str("parEndpoint", metadata.PushedAuthorizationRequestEndpoint).
+			Msg("Failed to build authorization URL")
+		http.Error(w, "Failed to start authorization", http.StatusInternalServerError)
+		return
+	}
 
 	// Return authorization URL to client
 	w.Header().Set("Content-Type", "application/json")
@@ -152,7 +173,7 @@ func (s *Service) OAuthCallbackHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Get token endpoint from issuer
-	tokenEndpoint, err := s.getTokenEndpoint(iss)
+	tokenEndpoint, err := getTokenEndpoint(iss)
 	if err != nil {
 		log.Error().Err(err).Str("iss", iss).Msg("Failed to get token endpoint")
 		http.Error(w, "Failed to get token endpoint", http.StatusInternalServerError)
@@ -236,13 +257,32 @@ func (s *Service) LogoutHandler(w http.ResponseWriter, r *http.Request) {
 
 // Helper methods
 
-func (s *Service) resolveOAuthEndpoints(handle string) (pdsURL, authEndpoint string, err error) {
+// authServerMetadata is the subset of an AT Protocol authorization server's
+// /.well-known/oauth-authorization-server document this service acts on.
+// Unlike the pre-atchess-1c9.12 getAuthorizationEndpoint (which decoded and
+// kept only AuthorizationEndpoint, silently discarding everything else),
+// this keeps the PAR-related fields too so resolveOAuthEndpoints' caller
+// can decide whether to use Pushed Authorization Requests.
+type authServerMetadata struct {
+	AuthorizationEndpoint              string `json:"authorization_endpoint"`
+	TokenEndpoint                      string `json:"token_endpoint"`
+	PushedAuthorizationRequestEndpoint string `json:"pushed_authorization_request_endpoint"`
+	RequirePushedAuthorizationRequests bool   `json:"require_pushed_authorization_requests"`
+}
+
+// resolveOAuthEndpoints resolves handle all the way through to the target
+// authorization server's metadata: handle -> DID -> PDS -> resource-server
+// metadata -> authorization-server metadata. authServerURL is returned
+// alongside metadata so callers that need to authenticate directly to the
+// authorization server (e.g. a Pushed Authorization Request's client
+// assertion "aud") don't have to re-derive it.
+func (s *Service) resolveOAuthEndpoints(handle string) (pdsURL, authServerURL string, metadata *authServerMetadata, err error) {
 	// First resolve handle to DID
 	// Called before any session exists (this is how login is initiated), so
 	// it legitimately uses the server's own client rather than clientFor(r).
 	did, err := s.serverClient.ResolveHandle(context.Background(), handle)
 	if err != nil {
-		return "", "", fmt.Errorf("failed to resolve handle: %w", err)
+		return "", "", nil, fmt.Errorf("failed to resolve handle: %w", err)
 	}
 
 	// Get DID document and extract its PDS URL. Delegates to
@@ -251,22 +291,21 @@ func (s *Service) resolveOAuthEndpoints(handle string) (pdsURL, authEndpoint str
 	// resolution logic here -- see atchess-1c9.10.
 	pdsURL, err = atproto.ResolvePDS(context.Background(), did, s.config.ATProto.PLCDirectoryURL)
 	if err != nil {
-		return "", "", fmt.Errorf("failed to resolve PDS for %s: %w", did, err)
+		return "", "", nil, fmt.Errorf("failed to resolve PDS for %s: %w", did, err)
 	}
 
 	// Get OAuth authorization server metadata
-	authServerURL, err := s.getAuthorizationServer(pdsURL)
+	authServerURL, err = s.getAuthorizationServer(pdsURL)
 	if err != nil {
-		return "", "", fmt.Errorf("failed to get authorization server: %w", err)
+		return "", "", nil, fmt.Errorf("failed to get authorization server: %w", err)
 	}
 
-	// Get authorization endpoint from metadata
-	authEndpoint, err = s.getAuthorizationEndpoint(authServerURL)
+	metadata, err = getAuthServerMetadata(authServerURL)
 	if err != nil {
-		return "", "", fmt.Errorf("failed to get authorization endpoint: %w", err)
+		return "", "", nil, fmt.Errorf("failed to get authorization server metadata: %w", err)
 	}
 
-	return pdsURL, authEndpoint, nil
+	return pdsURL, authServerURL, metadata, nil
 }
 
 func (s *Service) getAuthorizationServer(pdsURL string) (string, error) {
@@ -292,45 +331,50 @@ func (s *Service) getAuthorizationServer(pdsURL string) (string, error) {
 	return metadata.AuthorizationServers[0], nil
 }
 
-func (s *Service) getAuthorizationEndpoint(authServerURL string) (string, error) {
-	// Get authorization server metadata
+// getAuthServerMetadata fetches and decodes an authorization server's
+// /.well-known/oauth-authorization-server document. authServerURL must
+// already be a bare origin (scheme://host[:port]), with no path -- both of
+// this function's callers (resolveOAuthEndpoints and getTokenEndpoint)
+// ensure that.
+func getAuthServerMetadata(authServerURL string) (*authServerMetadata, error) {
 	resp, err := http.Get(authServerURL + "/.well-known/oauth-authorization-server")
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	defer resp.Body.Close()
 
-	var metadata struct {
-		AuthorizationEndpoint string `json:"authorization_endpoint"`
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("oauth-authorization-server metadata: HTTP %d", resp.StatusCode)
 	}
 
+	var metadata authServerMetadata
 	if err := json.NewDecoder(resp.Body).Decode(&metadata); err != nil {
-		return "", err
+		return nil, err
 	}
 
-	return metadata.AuthorizationEndpoint, nil
+	return &metadata, nil
 }
 
-func (s *Service) getTokenEndpoint(issuer string) (string, error) {
-	// Parse issuer URL
+// getTokenEndpoint resolves issuer's token_endpoint from its authorization
+// server metadata. issuer is the OAuth "iss" value from the callback (or,
+// for a subsequent refresh, an OAuth session's recorded PDSURL -- see
+// refreshOAuthSession in session_auth.go, which is the other caller of
+// this function) -- normalized down to its bare origin, matching how the
+// AT Protocol OAuth profile locates .well-known/oauth-authorization-server
+// (irrespective of any path component on issuer itself). Deliberately a
+// free function, not a *Service method (despite living next to Service's
+// OAuth handlers): it needs no Service state, and refreshOAuthSession has
+// none available (session_auth.go's refreshFunc closures are built from a
+// bare *oauth.Session, not a request/Service).
+func getTokenEndpoint(issuer string) (string, error) {
 	u, err := url.Parse(issuer)
 	if err != nil {
 		return "", err
 	}
+	origin := fmt.Sprintf("%s://%s", u.Scheme, u.Host)
 
-	// Get authorization server metadata
-	metadataURL := fmt.Sprintf("%s://%s/.well-known/oauth-authorization-server", u.Scheme, u.Host)
-	resp, err := http.Get(metadataURL)
+	metadata, err := getAuthServerMetadata(origin)
 	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-
-	var metadata struct {
-		TokenEndpoint string `json:"token_endpoint"`
-	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&metadata); err != nil {
 		return "", err
 	}
 

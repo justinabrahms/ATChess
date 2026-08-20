@@ -178,7 +178,7 @@ func (s *Service) clientFor(r *http.Request) (*atproto.Client, error) {
 	}
 
 	useDPoP := session.DPoPKey != nil
-	client, err := atproto.NewClientFromSession(pdsURL, session.DID, session.Handle, useDPoP, newSessionAuthenticator(session))
+	client, err := atproto.NewClientFromSession(pdsURL, session.DID, session.Handle, useDPoP, session.DPoPKey, newSessionAuthenticator(session))
 	if err != nil {
 		return nil, fmt.Errorf("failed to build authenticated client for %s: %w", session.DID, err)
 	}

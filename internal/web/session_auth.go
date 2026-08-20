@@ -21,9 +21,11 @@ const defaultSessionTokenTTL = 50 * time.Minute
 // authenticated caller (atchess-1c9.9) instead of the protocol-service
 // instance's static configured identity.
 //
-// OAuth (DPoP-bound) sessions are not refreshable here yet -- signing a
-// DPoP-bound refresh request is atchess-1c9.12's job -- so refreshFunc fails
-// closed for them rather than silently reusing a stale token.
+// OAuth (DPoP-bound) sessions are refreshed via oauthClient.RefreshTokens
+// (atchess-1c9.12), which performs the refresh_token grant DPoP-bound to
+// session.DPoPKey -- the same key used at login, since DPoP binds a token
+// to its original proof key for the token's whole lifetime, not just its
+// initial issuance.
 type sessionAuthenticator struct {
 	session *oauth.Session
 }
@@ -48,11 +50,7 @@ func (a *sessionAuthenticator) refreshFunc() oauth.RefreshFunc {
 	session := a.session
 	return func(refreshToken string) (string, string, time.Time, error) {
 		if session.DPoPKey != nil {
-			// OAuth sessions are DPoP-bound; refreshing them requires
-			// signing a DPoP-bound token request, which is
-			// atchess-1c9.12's job. Fail closed rather than silently
-			// reusing a stale/expired token.
-			return "", "", time.Time{}, fmt.Errorf("OAuth session token refresh is not yet implemented (see atchess-1c9.12)")
+			return refreshOAuthSession(session, refreshToken)
 		}
 		if refreshToken == "" {
 			return "", "", time.Time{}, fmt.Errorf("session has no refresh token available")
@@ -72,4 +70,41 @@ func (a *sessionAuthenticator) refreshFunc() oauth.RefreshFunc {
 		}
 		return accessJWT, refreshJWT, expiresAt, nil
 	}
+}
+
+// refreshOAuthSession performs the OAuth refresh_token grant for a
+// DPoP-bound (session.DPoPKey != nil) session, via the global oauthClient
+// (initialized by InitializeOAuth). session.PDSURL holds the OAuth issuer
+// recorded at login time (see OAuthCallbackHandler) -- under the AT
+// Protocol "transition:generic" profile this is also the authorization
+// server, so it doubles as both the token endpoint's discovery origin and
+// the client assertion's "aud". Fails closed (rather than looping or
+// silently reusing a stale token) when any of the OAuth client, the
+// session's issuer, or its refresh token is unavailable.
+func refreshOAuthSession(session *oauth.Session, refreshToken string) (string, string, time.Time, error) {
+	if oauthClient == nil {
+		return "", "", time.Time{}, fmt.Errorf("OAuth client not initialized, cannot refresh OAuth session")
+	}
+	if refreshToken == "" {
+		return "", "", time.Time{}, fmt.Errorf("OAuth session has no refresh token available")
+	}
+	if session.PDSURL == "" {
+		return "", "", time.Time{}, fmt.Errorf("OAuth session has no recorded authorization-server issuer, cannot refresh")
+	}
+
+	tokenEndpoint, err := getTokenEndpoint(session.PDSURL)
+	if err != nil {
+		return "", "", time.Time{}, fmt.Errorf("resolving token endpoint for OAuth refresh: %w", err)
+	}
+
+	tokens, err := oauthClient.RefreshTokens(tokenEndpoint, session.PDSURL, refreshToken, session.DPoPKey)
+	if err != nil {
+		return "", "", time.Time{}, fmt.Errorf("OAuth token refresh failed: %w", err)
+	}
+
+	expiresAt, ok := atproto.ParseJWTExpiry(tokens.AccessToken)
+	if !ok {
+		expiresAt = time.Now().Add(time.Duration(tokens.ExpiresIn) * time.Second)
+	}
+	return tokens.AccessToken, tokens.RefreshToken, expiresAt, nil
 }

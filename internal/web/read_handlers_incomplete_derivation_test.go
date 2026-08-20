@@ -35,7 +35,7 @@ func newTestServerClient(t *testing.T, srv *httptest.Server, did string) *atprot
 		ExpiresAt:            time.Now().Add(time.Hour),
 		AccessTokenExpiresAt: time.Now().Add(time.Hour),
 	}
-	client, err := atproto.NewClientFromSession(srv.URL, did, "server.test", false, newSessionAuthenticator(session))
+	client, err := atproto.NewClientFromSession(srv.URL, did, "server.test", false, nil, newSessionAuthenticator(session))
 	if err != nil {
 		t.Fatalf("failed to build test server client: %v", err)
 	}

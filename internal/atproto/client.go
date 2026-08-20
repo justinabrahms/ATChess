@@ -3,6 +3,7 @@ package atproto
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
 	"crypto/sha256"
 	"encoding/base32"
 	"encoding/base64"
@@ -20,6 +21,7 @@ import (
 
 	"github.com/justinabrahms/atchess/internal/auth"
 	"github.com/justinabrahms/atchess/internal/chess"
+	"github.com/justinabrahms/atchess/internal/dpop"
 )
 
 // ErrIncompleteDerivation indicates that a game's derived status (see
@@ -61,6 +63,18 @@ type Client struct {
 	// uses the static accessJWT captured at login (NewClient/
 	// NewClientWithDPoP), matching this package's original behaviour.
 	auth Authenticator
+
+	// dpopKey, if set, is the DPoP private key an OAuth-bound session
+	// (session.DPoPKey) is bound to -- see NewClientFromSession. When set,
+	// doRequest signs a real DPoP proof (RFC 9449) and attaches it as the
+	// "DPoP" request header for every request, and makeRequest performs
+	// the resource-server nonce-challenge retry (RFC 9449 s9: HTTP 401 +
+	// a DPoP-Nonce response header). This is deliberately separate from
+	// dpopManager/useDPoP above, which is an older, unrelated DPoP
+	// mechanism for direct handle+password logins (NewClientWithDPoP) that
+	// generates and rotates its own key rather than using one bound to an
+	// OAuth session.
+	dpopKey *ecdsa.PrivateKey
 }
 
 // Authenticator supplies the bearer token used to authenticate a Client's
@@ -205,11 +219,17 @@ func (c *Client) GetRefreshJWT() string {
 // act as the caller (AuthenticatedDID) instead of the protocol-service
 // instance's own static configured identity (atchess-1c9.9). useDPoP
 // controls whether the Authorization header is "DPoP <token>" or
-// "Bearer <token>"; today only Bearer (app-password) sessions are wired
-// end-to-end -- DPoP-bound OAuth sessions are atchess-1c9.12's job.
-func NewClientFromSession(pdsURL, did, handle string, useDPoP bool, auth Authenticator) (*Client, error) {
+// "Bearer <token>". dpopKey is the session's DPoP-bound proof key
+// (oauth.Session.DPoPKey) when useDPoP is true for an OAuth session; it
+// must be non-nil in that case, since a "DPoP <token>" Authorization
+// header with no accompanying signed "DPoP" proof header is not a valid
+// DPoP request at all (RFC 9449 s4) -- pass nil only when useDPoP is false.
+func NewClientFromSession(pdsURL, did, handle string, useDPoP bool, dpopKey *ecdsa.PrivateKey, auth Authenticator) (*Client, error) {
 	if auth == nil {
 		return nil, fmt.Errorf("NewClientFromSession: an Authenticator is required")
+	}
+	if useDPoP && dpopKey == nil {
+		return nil, fmt.Errorf("NewClientFromSession: useDPoP is true but no DPoP key was provided")
 	}
 	accessJWT, err := auth.Token()
 	if err != nil {
@@ -222,6 +242,7 @@ func NewClientFromSession(pdsURL, did, handle string, useDPoP bool, auth Authent
 		handle:     handle,
 		httpClient: &http.Client{Timeout: 30 * time.Second},
 		useDPoP:    useDPoP,
+		dpopKey:    dpopKey,
 		auth:       auth,
 	}, nil
 }
@@ -283,29 +304,74 @@ func ParseJWTExpiry(token string) (time.Time, bool) {
 }
 
 // makeRequest creates and executes an HTTP request with proper
-// authentication, transparently refreshing and retrying once on a 401 when
-// the client was built via NewClientFromSession (c.auth != nil).
+// authentication, transparently retrying once on a 401.
+//
+// A 401 can mean two different things for a DPoP-bound (c.dpopKey != nil)
+// client, and they get two different responses (atchess-1c9.12 step 3):
+//
+//   - A DPoP nonce challenge (RFC 9449 s9): the resource server includes a
+//     DPoP-Nonce response header. The access token itself may be perfectly
+//     valid -- the server just wants a proof signed with a nonce it
+//     issued. This is retried EXACTLY ONCE with a freshly-signed proof
+//     carrying that nonce (doRequest picks it back up from the shared
+//     nonce store -- see below), WITHOUT calling c.auth.ForceRefresh: that
+//     would refresh a token that was never the problem. A 401 with no
+//     DPoP-Nonce header is NOT treated as a nonce challenge -- there would
+//     be nothing to retry with -- and falls through to the branch below
+//     instead (atchess-1c9.12 edge case: "do not loop").
+//   - Anything else (including a genuinely expired/invalid token, or a
+//     non-DPoP session) falls through to the pre-existing behaviour: if
+//     the client was built via NewClientFromSession (c.auth != nil), force
+//     a refresh and retry once.
+//
+// These two retry paths are mutually exclusive per call: at most one extra
+// request is ever made, regardless of session type.
 func (c *Client) makeRequest(method, url string, body []byte) (*http.Response, error) {
 	resp, err := c.doRequest(method, url, body)
 	if err != nil {
 		return nil, err
 	}
 
-	if resp.StatusCode == http.StatusUnauthorized && c.auth != nil {
-		resp.Body.Close()
-		if _, rerr := c.auth.ForceRefresh(); rerr != nil {
-			return nil, fmt.Errorf("request unauthorized (401) and token refresh failed: %w", rerr)
+	if resp.StatusCode == http.StatusUnauthorized {
+		if c.dpopKey != nil {
+			if nonce := resp.Header.Get("DPoP-Nonce"); nonce != "" {
+				resp.Body.Close()
+				// doRequest re-reads the freshly-updated nonce store
+				// itself (see below) -- no need to thread nonce through
+				// here.
+				resp, err = c.doRequest(method, url, body)
+				if err != nil {
+					return nil, err
+				}
+				return resp, nil
+			}
 		}
-		resp, err = c.doRequest(method, url, body)
-		if err != nil {
-			return nil, err
+
+		if c.auth != nil {
+			resp.Body.Close()
+			if _, rerr := c.auth.ForceRefresh(); rerr != nil {
+				return nil, fmt.Errorf("request unauthorized (401) and token refresh failed: %w", rerr)
+			}
+			resp, err = c.doRequest(method, url, body)
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
 
 	return resp, nil
 }
 
-// doRequest performs a single attempt of an authenticated HTTP request.
+// doRequest performs a single attempt of an authenticated HTTP request. For
+// a DPoP-bound client (c.dpopKey != nil), it also signs and attaches a
+// fresh DPoP proof (RFC 9449) on every attempt, using whatever nonce the
+// shared process-wide nonce store (dpop.DefaultNonceStore, keyed by url's
+// origin) currently holds for this server -- so a server whose nonce is
+// already known gets it on the first try (atchess-1c9.12 step 4: "so the
+// common path is one request not two"), and any response carrying a
+// DPoP-Nonce header (success or failure, satisfying atchess-1c9.12's
+// nonce-rotation edge case) immediately updates the store for the next
+// request, from any Client instance, to pick up.
 func (c *Client) doRequest(method, url string, body []byte) (*http.Response, error) {
 	req, err := http.NewRequest(method, url, bytes.NewBuffer(body))
 	if err != nil {
@@ -330,7 +396,28 @@ func (c *Client) doRequest(method, url string, body []byte) (*http.Response, err
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
 
-	return c.httpClient.Do(req)
+	if c.dpopKey != nil {
+		origin := dpop.OriginOf(url)
+		nonce := dpop.DefaultNonceStore().Get(origin)
+		// htu (RFC 9449 s4.2) must not include the query string; strip it.
+		htu := url
+		if idx := strings.IndexByte(url, '?'); idx >= 0 {
+			htu = url[:idx]
+		}
+		proof, perr := dpop.CreateProof(c.dpopKey, method, htu, token, nonce)
+		if perr != nil {
+			return nil, fmt.Errorf("failed to create DPoP proof: %w", perr)
+		}
+		req.Header.Set("DPoP", proof)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err == nil && resp != nil && c.dpopKey != nil {
+		if nonce := resp.Header.Get("DPoP-Nonce"); nonce != "" {
+			dpop.DefaultNonceStore().Set(dpop.OriginOf(url), nonce)
+		}
+	}
+	return resp, err
 }
 
 // CreateGameFromChallenge creates a game record using a specific rkey and challenge reference

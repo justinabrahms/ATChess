@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+
+	"github.com/justinabrahms/atchess/internal/dpop"
 )
 
 type OAuthClient struct {
@@ -23,6 +25,13 @@ type OAuthClient struct {
 	privateKey   *ecdsa.PrivateKey
 	publicKeyJWK map[string]interface{}
 	httpClient   *http.Client
+
+	// nonceStore caches DPoP nonces per authorization-server origin. It is
+	// the same process-wide store internal/atproto uses for resource-
+	// server (PDS) requests on OAuth-bound sessions -- see
+	// dpop.DefaultNonceStore's doc comment for why a single shared store
+	// is required rather than one per client instance.
+	nonceStore *dpop.NonceStore
 }
 
 // NewOAuthClient creates a new OAuth client for AT Protocol
@@ -44,12 +53,24 @@ func NewOAuthClient(clientID, redirectURI string) (*OAuthClient, error) {
 		httpClient: &http.Client{
 			Timeout: 30 * time.Second,
 		},
+		nonceStore: dpop.DefaultNonceStore(),
 	}, nil
 }
 
 // GetPublicKeyJWK returns the public key in JWK format
 func (c *OAuthClient) GetPublicKeyJWK() map[string]interface{} {
 	return c.publicKeyJWK
+}
+
+// nonces returns c.nonceStore, falling back to the process-wide default
+// store when c.nonceStore is nil (e.g. an *OAuthClient built as a struct
+// literal, as the conformance tests in this package do, rather than via
+// NewOAuthClient). Never returns nil.
+func (c *OAuthClient) nonces() *dpop.NonceStore {
+	if c.nonceStore == nil {
+		return dpop.DefaultNonceStore()
+	}
+	return c.nonceStore
 }
 
 // GeneratePKCE creates a PKCE challenge pair
@@ -112,18 +133,14 @@ func (c *OAuthClient) CreateClientAssertion(issuer string) (string, error) {
 	return signedToken, nil
 }
 
-// ExchangeCodeForTokens exchanges an authorization code for tokens
+// ExchangeCodeForTokens exchanges an authorization code for tokens.
 func (c *OAuthClient) ExchangeCodeForTokens(tokenEndpoint, issuer, code, codeVerifier string, dpopKey *ecdsa.PrivateKey) (*TokenResponse, error) {
-	// Create client assertion
 	clientAssertion, err := c.CreateClientAssertion(issuer)
 	if err != nil {
 		return nil, err
 	}
 
-	// Try up to 2 times (initial + 1 retry with nonce)
-	var nonce string
-	for attempt := 0; attempt < 2; attempt++ {
-		// Prepare request
+	resp, body, err := c.postFormWithDPoPRetry(tokenEndpoint, dpopKey, "", func() url.Values {
 		data := url.Values{}
 		data.Set("grant_type", "authorization_code")
 		data.Set("code", code)
@@ -132,61 +149,259 @@ func (c *OAuthClient) ExchangeCodeForTokens(tokenEndpoint, issuer, code, codeVer
 		data.Set("client_id", c.clientID)
 		data.Set("client_assertion_type", "urn:ietf:params:oauth:client-assertion-type:jwt-bearer")
 		data.Set("client_assertion", clientAssertion)
+		return data
+	})
+	if err != nil {
+		return nil, fmt.Errorf("token exchange failed: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("token exchange failed: HTTP %d - %s", resp.StatusCode, string(body))
+	}
 
-		req, err := http.NewRequest("POST", tokenEndpoint, strings.NewReader(data.Encode()))
-		if err != nil {
-			return nil, err
+	var tokenResp TokenResponse
+	if err := json.Unmarshal(body, &tokenResp); err != nil {
+		return nil, err
+	}
+	return &tokenResp, nil
+}
+
+// PushAuthorizationRequest performs an RFC 9126 Pushed Authorization
+// Request: it POSTs the full set of authorization parameters (client_id,
+// redirect_uri, response_type, scope, state, code_challenge,
+// code_challenge_method, and login_hint when handle is non-empty), signed
+// with a client assertion the same way the token endpoint is authenticated,
+// to parEndpoint, and returns the request_uri the server hands back for use
+// in the subsequent /authorize redirect (see
+// BuildAuthorizationURLFromRequestURI). issuer is used as the "aud" of the
+// client assertion, matching ExchangeCodeForTokens' convention -- for PAR
+// this is the authorization server URL resolved via the resource/
+// authorization-server metadata chain (there is no OAuth "iss" callback
+// parameter yet at this point in the flow, since no redirect has happened).
+//
+// dpopKey, when non-nil, DPoP-binds the PAR request (and, from here
+// onward, every token this authorization eventually yields) the same way
+// ExchangeCodeForTokens does, including the same nonce-retry behaviour.
+func (c *OAuthClient) PushAuthorizationRequest(parEndpoint, issuer, handle, state, codeChallenge string, dpopKey *ecdsa.PrivateKey) (requestURI string, err error) {
+	clientAssertion, err := c.CreateClientAssertion(issuer)
+	if err != nil {
+		return "", err
+	}
+
+	resp, body, err := c.postFormWithDPoPRetry(parEndpoint, dpopKey, "", func() url.Values {
+		data := url.Values{}
+		data.Set("response_type", "code")
+		data.Set("client_id", c.clientID)
+		data.Set("redirect_uri", c.redirectURI)
+		data.Set("state", state)
+		data.Set("scope", "atproto transition:generic")
+		data.Set("code_challenge", codeChallenge)
+		data.Set("code_challenge_method", "S256")
+		if handle != "" {
+			data.Set("login_hint", handle)
 		}
+		data.Set("client_assertion_type", "urn:ietf:params:oauth:client-assertion-type:jwt-bearer")
+		data.Set("client_assertion", clientAssertion)
+		return data
+	})
+	if err != nil {
+		return "", fmt.Errorf("pushed authorization request failed: %w", err)
+	}
+	// RFC 9126 s2.2: a successful PAR response is 201 Created. Some
+	// deployments have been observed returning 200; accept both, reject
+	// everything else.
+	if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("pushed authorization request failed: HTTP %d - %s", resp.StatusCode, string(body))
+	}
 
+	var parResp struct {
+		RequestURI string `json:"request_uri"`
+		ExpiresIn  int    `json:"expires_in"`
+	}
+	if err := json.Unmarshal(body, &parResp); err != nil {
+		return "", fmt.Errorf("decoding PAR response: %w", err)
+	}
+	if parResp.RequestURI == "" {
+		return "", fmt.Errorf("PAR response did not include a request_uri: %s", string(body))
+	}
+	return parResp.RequestURI, nil
+}
+
+// BuildAuthorizationURLFromRequestURI builds the /authorize redirect target
+// for a request_uri obtained via PushAuthorizationRequest. Per RFC 9126
+// s4, only client_id and request_uri belong on this URL -- every other
+// authorization parameter was already delivered (and is now referenced
+// opaquely) via the PAR call, and must NOT be duplicated here.
+func (c *OAuthClient) BuildAuthorizationURLFromRequestURI(authEndpoint, requestURI string) string {
+	params := url.Values{}
+	params.Set("client_id", c.clientID)
+	params.Set("request_uri", requestURI)
+	return authEndpoint + "?" + params.Encode()
+}
+
+// BuildAuthorizationURLAuto selects between a Pushed Authorization Request
+// (RFC 9126) and the plain query-parameter authorization URL, based purely
+// on whether parEndpoint is non-empty -- the caller is expected to pass an
+// authorization server's advertised pushed_authorization_request_endpoint
+// (empty string if it did not advertise one, atchess-1c9.12's explicit
+// "use PAR only when the server advertises a PAR endpoint" rule). issuer
+// is used as the client assertion's "aud" for the PAR call; it is unused
+// when parEndpoint is empty.
+//
+// This is the single production entry point atchess-1c9.12's login handler
+// (internal/web's OAuthLoginHandler) uses, and is exercised directly (with
+// both a populated and an empty parEndpoint) by this package's own unit
+// tests -- see client_par_test.go -- rather than only indirectly through
+// internal/web, since a full web-layer test would additionally require
+// mocking the handle/DID/PDS resolution chain PAR selection itself does
+// not depend on.
+func (c *OAuthClient) BuildAuthorizationURLAuto(authEndpoint, parEndpoint, issuer, handle, state, codeChallenge string, dpopKey *ecdsa.PrivateKey) (string, error) {
+	if parEndpoint == "" {
+		return c.BuildAuthorizationURL(authEndpoint, handle, state, codeChallenge), nil
+	}
+	requestURI, err := c.PushAuthorizationRequest(parEndpoint, issuer, handle, state, codeChallenge, dpopKey)
+	if err != nil {
+		return "", err
+	}
+	return c.BuildAuthorizationURLFromRequestURI(authEndpoint, requestURI), nil
+}
+
+// RefreshTokens exchanges a refresh_token for a new access/refresh token
+// pair via the OAuth refresh_token grant, DPoP-bound with dpopKey. dpopKey
+// must be the SAME key that was used to obtain the tokens being refreshed
+// -- DPoP binds a refresh token to the proof key that first requested it
+// for the token's entire lifetime, not just its initial issuance -- so
+// callers must persist and reuse the original session's DPoP key rather
+// than generating a new one per refresh.
+func (c *OAuthClient) RefreshTokens(tokenEndpoint, issuer, refreshToken string, dpopKey *ecdsa.PrivateKey) (*TokenResponse, error) {
+	if refreshToken == "" {
+		return nil, fmt.Errorf("refresh token is empty")
+	}
+	clientAssertion, err := c.CreateClientAssertion(issuer)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, body, err := c.postFormWithDPoPRetry(tokenEndpoint, dpopKey, "", func() url.Values {
+		data := url.Values{}
+		data.Set("grant_type", "refresh_token")
+		data.Set("refresh_token", refreshToken)
+		data.Set("client_id", c.clientID)
+		data.Set("client_assertion_type", "urn:ietf:params:oauth:client-assertion-type:jwt-bearer")
+		data.Set("client_assertion", clientAssertion)
+		return data
+	})
+	if err != nil {
+		return nil, fmt.Errorf("refresh_token request failed: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("refresh_token request failed: HTTP %d - %s", resp.StatusCode, string(body))
+	}
+
+	var tokenResp TokenResponse
+	if err := json.Unmarshal(body, &tokenResp); err != nil {
+		return nil, err
+	}
+	return &tokenResp, nil
+}
+
+// postFormWithDPoPRetry POSTs an application/x-www-form-urlencoded body
+// (rebuilt via buildData on every attempt, so callers whose form includes a
+// nonce-independent value can keep it constant, though none of this
+// package's callers currently need per-attempt variation) to endpoint.
+//
+// When dpopKey is nil, the request carries no DPoP header at all -- the
+// server is assumed not to require it.
+//
+// When dpopKey is non-nil, every attempt is DPoP-signed. The shared
+// process-wide nonce store (see DefaultNonceStore) is consulted before the
+// FIRST attempt, so a server whose nonce this process already knows gets
+// it on the very first request rather than a guaranteed-to-fail one
+// (atchess-1c9.12 step 4 -- "so the common path is one request not two").
+// Every response, success or failure, that carries a DPoP-Nonce header
+// updates the store for endpoint's origin -- including on the first,
+// nonce-less attempt -- which is what keeps a nonce that rotates on every
+// response (atchess-1c9.12's first edge case) from ever going stale in the
+// store for longer than one request.
+//
+// If the server responds with the AS-side nonce challenge shape (RFC 9449
+// s8.2: HTTP 400 + JSON body {"error":"use_dpop_nonce"}), this retries
+// EXACTLY ONCE with a freshly-signed proof carrying the nonce from that
+// response's DPoP-Nonce header. A 400 use_dpop_nonce response that (against
+// spec) carries no DPoP-Nonce header is NOT retried -- there is nothing to
+// retry with -- and is returned as an error immediately (atchess-1c9.12's
+// second edge case: "do not loop"). A second consecutive nonce challenge
+// (e.g. a nonce that rotated again between the retry being built and
+// received) is likewise not retried again; its (still fresh) nonce was
+// already captured into the store above for the NEXT call to pick up.
+//
+// accessToken, when non-empty, is included as the DPoP proof's "ath" claim
+// (RFC 9449 s4.3) -- relevant for resource-server requests carrying a
+// bearer/DPoP access token; none of this package's own callers (PAR, token
+// exchange, refresh) have an access token yet, so they all pass "".
+func (c *OAuthClient) postFormWithDPoPRetry(endpoint string, dpopKey *ecdsa.PrivateKey, accessToken string, buildData func() url.Values) (*http.Response, []byte, error) {
+	origin := dpop.OriginOf(endpoint)
+	var nonce string
+	if dpopKey != nil {
+		nonce = c.nonces().Get(origin)
+	}
+
+	var lastResp *http.Response
+	var lastBody []byte
+
+	for attempt := 0; attempt < 2; attempt++ {
+		data := buildData()
+		req, err := http.NewRequest("POST", endpoint, strings.NewReader(data.Encode()))
+		if err != nil {
+			return nil, nil, err
+		}
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-		// Add DPoP header if key provided
 		if dpopKey != nil {
-			dpopToken, err := createDPoPToken(dpopKey, "POST", tokenEndpoint, "", nonce)
-			if err != nil {
-				return nil, err
+			// Fresh iat on every attempt (including the retry) -- this is
+			// also this package's answer to the "clock skew" edge case:
+			// a proof is never reused past the moment it was signed, so
+			// the window between signing and the server evaluating "iat"
+			// is always as small as network latency allows, rather than
+			// being inflated by a prior failed attempt's round trip.
+			proof, perr := createDPoPToken(dpopKey, "POST", endpoint, accessToken, nonce)
+			if perr != nil {
+				return nil, nil, perr
 			}
-			req.Header.Set("DPoP", dpopToken)
+			req.Header.Set("DPoP", proof)
 		}
 
 		resp, err := c.httpClient.Do(req)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		defer resp.Body.Close()
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		lastResp, lastBody = resp, body
 
-		// Check for DPoP nonce requirement
-		if resp.StatusCode == http.StatusBadRequest {
-			body, _ := io.ReadAll(resp.Body)
+		if dpopKey != nil {
+			if newNonce := resp.Header.Get("DPoP-Nonce"); newNonce != "" {
+				c.nonces().Set(origin, newNonce)
+			}
+		}
+
+		if resp.StatusCode == http.StatusBadRequest && dpopKey != nil && attempt == 0 {
 			var errorResp struct {
-				Error            string `json:"error"`
-				ErrorDescription string `json:"error_description"`
+				Error string `json:"error"`
 			}
-			if err := json.Unmarshal(body, &errorResp); err == nil && errorResp.Error == "use_dpop_nonce" {
-				// Extract nonce from DPoP-Nonce header and retry
-				if newNonce := resp.Header.Get("DPoP-Nonce"); newNonce != "" && attempt == 0 {
-					nonce = newNonce
-					continue // Retry with nonce
+			if json.Unmarshal(body, &errorResp) == nil && errorResp.Error == "use_dpop_nonce" {
+				challengeNonce := resp.Header.Get("DPoP-Nonce")
+				if challengeNonce == "" {
+					return resp, body, fmt.Errorf("server requires a DPoP nonce (use_dpop_nonce) but did not supply one via the DPoP-Nonce header; refusing to retry without one")
 				}
+				nonce = challengeNonce
+				continue
 			}
-			return nil, fmt.Errorf("token exchange failed: HTTP %d - %s", resp.StatusCode, string(body))
 		}
 
-		if resp.StatusCode != http.StatusOK {
-			// Read error response
-			body, _ := io.ReadAll(resp.Body)
-			return nil, fmt.Errorf("token exchange failed: HTTP %d - %s", resp.StatusCode, string(body))
-		}
-
-		var tokenResp TokenResponse
-		if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
-			return nil, err
-		}
-
-		return &tokenResp, nil
+		return resp, body, nil
 	}
 
-	return nil, fmt.Errorf("token exchange failed after retries")
+	return lastResp, lastBody, nil
 }
 
 // TokenResponse represents the OAuth token response
@@ -215,41 +430,26 @@ func generateJTI() string {
 	return base64.RawURLEncoding.EncodeToString(b)
 }
 
+// CreateDPoPProof creates a DPoP proof JWT (RFC 9449) for a request with
+// the given HTTP method and URI (which must NOT include a query string --
+// per RFC 9449 s4.2 the "htu" claim is compared without one), optionally
+// binding it to accessToken (via the "ath" claim, for resource-server
+// requests carrying a DPoP-bound access token) and/or a server-supplied
+// nonce. A thin exported wrapper around internal/dpop.CreateProof, which is
+// where this package's own PAR/token/refresh DPoP signing (createDPoPToken
+// below) also delegates to -- see internal/dpop's package doc comment for
+// why the actual implementation lives there rather than here.
+func CreateDPoPProof(privateKey *ecdsa.PrivateKey, method, uri, accessToken, nonce string) (string, error) {
+	return dpop.CreateProof(privateKey, method, uri, accessToken, nonce)
+}
+
+// createDPoPToken is this package's original (pre-atchess-1c9.12) internal
+// name for CreateDPoPProof; kept as a thin alias -- rather than renaming
+// every call site -- because internal/oauth/conformance_test.go calls it
+// directly by this unexported name and must not be edited (it is this
+// bead's specification, not implementation detail).
 func createDPoPToken(privateKey *ecdsa.PrivateKey, method, uri, accessToken string, nonce string) (string, error) {
-	now := time.Now()
-
-	// Create DPoP JWT
-	claims := jwt.MapClaims{
-		"jti": generateJTI(),
-		"htm": method,
-		"htu": uri,
-		"iat": now.Unix(),
-		"exp": now.Add(5 * time.Minute).Unix(),
-	}
-
-	// Add nonce if provided (required by some servers)
-	if nonce != "" {
-		claims["nonce"] = nonce
-	}
-
-	// Add access token hash if provided
-	if accessToken != "" {
-		h := sha256.Sum256([]byte(accessToken))
-		claims["ath"] = base64.RawURLEncoding.EncodeToString(h[:])
-	}
-
-	token := jwt.NewWithClaims(jwt.SigningMethodES256, claims)
-
-	// Add JWK to header
-	token.Header["typ"] = "dpop+jwt"
-	token.Header["jwk"] = map[string]interface{}{
-		"kty": "EC",
-		"crv": "P-256",
-		"x":   base64.RawURLEncoding.EncodeToString(privateKey.PublicKey.X.Bytes()),
-		"y":   base64.RawURLEncoding.EncodeToString(privateKey.PublicKey.Y.Bytes()),
-	}
-
-	return token.SignedString(privateKey)
+	return dpop.CreateProof(privateKey, method, uri, accessToken, nonce)
 }
 
 // GenerateState creates a random state parameter
