@@ -7,6 +7,7 @@ import (
 	"encoding/base32"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -20,6 +21,23 @@ import (
 	"github.com/justinabrahms/atchess/internal/auth"
 	"github.com/justinabrahms/atchess/internal/chess"
 )
+
+// ErrIncompleteDerivation indicates that a game's derived status (see
+// GetGame's doc comment) could not be fully verified because at least one
+// player's repo could not be read during the terminal-event scan. This is
+// deliberately treated as a hard error rather than folded silently into
+// "no terminal event found" (which would derive as active): a truncated
+// scan has only proven it did not FIND a terminal event, which is a
+// different claim from proving one does not exist -- it cannot distinguish
+// "no resignation exists" from "could not look". Since the derived status
+// is a safety gate (MakeMoveHandler and friends use it to decide whether a
+// write is even allowed, not just to render a label), every caller must
+// treat this error as "unproven, do not authorize" and fail closed. A
+// caller that only needs a best-effort display value may still inspect the
+// partial *chess.Game returned alongside this error (see
+// Game.DerivationIncomplete), but no such caller exists yet -- see
+// atchess-1c9.51.
+var ErrIncompleteDerivation = errors.New("game status derivation incomplete: one or more repos could not be read")
 
 type Client struct {
 	pdsURL      string
@@ -847,6 +865,7 @@ func (c *Client) ListMovesForGame(ctx context.Context, gameURI string) ([]Stored
 // the latest move for the given game. This is the source of truth for game state.
 func (c *Client) getLatestMoveForGame(ctx context.Context, gameURI string, whiteDID, blackDID string) (*moveRecord, error) {
 	var latest *moveRecord
+	var errs []error
 
 	for _, playerDID := range []string{whiteDID, blackDID} {
 		if playerDID == "" {
@@ -854,16 +873,19 @@ func (c *Client) getLatestMoveForGame(ctx context.Context, gameURI string, white
 		}
 		base, ownRepo, err := c.resolveReadEndpoint(ctx, playerDID)
 		if err != nil {
+			errs = append(errs, fmt.Errorf("resolve read endpoint for %s: %w: %v", playerDID, ErrIncompleteDerivation, err))
 			continue
 		}
 		params := url.Values{"repo": {playerDID}, "collection": {"app.atchess.move"}, "limit": {"100"}}
 		resp, err := c.getXRPC(ctx, base, ownRepo, "com.atproto.repo.listRecords", params)
 		if err != nil {
+			errs = append(errs, fmt.Errorf("list moves for %s: %w: %v", playerDID, ErrIncompleteDerivation, err))
 			continue
 		}
 		defer resp.Body.Close()
 
 		if resp.StatusCode != http.StatusOK {
+			errs = append(errs, fmt.Errorf("list moves for %s: HTTP %d: %w", playerDID, resp.StatusCode, ErrIncompleteDerivation))
 			continue
 		}
 
@@ -883,6 +905,7 @@ func (c *Client) getLatestMoveForGame(ctx context.Context, gameURI string, white
 		}
 
 		if err := json.NewDecoder(resp.Body).Decode(&listResp); err != nil {
+			errs = append(errs, fmt.Errorf("decode moves list for %s: %w: %v", playerDID, ErrIncompleteDerivation, err))
 			continue
 		}
 
@@ -907,7 +930,7 @@ func (c *Client) getLatestMoveForGame(ctx context.Context, gameURI string, white
 		}
 	}
 
-	return latest, nil
+	return latest, errors.Join(errs...)
 }
 
 // terminalEvent is one candidate final outcome for a game, sourced from a
@@ -962,6 +985,7 @@ func latestTerminalEvent(events ...*terminalEvent) *terminalEvent {
 // never a same-record field (atchess-1c9.48 review).
 func (c *Client) getResignationOutcome(ctx context.Context, gameURI, whiteDID, blackDID string) (*terminalEvent, error) {
 	var latest *terminalEvent
+	var errs []error
 
 	for _, playerDID := range []string{whiteDID, blackDID} {
 		if playerDID == "" {
@@ -969,17 +993,20 @@ func (c *Client) getResignationOutcome(ctx context.Context, gameURI, whiteDID, b
 		}
 		base, ownRepo, err := c.resolveReadEndpoint(ctx, playerDID)
 		if err != nil {
+			errs = append(errs, fmt.Errorf("resolve read endpoint for %s: %w: %v", playerDID, ErrIncompleteDerivation, err))
 			continue
 		}
 		params := url.Values{"repo": {playerDID}, "collection": {"app.atchess.resignation"}, "limit": {"100"}}
 		resp, err := c.getXRPC(ctx, base, ownRepo, "com.atproto.repo.listRecords", params)
 		if err != nil {
+			errs = append(errs, fmt.Errorf("list resignations for %s: %w: %v", playerDID, ErrIncompleteDerivation, err))
 			continue
 		}
 
 		func() {
 			defer resp.Body.Close()
 			if resp.StatusCode != http.StatusOK {
+				errs = append(errs, fmt.Errorf("list resignations for %s: HTTP %d: %w", playerDID, resp.StatusCode, ErrIncompleteDerivation))
 				return
 			}
 
@@ -996,6 +1023,7 @@ func (c *Client) getResignationOutcome(ctx context.Context, gameURI, whiteDID, b
 				} `json:"records"`
 			}
 			if err := json.NewDecoder(resp.Body).Decode(&listResp); err != nil {
+				errs = append(errs, fmt.Errorf("decode resignations list for %s: %w: %v", playerDID, ErrIncompleteDerivation, err))
 				return
 			}
 
@@ -1026,7 +1054,7 @@ func (c *Client) getResignationOutcome(ctx context.Context, gameURI, whiteDID, b
 		}()
 	}
 
-	return latest, nil
+	return latest, errors.Join(errs...)
 }
 
 // getTimeViolationOutcome scans app.atchess.timeViolation records in BOTH
@@ -1061,6 +1089,7 @@ func (c *Client) getResignationOutcome(ctx context.Context, gameURI, whiteDID, b
 // authoritative merge (logged, not applied).
 func (c *Client) getTimeViolationOutcome(ctx context.Context, gameURI, whiteDID, blackDID string, timeControlType string, daysPerMove int, lastActivityAt time.Time, lastActivityKnown bool) (*terminalEvent, error) {
 	var latest *terminalEvent
+	var errs []error
 
 	for _, playerDID := range []string{whiteDID, blackDID} {
 		if playerDID == "" {
@@ -1068,17 +1097,20 @@ func (c *Client) getTimeViolationOutcome(ctx context.Context, gameURI, whiteDID,
 		}
 		base, ownRepo, err := c.resolveReadEndpoint(ctx, playerDID)
 		if err != nil {
+			errs = append(errs, fmt.Errorf("resolve read endpoint for %s: %w: %v", playerDID, ErrIncompleteDerivation, err))
 			continue
 		}
 		params := url.Values{"repo": {playerDID}, "collection": {"app.atchess.timeViolation"}, "limit": {"100"}}
 		resp, err := c.getXRPC(ctx, base, ownRepo, "com.atproto.repo.listRecords", params)
 		if err != nil {
+			errs = append(errs, fmt.Errorf("list timeViolations for %s: %w: %v", playerDID, ErrIncompleteDerivation, err))
 			continue
 		}
 
 		func() {
 			defer resp.Body.Close()
 			if resp.StatusCode != http.StatusOK {
+				errs = append(errs, fmt.Errorf("list timeViolations for %s: HTTP %d: %w", playerDID, resp.StatusCode, ErrIncompleteDerivation))
 				return
 			}
 
@@ -1096,6 +1128,7 @@ func (c *Client) getTimeViolationOutcome(ctx context.Context, gameURI, whiteDID,
 				} `json:"records"`
 			}
 			if err := json.NewDecoder(resp.Body).Decode(&listResp); err != nil {
+				errs = append(errs, fmt.Errorf("decode timeViolations list for %s: %w: %v", playerDID, ErrIncompleteDerivation, err))
 				return
 			}
 
@@ -1159,7 +1192,7 @@ func (c *Client) getTimeViolationOutcome(ctx context.Context, gameURI, whiteDID,
 		}()
 	}
 
-	return latest, nil
+	return latest, errors.Join(errs...)
 }
 
 // getDrawAcceptOutcome scans app.atchess.drawResponse records in BOTH
@@ -1183,6 +1216,7 @@ func (c *Client) getTimeViolationOutcome(ctx context.Context, gameURI, whiteDID,
 // on the hot per-move path.
 func (c *Client) getDrawAcceptOutcome(ctx context.Context, gameURI, whiteDID, blackDID string) (*terminalEvent, error) {
 	var latest *terminalEvent
+	var errs []error
 
 	for _, playerDID := range []string{whiteDID, blackDID} {
 		if playerDID == "" {
@@ -1190,17 +1224,20 @@ func (c *Client) getDrawAcceptOutcome(ctx context.Context, gameURI, whiteDID, bl
 		}
 		base, ownRepo, err := c.resolveReadEndpoint(ctx, playerDID)
 		if err != nil {
+			errs = append(errs, fmt.Errorf("resolve read endpoint for %s: %w: %v", playerDID, ErrIncompleteDerivation, err))
 			continue
 		}
 		params := url.Values{"repo": {playerDID}, "collection": {"app.atchess.drawResponse"}, "limit": {"100"}}
 		resp, err := c.getXRPC(ctx, base, ownRepo, "com.atproto.repo.listRecords", params)
 		if err != nil {
+			errs = append(errs, fmt.Errorf("list drawResponses for %s: %w: %v", playerDID, ErrIncompleteDerivation, err))
 			continue
 		}
 
 		func() {
 			defer resp.Body.Close()
 			if resp.StatusCode != http.StatusOK {
+				errs = append(errs, fmt.Errorf("list drawResponses for %s: HTTP %d: %w", playerDID, resp.StatusCode, ErrIncompleteDerivation))
 				return
 			}
 
@@ -1222,6 +1259,7 @@ func (c *Client) getDrawAcceptOutcome(ctx context.Context, gameURI, whiteDID, bl
 				} `json:"records"`
 			}
 			if err := json.NewDecoder(resp.Body).Decode(&listResp); err != nil {
+				errs = append(errs, fmt.Errorf("decode drawResponses list for %s: %w: %v", playerDID, ErrIncompleteDerivation, err))
 				return
 			}
 
@@ -1285,7 +1323,7 @@ func (c *Client) getDrawAcceptOutcome(ctx context.Context, gameURI, whiteDID, bl
 		}()
 	}
 
-	return latest, nil
+	return latest, errors.Join(errs...)
 }
 
 func (c *Client) GetGame(ctx context.Context, gameURI string) (*chess.Game, error) {
@@ -1390,6 +1428,7 @@ func (c *Client) GetGame(ctx context.Context, gameURI string) (*chess.Game, erro
 	var latestMove *moveRecord
 	var moveErr error
 	var resignationEvent, drawAcceptEvent *terminalEvent
+	var resignationErr, drawAcceptErr error
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -1399,12 +1438,12 @@ func (c *Client) GetGame(ctx context.Context, gameURI string) (*chess.Game, erro
 	}()
 	go func() {
 		defer wg.Done()
-		resignationEvent, _ = c.getResignationOutcome(ctx, gameURI, game.White, game.Black)
+		resignationEvent, resignationErr = c.getResignationOutcome(ctx, gameURI, game.White, game.Black)
 	}()
 	drawAcceptDone := make(chan struct{})
 	go func() {
 		defer close(drawAcceptDone)
-		drawAcceptEvent, _ = c.getDrawAcceptOutcome(ctx, gameURI, game.White, game.Black)
+		drawAcceptEvent, drawAcceptErr = c.getDrawAcceptOutcome(ctx, gameURI, game.White, game.Black)
 	}()
 	wg.Wait()
 
@@ -1442,12 +1481,24 @@ func (c *Client) GetGame(ctx context.Context, gameURI string) (*chess.Game, erro
 		timeControlType = timeControl.Type
 		daysPerMove = timeControl.DaysPerMove
 	}
-	timeViolationEvent, _ := c.getTimeViolationOutcome(ctx, gameURI, game.White, game.Black, timeControlType, daysPerMove, lastActivityAt, lastActivityKnown)
+	timeViolationEvent, timeViolationErr := c.getTimeViolationOutcome(ctx, gameURI, game.White, game.Black, timeControlType, daysPerMove, lastActivityAt, lastActivityKnown)
 
 	<-drawAcceptDone
 
 	if final := latestTerminalEvent(moveEvent, resignationEvent, timeViolationEvent, drawAcceptEvent); final != nil {
 		game.Status = final.status
+	}
+
+	// Fail closed (see ErrIncompleteDerivation's doc comment): if ANY of the
+	// four scans above could not read every repo, Status (and possibly FEN)
+	// is unproven, not just "possibly stale". The partial *chess.Game is
+	// still returned -- a caller that has deliberately opted into a
+	// degraded read-only view could use it -- but every caller in this
+	// codebase currently treats a non-nil error here as authoritative and
+	// must reject any write it was about to authorize (atchess-1c9.51).
+	if derivationErr := errors.Join(moveErr, resignationErr, timeViolationErr, drawAcceptErr); derivationErr != nil {
+		game.DerivationIncomplete = true
+		return game, fmt.Errorf("%w: %v", ErrIncompleteDerivation, derivationErr)
 	}
 
 	return game, nil
@@ -1603,11 +1654,17 @@ func (c *Client) resolveHandleSamePDS(ctx context.Context, handle string) (strin
 
 // currentGameStatus returns gameURI's authoritative, derived status (see
 // GetGame's doc comment) -- never the raw, possibly-stale-or-forged
-// "status" field cached on the app.atchess.game record itself. Best-effort:
-// on error it returns ("", err) and callers should treat that the same way
-// they always have when the cached field was simply absent -- i.e. not
-// block the action -- rather than hard-failing a write because a read
-// elsewhere is temporarily unavailable.
+// "status" field cached on the app.atchess.game record itself. On error it
+// returns ("", err); the error may wrap ErrIncompleteDerivation (one or
+// more repos could not be read while scanning for terminal events). Every
+// caller of this method uses the result to decide whether to AUTHORIZE a
+// write (resign, offer/accept a draw, claim a time violation), so callers
+// MUST fail closed on a non-nil error -- i.e. reject the write -- rather
+// than treating "could not verify" the same as "verified active". Treating
+// an unreadable repo as equivalent to an active game is exactly the bug
+// atchess-1c9.51 fixed: an opponent-PDS outage must not silently reopen a
+// game that has already ended. Do not restore the old "err == nil &&
+// status != active" fail-open pattern here.
 func (c *Client) currentGameStatus(ctx context.Context, gameURI string) (chess.GameStatus, error) {
 	g, err := c.GetGame(ctx, gameURI)
 	if err != nil {
@@ -1627,8 +1684,14 @@ func (c *Client) OfferDraw(ctx context.Context, gameID string, message string) (
 	// Verify the game is active. Uses the derived status (GetGame), not the
 	// raw cached gameValue["status"] field, so this is consistent with
 	// terminal events the game's own repo owner may not know about yet
-	// (atchess-1c9.48 review).
-	if status, err := c.currentGameStatus(ctx, gameID); err == nil && status != chess.StatusActive {
+	// (atchess-1c9.48 review). Fail closed if the status could not be
+	// verified at all (atchess-1c9.51) -- an unreadable repo must not be
+	// treated as "active".
+	status, err := c.currentGameStatus(ctx, gameID)
+	if err != nil {
+		return nil, fmt.Errorf("cannot verify game is still active: %w", err)
+	}
+	if status != chess.StatusActive {
 		return nil, fmt.Errorf("cannot offer draw in a game with status: %s", status)
 	}
 
@@ -1859,8 +1922,11 @@ func (c *Client) ResignGame(ctx context.Context, gameID string, reason string) e
 
 	// Verify the game is active. Uses the derived status (GetGame), not the
 	// raw cached gameValue["status"] field -- see OfferDraw's comment
-	// (atchess-1c9.48 review).
-	if status, err := c.currentGameStatus(ctx, gameID); err == nil && status != chess.StatusActive {
+	// (atchess-1c9.48 review). Fail closed if the status could not be
+	// verified at all (atchess-1c9.51).
+	if status, statusErr := c.currentGameStatus(ctx, gameID); statusErr != nil {
+		return fmt.Errorf("cannot verify game is still active: %w", statusErr)
+	} else if status != chess.StatusActive {
 		return fmt.Errorf("cannot resign from a game with status: %s", status)
 	}
 
@@ -2048,8 +2114,15 @@ func (c *Client) CheckTimeViolation(ctx context.Context, gameID string) (bool, *
 
 	// Check if game is still active. Uses the derived status (GetGame), not
 	// the raw cached gameValue["status"] field -- see OfferDraw's comment
-	// (atchess-1c9.48 review).
-	if status, err := c.currentGameStatus(ctx, gameID); err == nil && status != chess.StatusActive {
+	// (atchess-1c9.48 review). Fail closed if the status could not be
+	// verified at all (atchess-1c9.51): this result also gates
+	// ClaimTimeVictory's write, so "could not verify" must not be treated
+	// as "still active".
+	status, statusErr := c.currentGameStatus(ctx, gameID)
+	if statusErr != nil {
+		return false, nil, fmt.Errorf("cannot verify game is still active: %w", statusErr)
+	}
+	if status != chess.StatusActive {
 		return false, nil, nil // Game is not active, no time violation possible
 	}
 

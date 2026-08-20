@@ -45,6 +45,13 @@ type mockFederatedPDS struct {
 	base    string
 
 	writeCalls []string // "createRecord repo=... collection=..." / "putRecord ..."
+
+	// unreachable maps a repo DID to a serviceEndpoint that nothing is
+	// listening on, so that DID's DID document resolves successfully but
+	// every subsequent XRPC call against it fails with a connection error --
+	// simulating an opponent-PDS outage (atchess-1c9.51) rather than the
+	// DID simply not existing. See setUnreachable.
+	unreachable map[string]string
 }
 
 func newMockFederatedPDS(t *testing.T, wantOwnRepoDID string) *mockFederatedPDS {
@@ -84,10 +91,16 @@ func (m *mockFederatedPDS) handle(w http.ResponseWriter, r *http.Request) {
 	// did:plc directory lookups: path is exactly "/did:plc:<x>".
 	if strings.HasPrefix(r.URL.Path, "/did:plc:") {
 		did := strings.TrimPrefix(r.URL.Path, "/")
+		endpoint := m.baseURL()
+		m.mu.Lock()
+		if u, ok := m.unreachable[did]; ok {
+			endpoint = u
+		}
+		m.mu.Unlock()
 		_ = json.NewEncoder(w).Encode(atproto.DIDDocument{
 			ID: did,
 			Service: []atproto.DIDService{
-				{ID: "#atproto_pds", Type: "AtprotoPersonalDataServer", ServiceEndpoint: m.baseURL()},
+				{ID: "#atproto_pds", Type: "AtprotoPersonalDataServer", ServiceEndpoint: endpoint},
 			},
 		})
 		return
@@ -186,6 +199,20 @@ func (m *mockFederatedPDS) handle(w http.ResponseWriter, r *http.Request) {
 // URL, which httptest only assigns once the listener is up).
 func (m *mockFederatedPDS) setBaseURL(u string) { m.mu.Lock(); m.base = u; m.mu.Unlock() }
 func (m *mockFederatedPDS) baseURL() string     { m.mu.Lock(); defer m.mu.Unlock(); return m.base }
+
+// setUnreachable makes did's DID document advertise endpoint (expected to
+// be an address nothing is listening on, e.g. an httptest server closed
+// immediately after creation) as its serviceEndpoint, instead of this
+// mock's own base URL -- simulating that DID's PDS being unreachable
+// (atchess-1c9.51), as distinct from the DID simply not resolving at all.
+func (m *mockFederatedPDS) setUnreachable(did, endpoint string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.unreachable == nil {
+		m.unreachable = map[string]string{}
+	}
+	m.unreachable[did] = endpoint
+}
 
 // TestMakeMoveHandler_NonOwnerMove_NoCrossRepoWriteAttempted is a
 // regression test for atchess-1c9.48: RecordMove must never attempt a
@@ -420,6 +447,83 @@ func TestMakeMoveHandler_TerminalGame_MoveRejected(t *testing.T) {
 
 	if w.Code != http.StatusConflict {
 		t.Fatalf("expected HTTP 409 (game already ended by black's resignation), got %d: %s", w.Code, w.Body.String())
+	}
+
+	mock.mu.Lock()
+	calls := append([]string(nil), mock.writeCalls...)
+	mock.mu.Unlock()
+	if len(calls) != 0 {
+		t.Errorf("expected no write calls at all (move must be rejected before RecordMove is ever reached), got %d: %v", len(calls), calls)
+	}
+}
+
+// TestMakeMoveHandler_IncompleteDerivation_MoveRejected is a regression
+// test for atchess-1c9.51: an opponent-PDS outage must not silently open
+// MakeMoveHandler's terminal-game gate. Here the game record is owned by
+// the MOVER's own repo (so the primary GetGame record fetch itself
+// succeeds without needing to resolve the opponent's PDS at all -- see
+// resolveReadEndpoint's c.did shortcut), but the opponent's repo -- which
+// the cross-repo terminal-event scan must also read -- is unreachable. The
+// move must be rejected with 503 (transient: distinct from the 409 "game
+// is over" case), and RecordMove must never be reached.
+func TestMakeMoveHandler_IncompleteDerivation_MoveRejected(t *testing.T) {
+	const moverDID = "did:plc:white"
+	const opponentDID = "did:plc:black"
+
+	mock := newMockFederatedPDS(t, moverDID)
+	srv := mock.server()
+	defer srv.Close()
+	mock.setBaseURL(srv.URL)
+
+	// opponentDID's PDS is unreachable: its DID document resolves fine, but
+	// the serviceEndpoint it advertises has nothing listening on it.
+	dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	dead.Close()
+	mock.setUnreachable(opponentDID, dead.URL)
+
+	const gameRkey = "game1"
+	mock.seed(moverDID, "app.atchess.game", gameRkey, map[string]interface{}{
+		"$type":     "app.atchess.game",
+		"createdAt": time.Now().Format(time.RFC3339),
+		"white":     moverDID,
+		"black":     opponentDID,
+		"status":    "active",
+		"fen":       "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+		"pgn":       "",
+	})
+	gameURI := fmt.Sprintf("at://%s/app.atchess.game/%s", moverDID, gameRkey)
+
+	svc := &Service{
+		config:         &config.Config{ATProto: config.ATProtoConfig{PLCDirectoryURL: srv.URL}},
+		challengeStore: challenge.NewStore(),
+	}
+
+	session := &oauth.Session{
+		DID:                  moverDID,
+		Handle:               "white.test",
+		PDSURL:               srv.URL,
+		AccessToken:          "test-jwt",
+		RefreshToken:         "test-refresh",
+		ExpiresAt:            time.Now().Add(time.Hour),
+		AccessTokenExpiresAt: time.Now().Add(time.Hour),
+	}
+
+	body, _ := json.Marshal(map[string]string{
+		"game_id": gameURI,
+		"from":    "e2",
+		"to":      "e4",
+	})
+	req := httptest.NewRequest("POST", "/api/moves", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	ctx := context.WithValue(req.Context(), contextKeySession, session)
+	ctx = context.WithValue(ctx, contextKeyDID, session.DID)
+	req = req.WithContext(ctx)
+
+	w := httptest.NewRecorder()
+	svc.MakeMoveHandler(w, req)
+
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected HTTP 503 (derivation incomplete: opponent PDS unreachable), got %d: %s", w.Code, w.Body.String())
 	}
 
 	mock.mu.Lock()

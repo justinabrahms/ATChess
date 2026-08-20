@@ -23,14 +23,28 @@ type MoveResult struct {
 }
 
 type Game struct {
-	ID          string      `json:"id"`
-	White       string      `json:"white"` // DID
-	Black       string      `json:"black"` // DID
-	Status      GameStatus  `json:"status"`
-	FEN         string      `json:"fen"`
-	PGN         string      `json:"pgn"`
+	ID          string       `json:"id"`
+	White       string       `json:"white"` // DID
+	Black       string       `json:"black"` // DID
+	Status      GameStatus   `json:"status"`
+	FEN         string       `json:"fen"`
+	PGN         string       `json:"pgn"`
 	TimeControl *TimeControl `json:"timeControl"`
-	CreatedAt   string      `json:"createdAt"`
+	CreatedAt   string       `json:"createdAt"`
+
+	// DerivationIncomplete is true when Status (and, transitively, FEN --
+	// see GetGame's doc comment) could not be fully verified because at
+	// least one player's repo could not be read while scanning for terminal
+	// events. Status in that case is UNPROVEN, not merely "possibly stale":
+	// a truncated scan cannot distinguish "this game is still active" from
+	// "a terminal event exists but this scan could not see it". It must
+	// never be used to authorize a write (e.g. allowing a move, resignation,
+	// draw response, or time-violation claim) -- callers making that
+	// decision must instead treat the accompanying error (which wraps
+	// atproto.ErrIncompleteDerivation) as a hard failure. It may only be
+	// used by a caller that has deliberately opted in to rendering a
+	// best-effort/degraded read view; no such caller exists yet (atchess-1c9.51).
+	DerivationIncomplete bool `json:"derivationIncomplete,omitempty"`
 }
 
 type TimeControl struct {

@@ -3,6 +3,7 @@ package atproto
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -30,6 +31,27 @@ type deriveTestPDS struct {
 
 	mu      sync.Mutex
 	records map[string]map[string]map[string]interface{} // repo -> collection -> rkey -> value
+
+	// didDocFail, when set for a repo DID, makes that DID's DID document
+	// lookup itself fail (HTTP 404), so resolveReadEndpoint's PLC
+	// resolution never even produces a serviceEndpoint -- distinct from
+	// unreachableEndpoint (endpoint resolves, but nothing answers there)
+	// and listFail (endpoint answers, but the specific listRecords call
+	// misbehaves). See setDIDDocFail/setUnreachable/setListFail.
+	didDocFail map[string]bool
+
+	// unreachableEndpoint, when set for a repo DID, makes that DID resolve
+	// successfully to the given serviceEndpoint, which has nothing
+	// listening on it -- simulating an opponent-PDS outage (atchess-1c9.51)
+	// distinct from DID resolution itself failing.
+	unreachableEndpoint map[string]string
+
+	// listFail, when set for a repo DID, makes every
+	// com.atproto.repo.listRecords call against that repo (regardless of
+	// collection) misbehave in the given way: "http500" returns a bare
+	// HTTP 500, "malformed" returns HTTP 200 with a body that is not valid
+	// JSON.
+	listFail map[string]string
 }
 
 func newDeriveTestPDS(t *testing.T) *deriveTestPDS {
@@ -69,7 +91,16 @@ func (m *deriveTestPDS) handle(w http.ResponseWriter, r *http.Request) {
 		did := strings.TrimPrefix(r.URL.Path, "/")
 		m.mu.Lock()
 		base := m.base
+		fail := m.didDocFail[did]
+		if u, ok := m.unreachableEndpoint[did]; ok {
+			base = u
+		}
 		m.mu.Unlock()
+		if fail {
+			w.WriteHeader(http.StatusNotFound)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "DIDNotFound"})
+			return
+		}
 		_ = json.NewEncoder(w).Encode(DIDDocument{
 			ID: did,
 			Service: []DIDService{
@@ -110,7 +141,18 @@ func (m *deriveTestPDS) handle(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
 		repo, collection := q.Get("repo"), q.Get("collection")
 		m.mu.Lock()
+		fail := m.listFail[repo]
 		coll := m.records[repo][collection]
+		m.mu.Unlock()
+		switch fail {
+		case "http500":
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		case "malformed":
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("{not valid json"))
+			return
+		}
 		type rec struct {
 			URI   string      `json:"uri"`
 			CID   string      `json:"cid"`
@@ -120,13 +162,47 @@ func (m *deriveTestPDS) handle(w http.ResponseWriter, r *http.Request) {
 		for rkey, val := range coll {
 			recs = append(recs, rec{URI: fmt.Sprintf("at://%s/%s/%s", repo, collection, rkey), CID: "cid-" + rkey, Value: val})
 		}
-		m.mu.Unlock()
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{"records": recs})
 		return
 
 	default:
 		w.WriteHeader(http.StatusNotFound)
 	}
+}
+
+// setDIDDocFail makes did's DID document lookup itself return HTTP 404, so
+// resolveReadEndpoint's PLC resolution fails before ever producing a
+// serviceEndpoint.
+func (m *deriveTestPDS) setDIDDocFail(did string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.didDocFail == nil {
+		m.didDocFail = map[string]bool{}
+	}
+	m.didDocFail[did] = true
+}
+
+// setUnreachable makes did resolve successfully to endpoint, which has
+// nothing listening on it -- simulating an opponent-PDS outage
+// (atchess-1c9.51) distinct from DID resolution itself failing.
+func (m *deriveTestPDS) setUnreachable(did, endpoint string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.unreachableEndpoint == nil {
+		m.unreachableEndpoint = map[string]string{}
+	}
+	m.unreachableEndpoint[did] = endpoint
+}
+
+// setListFail makes every com.atproto.repo.listRecords call against did's
+// repo misbehave in the given way ("http500" or "malformed" -- see handle).
+func (m *deriveTestPDS) setListFail(did, mode string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.listFail == nil {
+		m.listFail = map[string]string{}
+	}
+	m.listFail[did] = mode
 }
 
 // newDeriveTestClient wires up a *Client (as white.test / did:plc:white)
@@ -511,5 +587,202 @@ func TestGetGame_PrematureTimeViolation_Rejected(t *testing.T) {
 	}
 	if game.Status != chess.StatusActive {
 		t.Errorf("expected the premature timeViolation claim to be ignored (status active), got %q -- a time-violation deadline must be re-derived from real timestamps, not trusted on assertion", game.Status)
+	}
+}
+
+// --- Incomplete-derivation / fail-closed regression tests (atchess-1c9.51) ---
+//
+// Each of these seeds a resignation record in WHITE's OWN repo (as
+// ResignGame always writes it -- see TestGetGame_WhiteResigns_BlackWon),
+// which resolveReadEndpoint always reads directly against this client's own
+// PDS (c.did shortcut) regardless of PLC/network state, then breaks reading
+// BLACK's repo in one specific way. This isolates "the opponent's repo
+// could not be scanned" from "the terminal event itself could not be
+// found": the resignation IS found (via white's reachable repo), so if
+// GetGame's error handling were accidentally dropped, the status would
+// still come back correct (black_won) and these tests would pass for the
+// wrong reason -- which is exactly why each asserts directly on the
+// returned error via errors.Is, not merely on the status.
+
+func TestGetGame_IncompleteDerivation_OpponentUnreachable_Resigned(t *testing.T) {
+	mock := newDeriveTestPDS(t)
+	srv := mock.server()
+	defer srv.Close()
+
+	// Nothing is listening here: a real httptest server, closed
+	// immediately, so black's DID resolves fine but every XRPC call against
+	// it fails with a connection error.
+	dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	dead.Close()
+	mock.setUnreachable(blackDID, dead.URL)
+
+	gameURI := mock.seedActiveGame(t, time.Now().Add(-time.Hour), nil)
+	mock.seed(whiteDID, "app.atchess.resignation", "resign1", map[string]interface{}{
+		"$type":           "app.atchess.resignation",
+		"createdAt":       time.Now().Format(time.RFC3339),
+		"game":            map[string]interface{}{"uri": gameURI},
+		"resigningPlayer": whiteDID,
+	})
+
+	client := newDeriveTestClient(t, mock)
+	game, err := client.GetGame(context.Background(), gameURI)
+	if err == nil {
+		t.Fatalf("expected a non-nil error (black's PDS is unreachable), got nil with status %q", game.Status)
+	}
+	if !errors.Is(err, ErrIncompleteDerivation) {
+		t.Errorf("expected errors.Is(err, ErrIncompleteDerivation), got: %v", err)
+	}
+	if game == nil {
+		t.Fatalf("expected a non-nil partial *Game alongside the error")
+	}
+	if !game.DerivationIncomplete {
+		t.Errorf("expected game.DerivationIncomplete == true")
+	}
+	if game.Status == chess.StatusActive {
+		t.Errorf("must not report the game as active when derivation could not be verified; got %q", game.Status)
+	}
+}
+
+func TestGetGame_IncompleteDerivation_OpponentHTTP500_Resigned(t *testing.T) {
+	mock := newDeriveTestPDS(t)
+	srv := mock.server()
+	defer srv.Close()
+
+	mock.setListFail(blackDID, "http500")
+
+	gameURI := mock.seedActiveGame(t, time.Now().Add(-time.Hour), nil)
+	mock.seed(whiteDID, "app.atchess.resignation", "resign1", map[string]interface{}{
+		"$type":           "app.atchess.resignation",
+		"createdAt":       time.Now().Format(time.RFC3339),
+		"game":            map[string]interface{}{"uri": gameURI},
+		"resigningPlayer": whiteDID,
+	})
+
+	client := newDeriveTestClient(t, mock)
+	game, err := client.GetGame(context.Background(), gameURI)
+	if err == nil {
+		t.Fatalf("expected a non-nil error (black's PDS returns HTTP 500), got nil with status %q", game.Status)
+	}
+	if !errors.Is(err, ErrIncompleteDerivation) {
+		t.Errorf("expected errors.Is(err, ErrIncompleteDerivation), got: %v", err)
+	}
+	if !game.DerivationIncomplete {
+		t.Errorf("expected game.DerivationIncomplete == true")
+	}
+	if game.Status == chess.StatusActive {
+		t.Errorf("must not report the game as active when derivation could not be verified; got %q", game.Status)
+	}
+}
+
+func TestGetGame_IncompleteDerivation_OpponentMalformedJSON_Resigned(t *testing.T) {
+	mock := newDeriveTestPDS(t)
+	srv := mock.server()
+	defer srv.Close()
+
+	mock.setListFail(blackDID, "malformed")
+
+	gameURI := mock.seedActiveGame(t, time.Now().Add(-time.Hour), nil)
+	mock.seed(whiteDID, "app.atchess.resignation", "resign1", map[string]interface{}{
+		"$type":           "app.atchess.resignation",
+		"createdAt":       time.Now().Format(time.RFC3339),
+		"game":            map[string]interface{}{"uri": gameURI},
+		"resigningPlayer": whiteDID,
+	})
+
+	client := newDeriveTestClient(t, mock)
+	game, err := client.GetGame(context.Background(), gameURI)
+	if err == nil {
+		t.Fatalf("expected a non-nil error (black's PDS returns malformed JSON), got nil with status %q", game.Status)
+	}
+	if !errors.Is(err, ErrIncompleteDerivation) {
+		t.Errorf("expected errors.Is(err, ErrIncompleteDerivation), got: %v", err)
+	}
+	if !game.DerivationIncomplete {
+		t.Errorf("expected game.DerivationIncomplete == true")
+	}
+	if game.Status == chess.StatusActive {
+		t.Errorf("must not report the game as active when derivation could not be verified; got %q", game.Status)
+	}
+}
+
+func TestGetGame_IncompleteDerivation_OpponentDIDResolutionFails_Resigned(t *testing.T) {
+	mock := newDeriveTestPDS(t)
+	srv := mock.server()
+	defer srv.Close()
+
+	mock.setDIDDocFail(blackDID)
+
+	gameURI := mock.seedActiveGame(t, time.Now().Add(-time.Hour), nil)
+	mock.seed(whiteDID, "app.atchess.resignation", "resign1", map[string]interface{}{
+		"$type":           "app.atchess.resignation",
+		"createdAt":       time.Now().Format(time.RFC3339),
+		"game":            map[string]interface{}{"uri": gameURI},
+		"resigningPlayer": whiteDID,
+	})
+
+	client := newDeriveTestClient(t, mock)
+	game, err := client.GetGame(context.Background(), gameURI)
+	if err == nil {
+		t.Fatalf("expected a non-nil error (black's DID document cannot be resolved), got nil with status %q", game.Status)
+	}
+	if !errors.Is(err, ErrIncompleteDerivation) {
+		t.Errorf("expected errors.Is(err, ErrIncompleteDerivation), got: %v", err)
+	}
+	if !game.DerivationIncomplete {
+		t.Errorf("expected game.DerivationIncomplete == true")
+	}
+	if game.Status == chess.StatusActive {
+		t.Errorf("must not report the game as active when derivation could not be verified; got %q", game.Status)
+	}
+}
+
+// TestGetGame_NegativeControl_BothReposReadable_NoTerminalEvent_Active
+// proves the new error path does not fire unconditionally: with both
+// repos fully readable and no terminal event anywhere, GetGame must still
+// return a nil error and StatusActive, exactly as before atchess-1c9.51.
+func TestGetGame_NegativeControl_BothReposReadable_NoTerminalEvent_Active(t *testing.T) {
+	mock := newDeriveTestPDS(t)
+	srv := mock.server()
+	defer srv.Close()
+
+	gameURI := mock.seedActiveGame(t, time.Now().Add(-time.Hour), nil)
+
+	client := newDeriveTestClient(t, mock)
+	game, err := client.GetGame(context.Background(), gameURI)
+	if err != nil {
+		t.Fatalf("GetGame: unexpected error with both repos fully readable and no terminal event: %v", err)
+	}
+	if game.DerivationIncomplete {
+		t.Errorf("expected game.DerivationIncomplete == false")
+	}
+	if game.Status != chess.StatusActive {
+		t.Errorf("expected active, got %q", game.Status)
+	}
+}
+
+// TestResignGame_FailsClosed_WhenDerivationIncomplete is a regression test
+// for the fail-open bug found while auditing currentGameStatus's callers
+// during atchess-1c9.51: ResignGame used to only block on
+// "err == nil && status != active", so a derivation error (opponent's PDS
+// unreachable) was silently treated the same as "verified active",
+// letting a resignation through unchecked. It must now reject instead.
+func TestResignGame_FailsClosed_WhenDerivationIncomplete(t *testing.T) {
+	mock := newDeriveTestPDS(t)
+	srv := mock.server()
+	defer srv.Close()
+
+	dead := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	dead.Close()
+	mock.setUnreachable(blackDID, dead.URL)
+
+	gameURI := mock.seedActiveGame(t, time.Now().Add(-time.Hour), nil)
+
+	client := newDeriveTestClient(t, mock)
+	err := client.ResignGame(context.Background(), gameURI, "")
+	if err == nil {
+		t.Fatalf("expected ResignGame to fail closed when the game's status could not be verified (black's PDS unreachable), got nil error")
+	}
+	if !errors.Is(err, ErrIncompleteDerivation) {
+		t.Errorf("expected errors.Is(err, ErrIncompleteDerivation), got: %v", err)
 	}
 }

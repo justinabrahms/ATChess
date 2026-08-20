@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -297,6 +298,20 @@ func (s *Service) MakeMoveHandler(w http.ResponseWriter, r *http.Request) {
 	// stale board position.
 	game, err := client.GetGame(context.Background(), gameID)
 	if err != nil {
+		// An incomplete derivation (atchess-1c9.51: one or more repos could
+		// not be read while scanning for terminal events) is distinct from
+		// every other GetGame failure and MUST be rejected here, before any
+		// move is written -- game.Status in that case is unproven, not just
+		// possibly stale, so the 409 "game is over" gate below cannot be
+		// trusted to have seen everything. Use 503 (transient: the read may
+		// succeed on retry) rather than folding it into the generic 500, so
+		// a client/operator can tell "this game is over" (409) apart from
+		// "we could not verify whether this game is over" (503).
+		if errors.Is(err, atproto.ErrIncompleteDerivation) {
+			log.Error().Err(err).Str("gameID", gameID).Msg("Cannot verify game is still active: derivation incomplete, rejecting move")
+			http.Error(w, "Could not verify game state (one or more repos unreachable); try again", http.StatusServiceUnavailable)
+			return
+		}
 		log.Error().Err(err).Str("gameID", gameID).Msg("Failed to fetch game for move validation")
 		http.Error(w, "Failed to fetch game state", http.StatusInternalServerError)
 		return
