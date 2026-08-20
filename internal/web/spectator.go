@@ -3,10 +3,12 @@ package web
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"time"
 
 	"github.com/gorilla/mux"
+	"github.com/justinabrahms/atchess/internal/atproto"
 	"github.com/justinabrahms/atchess/internal/chess"
 	"github.com/rs/zerolog/log"
 )
@@ -60,12 +62,23 @@ func (s *Service) GetSpectatorGameHandler(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Fetch game from AT Protocol
+	// Fetch game from AT Protocol. A GetGame error wrapping
+	// ErrIncompleteDerivation with a non-nil game means the record itself
+	// exists but its derived status could not be fully verified (e.g. a
+	// transient opponent-PDS read failure) -- not that the game is absent.
+	// Render the partial game (its DerivationIncomplete flag intact, see
+	// service.go's GetGameHandler for the fuller rationale) rather than
+	// reporting a 404 that misdirects the spectator toward "wrong game ID"
+	// instead of "status currently unverified". Any other error (or a nil
+	// game) means the record genuinely could not be found.
 	game, err := s.serverClient.GetGame(context.Background(), gameID)
-	if err != nil {
+	if err != nil && !(errors.Is(err, atproto.ErrIncompleteDerivation) && game != nil) {
 		log.Error().Err(err).Str("gameID", gameID).Msg("Failed to fetch game for spectator")
 		http.Error(w, "Game not found", http.StatusNotFound)
 		return
+	}
+	if err != nil {
+		log.Warn().Err(err).Str("gameID", gameID).Msg("Game status derivation incomplete for spectator; returning partial/unverified game")
 	}
 
 	// Get material count
@@ -136,9 +149,27 @@ func (s *Service) CheckAbandonmentHandler(w http.ResponseWriter, r *http.Request
 	vars := mux.Vars(r)
 	gameID := vars["id"]
 
-	// Fetch game
+	// Fetch game. As in GetGameHandler/GetSpectatorGameHandler above, an
+	// error wrapping ErrIncompleteDerivation with a non-nil game means the
+	// record exists but its derived Status is unproven (e.g. a transient
+	// opponent-PDS read failure), not that the game is absent -- that must
+	// not 404. It also must not be treated as authoritative for the
+	// abandonment computation below: game.Status may be stale/wrong, so
+	// neither "already ended" nor a real abandonment/canClaim verdict can
+	// be trusted. Report the ambiguity explicitly instead and stop.
 	game, err := s.serverClient.GetGame(context.Background(), gameID)
 	if err != nil {
+		if errors.Is(err, atproto.ErrIncompleteDerivation) && game != nil {
+			log.Warn().Err(err).Str("gameID", gameID).Msg("Game status derivation incomplete for abandonment check; withholding verdict")
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"abandoned":            false,
+				"canClaim":             false,
+				"derivationIncomplete": true,
+				"reason":               "Game status could not be verified (one or more repos unreachable); try again",
+			})
+			return
+		}
 		http.Error(w, "Game not found", http.StatusNotFound)
 		return
 	}

@@ -412,6 +412,24 @@ func (s *Service) GetGameHandler(w http.ResponseWriter, r *http.Request) {
 	// client rather than clientFor(r).
 	game, err := s.serverClient.GetGame(context.Background(), gameID)
 	if err != nil {
+		// atchess-1c9.51 made GetGame fail closed for WRITE authorization:
+		// any per-repo read failure while deriving status is reported as
+		// an error. That is correct for MakeMoveHandler, but wrong here --
+		// this is a read-only view, and mapping every GetGame error to 404
+		// makes a transient opponent-PDS blip present as "this game does
+		// not exist", which is a worse lie than a stale status. When the
+		// failure is specifically ErrIncompleteDerivation, GetGame still
+		// returns a fully-populated *chess.Game (with DerivationIncomplete
+		// set) alongside the error -- render that partial game with its
+		// derivationIncomplete flag intact instead of hiding it behind a
+		// 404. A nil game here means the record genuinely could not be
+		// found (or some other non-derivation failure), which is a real 404.
+		if errors.Is(err, atproto.ErrIncompleteDerivation) && game != nil {
+			log.Warn().Err(err).Str("gameID", gameID).Msg("Game status derivation incomplete; returning partial/unverified game")
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(game)
+			return
+		}
 		log.Error().Err(err).Str("gameID", gameID).Msg("Failed to fetch game")
 		http.Error(w, "Game not found", http.StatusNotFound)
 		return
