@@ -214,7 +214,36 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("failed to unmarshal config: %w", err)
 	}
 
+	if err := validate(&cfg); err != nil {
+		return nil, err
+	}
+
 	return &cfg, nil
+}
+
+// validate rejects config values that decode successfully (so they never
+// trip viper/mapstructure's own decode-hook errors -- see the comment on
+// ChallengeConfig.PruneInterval and atchess-1c9.62) but are unusable by
+// whatever consumes them.
+//
+// Chosen over clamping-to-default-with-a-warning to match how this
+// package already treats bad config: an unparseable
+// challenge.prune_interval (e.g. "banana") already fails Load() outright
+// with a "failed to unmarshal config" error naming the offending key,
+// rather than being silently replaced by the default. A value that
+// parses but is non-positive should fail exactly the same loud way, for
+// the same reason -- a clamp would hide the operator's typo instead of
+// telling them about it, and would leave the fixed error path
+// inconsistent depending on whether viper happened to notice the
+// problem at decode time.
+func validate(cfg *Config) error {
+	if cfg.Challenge.PruneInterval <= 0 {
+		return fmt.Errorf(
+			"invalid config: 'challenge.prune_interval' must be a positive duration (e.g. \"1h\", \"15m\"), got %s -- a zero or negative interval would panic time.NewTicker in cmd/protocol/main.go's prune loop",
+			cfg.Challenge.PruneInterval,
+		)
+	}
+	return nil
 }
 
 func loadDefaults() *Config {
