@@ -1,15 +1,23 @@
 package oauth
 
-// Conformance tests (atchess-1c9.7) that pin real mismatches between our
-// OAuth client and what a real AT Protocol authorization server actually
-// requires. These are network-gated behind ATCHESS_OAUTH_CONFORMANCE=1 and
-// skipped by default so ordinary unit runs and CI stay green.
+// Conformance tests (originally atchess-1c9.7) that check our OAuth client
+// against what a real AT Protocol authorization server actually requires.
+// These are network-gated behind ATCHESS_OAUTH_CONFORMANCE=1 and skipped by
+// default so ordinary unit runs and CI stay green.
 //
-// This bead's job is to PIN the defect, not fix it (that's atchess-1c9.12).
-// The two assertions below are expected to FAIL against a live
-// bsky.social. Do not "fix" this test by weakening the assertions -- if it
-// starts passing, atchess-1c9.12 shipped and this test (or its gate) should
-// be revisited then, not now.
+// History: atchess-1c9.7 originally landed TestConformance_PARRequiredButNotUsed,
+// pinning a real, then-unaddressed gap (PAR was advertised but not used) and
+// EXPECTED it to fail until atchess-1c9.12 shipped PAR support. But it
+// asserted against the plain, non-PAR BuildAuthorizationURL specifically --
+// and that builder must never perform PAR (some authorization servers,
+// including the local dual-PDS harness's, don't advertise a PAR endpoint at
+// all, so a non-PAR path is a hard requirement). That made the assertion
+// structurally unpassable even after atchess-1c9.12 added PAR support via a
+// new method, BuildAuthorizationURLAuto. atchess-1c9.85 diagnosed this and
+// rewrote it as TestConformance_PARIsAttemptedWhenRequired below, which
+// exercises BuildAuthorizationURLAuto instead and is expected to (and does)
+// PASS -- see that test's own doc comment for what it accepts as proof PAR
+// was attempted.
 //
 // A note on how this reaches the metadata: the bead asks us to exercise the
 // resolution chain the production code already implements in
@@ -170,12 +178,45 @@ func fetchAuthServerMetadataPublic(ctx context.Context, authServerURL string) (*
 	return &out, nil
 }
 
-// TestConformance_PARRequiredButNotUsed pins the mismatch between what
-// bsky.social's authorization server advertises (it requires Pushed
-// Authorization Requests) and what our client actually does
-// (BuildAuthorizationURL builds a plain query-parameter /authorize URL,
-// never touching a PAR endpoint). EXPECTED TO FAIL until atchess-1c9.12.
-func TestConformance_PARRequiredButNotUsed(t *testing.T) {
+// TestConformance_PARIsAttemptedWhenRequired verifies, against a live
+// authorization server that advertises Pushed Authorization Request (PAR)
+// support, that our client actually attempts PAR when it should --
+// exercising BuildAuthorizationURLAuto (atchess-1c9.12's production entry
+// point), not the plain BuildAuthorizationURL, which must never perform PAR
+// (some authorization servers, including the local dual-PDS harness's,
+// advertise no PAR endpoint at all, so a non-PAR path is a hard
+// requirement, not a gap).
+//
+// This test cannot complete a full PAR round trip: a live authorization
+// server's PAR endpoint requires fetching a resolvable client-metadata.json
+// for our client_id, and hosting real, live client metadata for a test
+// fixture would make a unit test depend on live infrastructure. Instead it
+// grades whether a well-formed PAR request reached a DEFINITIVE response
+// from the authorization server:
+//
+//   - "invalid_client_metadata" is accepted as proof-of-attempt: it proves
+//     the AS accepted our PAR request as well-formed enough to go try to
+//     fetch our (deliberately unresolvable) client metadata -- exactly as
+//     far as we can prove without hosting real metadata.
+//   - "use_dpop_nonce" surfacing here is a FAILURE: postFormWithDPoPRetry
+//     is supposed to retry exactly once against a 400 use_dpop_nonce
+//     challenge and only return that error if the second attempt is
+//     ALSO challenged (or the server broke the challenge contract by
+//     omitting DPoP-Nonce) -- either way, seeing it here means our nonce
+//     retry mechanics did not do their job.
+//   - anything else (no PAR attempt at all, a network-level failure before
+//     any AS response, or a request the AS rejected for some earlier
+//     reason than the client-metadata fetch) is also a FAILURE.
+//
+// This test was previously named TestConformance_PARRequiredButNotUsed and
+// asserted (against the PLAIN builder) that PAR was NOT used -- an
+// assertion atchess-1c9.7 correctly pinned as a known gap, which
+// atchess-1c9.12 then closed by adding BuildAuthorizationURLAuto. But
+// because that assertion targeted the plain builder specifically, and the
+// plain builder must never do PAR, it could never be made to pass by any
+// production change; see atchess-1c9.85 for the full diagnosis. It has been
+// restructured (this comment) to grade the real PAR path instead.
+func TestConformance_PARIsAttemptedWhenRequired(t *testing.T) {
 	requireConformanceGate(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
@@ -239,24 +280,71 @@ func TestConformance_PARRequiredButNotUsed(t *testing.T) {
 		t.Fatalf("generating state: %v", err)
 	}
 
-	authURL := client.BuildAuthorizationURL(metadata.AuthorizationEndpoint, conformanceTestHandle, state, challenge)
-	parsed, err := url.Parse(authURL)
+	// The same per-session DPoP key production generates in
+	// internal/web/oauth_handlers.go before calling BuildAuthorizationURLAuto.
+	dpopKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
-		t.Fatalf("BuildAuthorizationURL produced an unparseable URL: %v", err)
+		t.Fatalf("generating DPoP key: %v", err)
 	}
-	q := parsed.Query()
 
-	// A PAR-compliant client would POST the authorization parameters to
-	// pushed_authorization_request_endpoint and build the /authorize URL
-	// from nothing but client_id + the returned request_uri. Ours instead
-	// puts every parameter directly on the query string.
-	if q.Get("request_uri") == "" {
-		t.Errorf("authorization server %s requires PAR (pushed_authorization_request_endpoint=%q, "+
-			"require_pushed_authorization_requests=%v) but OAuthClient.BuildAuthorizationURL does not use "+
-			"it -- it built a plain query-parameter authorization URL with %d parameters instead of a "+
-			"request_uri obtained via PAR: %s",
-			authServerURL, metadata.PushedAuthorizationRequestEndpoint,
-			metadata.RequirePushedAuthorizationRequests, len(q), authURL)
+	// This is the actual production entry point (see
+	// internal/web/oauth_handlers.go): it selects PAR because parEndpoint
+	// (metadata.PushedAuthorizationRequestEndpoint) is non-empty, and
+	// PushAuthorizationRequest actually POSTs to the live PAR endpoint.
+	authURL, buildErr := client.BuildAuthorizationURLAuto(
+		metadata.AuthorizationEndpoint, metadata.PushedAuthorizationRequestEndpoint,
+		authServerURL, conformanceTestHandle, state, challenge, dpopKey)
+
+	switch {
+	case buildErr == nil:
+		// A full PAR round trip succeeded outright (e.g. the AS doesn't
+		// actually enforce resolving client_id's metadata for this
+		// request). That's strictly stronger proof of a correct PAR
+		// attempt than what we normally expect to observe here -- pass.
+		parsed, perr := url.Parse(authURL)
+		if perr != nil {
+			t.Fatalf("BuildAuthorizationURLAuto produced an unparseable URL: %v", perr)
+		}
+		if parsed.Query().Get("request_uri") == "" {
+			t.Errorf("BuildAuthorizationURLAuto returned no error but the resulting authorization URL has no "+
+				"request_uri, meaning it silently fell back to the plain (non-PAR) builder even though a PAR "+
+				"endpoint was advertised: %s", authURL)
+			break
+		}
+		t.Logf("PASS via FULL PAR ROUND TRIP: %s accepted the request and returned a request_uri. Note this is "+
+			"NOT the branch normally expected here -- it means the AS no longer rejects our unresolvable fixture "+
+			"client_id, so the proof-of-attempt path below has stopped being exercised.",
+			metadata.PushedAuthorizationRequestEndpoint)
+	case strings.Contains(buildErr.Error(), "use_dpop_nonce"):
+		// postFormWithDPoPRetry is supposed to retry exactly once against
+		// a 400 use_dpop_nonce challenge and succeed (or fail for an
+		// unrelated reason) on the retry. Seeing use_dpop_nonce escape
+		// all the way out here means that retry did not do its job.
+		t.Errorf("PAR request to %s was challenged with use_dpop_nonce and never got past it -- our DPoP "+
+			"nonce retry mechanics did not work: %v", metadata.PushedAuthorizationRequestEndpoint, buildErr)
+	case strings.Contains(buildErr.Error(), "invalid_client_metadata"):
+		// Proof-of-attempt: the authorization server accepted our PAR
+		// POST as well-formed enough to go try to fetch client metadata
+		// for our (deliberately unresolvable, non-live) client_id, and
+		// rejected it only because that fetch failed. That's as far as
+		// this test can prove without hosting real, live client metadata
+		// -- which would make a unit fixture depend on live
+		// infrastructure. This is a PASS.
+		//
+		// Logged rather than silent: this branch and the err==nil branch
+		// above are both passes but record materially different facts about
+		// the live server. Without a log line a change in the AS's behaviour
+		// would flip which one fires and nobody would notice.
+		t.Logf("PASS via PROOF-OF-ATTEMPT: PAR POST to %s was well-formed and reached the client-metadata "+
+			"fetch stage, rejected only because the fixture client_id is deliberately unresolvable: %v",
+			metadata.PushedAuthorizationRequestEndpoint, buildErr)
+	default:
+		t.Errorf("PAR request to %s (advertised by authorization server %s, "+
+			"require_pushed_authorization_requests=%v) did not reach the expected definitive response -- "+
+			"either PAR was never attempted, or the authorization server rejected the request for a reason "+
+			"other than fetching our client metadata: %v",
+			metadata.PushedAuthorizationRequestEndpoint, authServerURL,
+			metadata.RequirePushedAuthorizationRequests, buildErr)
 	}
 }
 
