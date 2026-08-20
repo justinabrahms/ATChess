@@ -57,9 +57,55 @@ func newIdentityResolver(plcDirectoryURL string) *identityResolver {
 	}
 	return &identityResolver{
 		plcDirectoryURL: plcDirectoryURL,
-		httpClient:      &http.Client{Timeout: 10 * time.Second},
-		cache:           make(map[string]pdsCacheEntry),
+		httpClient: &http.Client{
+			Timeout:       10 * time.Second,
+			CheckRedirect: refuseIdentityFetchRedirect,
+		},
+		cache: make(map[string]pdsCacheEntry),
 	}
+}
+
+// refuseIdentityFetchRedirect is the http.Client.CheckRedirect policy shared
+// by every identity-resolution fetch this package makes against a
+// user-named domain: the did:plc directory (fetchDIDDocument,
+// resolveHandleViaPLCExport), a did:web document (fetchDIDDocument), and
+// the AT Protocol HTTPS well-known handle endpoint
+// (resolveHandleViaWellKnown, which client.go's ResolveHandle deliberately
+// routes through THIS SAME client -- see Client.resolver() and its call
+// site -- rather than the general-purpose XRPC httpClient, precisely so
+// this policy cannot drift into a second, differently-configured copy).
+//
+// atchess-1c9.94 (found by reviewer during atchess-1c9.93): every did:web /
+// did:plc / handle host control this package has (atchess-1c9.69's handle
+// grammar, .70's IP-literal rejection, .72's empty-label rule, .93's ASCII
+// allowlist) validates only the host we are ABOUT to request. None of them
+// survives a redirect -- Go's default http.Client follows up to 10 of
+// them, so a fetch to a perfectly legitimate, allowlisted host could return
+// e.g. "302 Location: http://169.254.169.254/" and be followed with zero
+// further validation, defeating the entire validation stack with nothing
+// more exotic than a redirect.
+//
+// This refuses EVERY redirect outright (option (a) from the bead) rather
+// than re-validating the Location host on every hop (option (b)): neither
+// a did:plc directory, a did:web document fetch, nor the AT Protocol
+// .well-known/atproto-did endpoint is specified to redirect, so there is
+// no legitimate case being given up here, and "no second validator to keep
+// in sync with the first" is exactly the property that made .72 and .93
+// possible in the first place (a second copy of the host-validation rule,
+// silently drifting from the first).
+//
+// Deliberately NOT applied to the XRPC httpClient(s) client.go builds for
+// talking to a PDS (see NewClient/NewClientWithDPoP/NewClientFromSession
+// and RefreshSession): by the time any of those fire, the PDS's host has
+// already been resolved (via this same, now-redirect-safe identity
+// resolution, or supplied directly as trusted configuration) rather than
+// being a value an attacker can steer per-request the way a did:web
+// document's Location header could. Banning redirects there too could
+// break a legitimate PDS's own redirect behaviour (see e.g. the e2e
+// harness's proxy) for no corresponding SSRF benefit, since the request
+// target is not attacker-named at that point.
+func refuseIdentityFetchRedirect(req *http.Request, via []*http.Request) error {
+	return fmt.Errorf("identity fetch: refusing to follow redirect to %s (did:web/did:plc/.well-known identity fetches must not redirect, atchess-1c9.94)", req.URL)
 }
 
 var (

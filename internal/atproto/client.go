@@ -2093,7 +2093,15 @@ func (c *Client) ResolveHandle(ctx context.Context, handle string) (string, erro
 		attempts = append(attempts, fmt.Sprintf("DNS TXT: %v", err))
 	}
 
-	if did, err := resolveHandleViaWellKnown(ctx, c.httpClient, handle); err == nil {
+	// Deliberately c.resolver().httpClient here, NOT c.httpClient: this
+	// fetch's target host is the caller-supplied handle itself (an
+	// attacker-named domain, not this client's own already-resolved PDS),
+	// so it must go through the SAME redirect-refusing client every other
+	// identity-resolution fetch uses (see refuseIdentityFetchRedirect's doc
+	// comment, atchess-1c9.94) rather than the general-purpose XRPC client,
+	// which follows redirects normally and is used only against
+	// already-resolved PDS endpoints.
+	if did, err := resolveHandleViaWellKnown(ctx, c.resolver().httpClient, handle); err == nil {
 		return did, nil
 	} else {
 		attempts = append(attempts, fmt.Sprintf("HTTPS well-known: %v", err))
