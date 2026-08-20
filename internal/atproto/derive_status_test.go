@@ -478,6 +478,144 @@ func TestGetGame_TimeViolation_WhiteWon(t *testing.T) {
 	}
 }
 
+// --- resolveTimeControl agreement tests (atchess-1c9.88) ---
+//
+// getTimeViolationOutcome (reached via GetGame) and CheckTimeViolation
+// (reached via ClaimTimeVictory) used to disagree about what an absent
+// timeControl means: GetGame's derivation treated it as "no timeout is
+// ever possible", while CheckTimeViolation defaulted it to a 3-day
+// correspondence limit and ClaimTimeVictory happily awarded a win (and
+// wrote a real timeViolation record) on that basis -- a player could be
+// timed out of a game GetGame's own derived status insisted was still
+// active. Both paths now resolve through the single resolveTimeControl
+// function; these two tests pin that they reach the SAME conclusion for
+// the same underlying facts (not just individually plausible ones), for a
+// game with NO persisted timeControl at all -- the only case that occurs
+// in production today, since nothing in this codebase writes timeControl
+// yet (atchess-1c9.88/.90).
+
+// seedActiveGameNoTimeControlAfterMove seeds an app.atchess.game record
+// (no "timeControl" field, no "challenge" field -- exactly what every real
+// game looks like today) together with the single move that already
+// happened moveAt, putting the FEN's turn on black. Both CheckTimeViolation
+// (via the raw game record's own "fen" field) and GetGame's own move scan
+// need to agree it is black's turn, so the move's resulting FEN is used
+// for the game record's cached "fen" too, mirroring how RecordMove keeps
+// them in sync in production.
+//
+// The game record is deliberately seeded into BLACK's repo (gameURI is
+// at://blackDID/app.atchess.game/game1) even though white is the one who
+// will claim the violation: ClaimTimeVictory only patches its record's
+// cached "status" field directly when it owns the underlying repo the
+// gameURI points to (client.go: `parts[2] == c.did`), which is NOT
+// guaranteed -- a game can be, and often will be, canonically owned by the
+// player who is NOT the one claiming the violation. If the game record
+// were owned by white (the claimant) instead, that direct patch would
+// mask a getTimeViolationOutcome/GetGame regression: GetGame's raw-status
+// fallback would happen to already say the right thing even if the
+// terminal-event derivation itself were broken, and this test would pass
+// for the wrong reason. Owning it via black instead means GetGame's
+// answer here can ONLY come from real derivation.
+func seedActiveGameNoTimeControlAfterMove(mock *deriveTestPDS, moveAt time.Time) string {
+	const fenAfterE4 = "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1"
+	gameURI, _ := mock.seed(blackDID, "app.atchess.game", "game1", map[string]interface{}{
+		"$type":     "app.atchess.game",
+		"createdAt": moveAt.Add(-time.Hour).Format(time.RFC3339),
+		"white":     whiteDID,
+		"black":     blackDID,
+		"status":    "active",
+		"fen":       fenAfterE4,
+		"pgn":       "1. e4",
+	})
+	mock.seed(whiteDID, "app.atchess.move", "move1", map[string]interface{}{
+		"$type":     "app.atchess.move",
+		"createdAt": moveAt.Format(time.RFC3339),
+		"game":      map[string]interface{}{"uri": gameURI},
+		"player":    whiteDID,
+		"from":      "e2",
+		"to":        "e4",
+		"san":       "e4",
+		"fen":       fenAfterE4,
+	})
+	return gameURI
+}
+
+// TestTimeControlAgreement_AbsentTimeControl_OldViolation_BothAwardTheWin
+// exercises the real end-to-end paths -- an actual ClaimTimeVictory call
+// (which decides via CheckTimeViolation and, if it decides yes, really
+// writes the timeViolation record) followed by a fresh GetGame call
+// against the same server/game -- on a game with no persisted timeControl
+// at all. If ClaimTimeVictory awards the win but GetGame doesn't
+// recognise it (the exact bug atchess-1c9.88 fixes), this test must fail.
+func TestTimeControlAgreement_AbsentTimeControl_OldViolation_BothAwardTheWin(t *testing.T) {
+	mock := newDeriveTestPDS(t)
+	srv := mock.server()
+	defer srv.Close()
+
+	// White made the only move well past the resolved correspondence
+	// default, putting it on black to move -- and black never did.
+	moveAt := time.Now().Add(-time.Duration(defaultDaysPerMove+2) * 24 * time.Hour)
+	gameURI := seedActiveGameNoTimeControlAfterMove(mock, moveAt)
+
+	client := newDeriveTestClient(t, mock) // authenticates as whiteDID
+
+	if err := client.ClaimTimeVictory(context.Background(), gameURI); err != nil {
+		t.Fatalf("ClaimTimeVictory: expected it to award the win (black overstayed the resolved correspondence default), got error: %v", err)
+	}
+
+	game, err := client.GetGame(context.Background(), gameURI)
+	if err != nil {
+		t.Fatalf("GetGame: %v", err)
+	}
+	if game.Status != chess.StatusWhiteWon {
+		t.Errorf("disagreement: ClaimTimeVictory awarded white the win, but GetGame's derived status says %q, not white_won -- the two time-control paths disagree again", game.Status)
+	}
+}
+
+// TestTimeControlAgreement_AbsentTimeControl_YoungViolation_BothRefuse
+// mirrors the above but with the same move well inside the resolved
+// correspondence default: ClaimTimeVictory must refuse, and separately
+// (mirroring TestGetGame_PrematureTimeViolation_Rejected, but for an
+// absent rather than an explicit timeControl) GetGame must also refuse a
+// premature claim that was filed anyway -- this is
+// getTimeViolationOutcome's second job, preserved by atchess-1c9.88's fix,
+// distinct from the defaulting concern the first test above covers.
+func TestTimeControlAgreement_AbsentTimeControl_YoungViolation_BothRefuse(t *testing.T) {
+	mock := newDeriveTestPDS(t)
+	srv := mock.server()
+	defer srv.Close()
+
+	moveAt := time.Now().Add(-24 * time.Hour) // 1 day -- inside the 3-day default
+	gameURI := seedActiveGameNoTimeControlAfterMove(mock, moveAt)
+
+	client := newDeriveTestClient(t, mock)
+
+	if err := client.ClaimTimeVictory(context.Background(), gameURI); err == nil {
+		t.Fatalf("ClaimTimeVictory: expected it to refuse (black is still well inside the resolved correspondence default), got no error")
+	}
+
+	// FORGERY: white claims the violation anyway, well before its own
+	// deadline could have elapsed, with an absent timeControl (the real
+	// scenario, unlike TestGetGame_PrematureTimeViolation_Rejected's
+	// explicit correspondence/3).
+	mock.seed(whiteDID, "app.atchess.timeViolation", "forged1", map[string]interface{}{
+		"$type":             "app.atchess.timeViolation",
+		"createdAt":         time.Now().Format(time.RFC3339),
+		"game":              map[string]interface{}{"uri": gameURI},
+		"claimingPlayer":    whiteDID,
+		"violatingPlayer":   blackDID,
+		"lastMoveTimestamp": moveAt.Format(time.RFC3339),
+	})
+
+	game, err := client.GetGame(context.Background(), gameURI)
+	if err != nil {
+		t.Fatalf("GetGame: %v", err)
+	}
+	if game.Status != chess.StatusActive {
+		t.Errorf("disagreement: ClaimTimeVictory correctly refused (still inside the resolved correspondence default), but GetGame's derived status honoured a premature claim anyway: got %q, not active", game.Status)
+	}
+}
+
 // TestGetGame_SameSecondTie_ResolvedByTIDRkey is a regression test for the
 // (createdAt, TID) tie-break latestTerminalEvent/moveIsAfter perform when
 // two candidate terminal events share the same second-resolution

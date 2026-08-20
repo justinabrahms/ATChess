@@ -1145,6 +1145,64 @@ func (c *Client) getResignationOutcome(ctx context.Context, gameURI, whiteDID, b
 	return latest, errors.Join(errs...)
 }
 
+// defaultDaysPerMove is the correspondence time limit applied wherever a
+// game's time control is absent, or its daysPerMove is unset/zero on what
+// is (or defaults to) a correspondence game. See resolveTimeControl's doc
+// comment: this is the ONLY named default in the package, and every
+// caller must resolve through that function rather than re-declaring this
+// literal itself (atchess-1c9.88).
+const defaultDaysPerMove = 3
+
+// resolveTimeControl returns the EFFECTIVE time-control type/daysPerMove
+// that governs a game, given whatever was actually persisted for it
+// (rawType/rawDaysPerMove -- a game's own "timeControl" field, or its
+// challenge's). This is the single place the policy question "what does
+// an absent or zero daysPerMove mean?" is decided:
+//
+//   - an absent type (rawType == "", i.e. no timeControl was ever
+//     persisted at all -- the only case that occurs today, since nothing
+//     in this codebase writes timeControl yet: atchess-1c9.88/.90)
+//     resolves to "correspondence" with defaultDaysPerMove days;
+//   - a non-positive daysPerMove on a type that is (or has just been
+//     defaulted to) "correspondence" also resolves to defaultDaysPerMove
+//     days -- correspondence play cannot have a zero-day deadline, so
+//     zero is treated the same as absent;
+//   - any other explicitly-set, non-correspondence type (e.g. "rapid") is
+//     left exactly as given, including a zero/unused daysPerMove -- this
+//     function only ever asserts the correspondence default, it never
+//     invents a type that wasn't there.
+//
+// This deliberately PRESERVES today's effective behaviour (ClaimTimeVictory,
+// via CheckTimeViolation, has always defaulted an unconfigured game to a
+// 3-day correspondence limit and awarded time-violation wins on that
+// basis) rather than changing what a player experiences: atchess-1c9.88
+// narrowly fixes the fact that getTimeViolationOutcome (reached via
+// GetGame) used to disagree with that default -- treating an absent
+// timeControl as "no timeout is ever possible" instead -- which meant a
+// player could be timed out of a game GetGame's own derived status
+// insisted was still active. Whether time controls should be a supported,
+// persisted feature at all is a separate, deliberately deferred product
+// question (atchess-1c9.90).
+//
+// Every caller that reads a game's or challenge's time control and needs
+// to reason about whether a timeout is possible -- getTimeViolationOutcome
+// (via GetGame), CheckTimeViolation (via ClaimTimeVictory), and
+// GetTimeRemaining -- MUST call this function rather than re-implementing
+// the default inline. Two copies of the same literal is exactly how this
+// package previously ended up with getTimeViolationOutcome and
+// ClaimTimeVictory silently disagreeing about what an absent time control
+// means.
+func resolveTimeControl(rawType string, rawDaysPerMove int) (timeControlType string, daysPerMove int) {
+	timeControlType, daysPerMove = rawType, rawDaysPerMove
+	if timeControlType == "" {
+		timeControlType = "correspondence"
+	}
+	if timeControlType == "correspondence" && daysPerMove <= 0 {
+		daysPerMove = defaultDaysPerMove
+	}
+	return timeControlType, daysPerMove
+}
+
 // getTimeViolationOutcome scans app.atchess.timeViolation records in BOTH
 // players' repos for gameURI and returns the most recent one as a
 // terminalEvent (the violating player's opponent wins), or nil if none
@@ -1258,8 +1316,34 @@ func (c *Client) getTimeViolationOutcome(ctx context.Context, gameURI, whiteDID,
 						Msg("timeViolation record cannot be verified without a known last-activity timestamp; treating as advisory and excluding it from derived game status")
 					continue
 				}
+				// daysPerMove is expected to already be
+				// resolveTimeControl's EFFECTIVE value by the time it
+				// reaches here -- GetGame resolves the game's raw
+				// timeControl through resolveTimeControl before calling
+				// this function, so for a "correspondence" record (the
+				// only kind that reaches this point; see the type check
+				// above) it should never legitimately be <= 0. This is no
+				// longer where "absent/zero means no timeout is possible"
+				// is decided -- that policy lives solely in
+				// resolveTimeControl now (atchess-1c9.88). What's left
+				// here is a defensive fallback: if daysPerMove somehow
+				// still is <= 0, timeLimit would be zero/negative and
+				// every claim would trivially satisfy "elapsed", turning
+				// a bad value into an automatic win for the claimant --
+				// the opposite of safe -- so it fails closed rather than
+				// trusting its caller unconditionally.
+				if daysPerMove <= 0 {
+					log.Warn().Str("gameURI", gameURI).Str("recordURI", record.URI).Int("daysPerMove", daysPerMove).
+						Msg("ignoring timeViolation record: daysPerMove is not positive even after resolution -- refusing to treat a non-positive limit as an automatic violation")
+					continue
+				}
+				// Reject a claim made before its own deadline had
+				// actually elapsed -- this is the check that verifies
+				// TIMING (see doc comment above); it is unrelated to the
+				// defaulting concern above it and must be preserved
+				// exactly as-is.
 				timeLimit := time.Duration(daysPerMove) * 24 * time.Hour
-				if daysPerMove <= 0 || t.Sub(lastActivityAt) < timeLimit {
+				if t.Sub(lastActivityAt) < timeLimit {
 					log.Warn().Str("gameURI", gameURI).Str("recordURI", record.URI).
 						Time("lastActivityAt", lastActivityAt).Time("claimedAt", t).Int("daysPerMove", daysPerMove).
 						Msg("ignoring premature/forged timeViolation record: claimed before its own deadline had actually elapsed")
@@ -1569,6 +1653,14 @@ func (c *Client) GetGame(ctx context.Context, gameURI string) (*chess.Game, erro
 		timeControlType = timeControl.Type
 		daysPerMove = timeControl.DaysPerMove
 	}
+	// Resolve to the EFFECTIVE time control before asking
+	// getTimeViolationOutcome to verify a claim against it -- see
+	// resolveTimeControl's doc comment. Without this, an absent
+	// timeControl here (timeControlType == "") disagreed with
+	// CheckTimeViolation/ClaimTimeVictory, which already defaulted an
+	// absent time control to correspondence/defaultDaysPerMove days, about
+	// whether a timeout was even possible at all (atchess-1c9.88).
+	timeControlType, daysPerMove = resolveTimeControl(timeControlType, daysPerMove)
 	timeViolationEvent, timeViolationErr := c.getTimeViolationOutcome(ctx, gameURI, game.White, game.Black, timeControlType, daysPerMove, lastActivityAt, lastActivityKnown)
 
 	<-drawAcceptDone
@@ -2306,11 +2398,13 @@ func (c *Client) CheckTimeViolation(ctx context.Context, gameID string) (bool, *
 		}
 	}
 
-	// Default to correspondence with 3 days per move if not specified
-	if timeControlType == "" {
-		timeControlType = "correspondence"
-		daysPerMove = 3
-	}
+	// Resolve to the EFFECTIVE time control -- see resolveTimeControl's
+	// doc comment. This is the single place the "absent means
+	// correspondence/defaultDaysPerMove days" policy is decided, shared
+	// with getTimeViolationOutcome via GetGame (atchess-1c9.88): without
+	// going through the same function, this could silently drift from
+	// what GetGame's derived status considers a valid timeout again.
+	timeControlType, daysPerMove = resolveTimeControl(timeControlType, daysPerMove)
 
 	// For correspondence games, check the last move timestamp
 	if timeControlType == "correspondence" {
@@ -2640,11 +2734,11 @@ func (c *Client) GetTimeRemaining(ctx context.Context, gameID string) (time.Dura
 		}
 	}
 
-	// Default to correspondence with 3 days per move
-	if timeControlType == "" {
-		timeControlType = "correspondence"
-		daysPerMove = 3
-	}
+	// Resolve to the EFFECTIVE time control -- see resolveTimeControl's
+	// doc comment (atchess-1c9.88): the same single default used by
+	// CheckTimeViolation/GetGame, so this display-only calculation can
+	// never quietly drift from what actually governs the game.
+	timeControlType, daysPerMove = resolveTimeControl(timeControlType, daysPerMove)
 
 	// For correspondence games, calculate time remaining
 	if timeControlType == "correspondence" {
