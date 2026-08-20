@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -15,6 +16,19 @@ import (
 	"github.com/justinabrahms/atchess/internal/config"
 	"github.com/justinabrahms/atchess/internal/oauth"
 )
+
+// newTestChallengeStore opens a fresh, file-backed challenge.Store under
+// t.TempDir() (never a shared/global DB across tests -- see
+// atchess-1c9.50's brief) and registers its Close with t.Cleanup.
+func newTestChallengeStore(t *testing.T) *challenge.Store {
+	t.Helper()
+	s, err := challenge.NewStore(filepath.Join(t.TempDir(), "challenges.db"))
+	if err != nil {
+		t.Fatalf("challenge.NewStore: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	return s
+}
 
 // TestCreateChallengeHandler_NoCrossRepoWriteAttempted is a regression test
 // for atchess-1c9.11: CreateChallenge used to follow its own-repo challenge
@@ -54,7 +68,7 @@ func TestCreateChallengeHandler_NoCrossRepoWriteAttempted(t *testing.T) {
 	}))
 	defer mockPDS.Close()
 
-	svc := &Service{config: &config.Config{}, challengeStore: challenge.NewStore()}
+	svc := &Service{config: &config.Config{}, challengeStore: newTestChallengeStore(t)}
 
 	session := &oauth.Session{
 		DID:                  "did:plc:challenger",
@@ -86,8 +100,11 @@ func TestCreateChallengeHandler_NoCrossRepoWriteAttempted(t *testing.T) {
 	}
 
 	// The challenge should also be immediately visible in this instance's
-	// own cache for the CHALLENGED player (not the challenger).
-	pending := svc.challengeStore.ForPlayer("did:plc:challenged")
+	// own index for the CHALLENGED player (not the challenger).
+	pending, err := svc.challengeStore.ForPlayer("did:plc:challenged")
+	if err != nil {
+		t.Fatalf("ForPlayer: %v", err)
+	}
 	if len(pending) != 1 {
 		t.Fatalf("expected 1 pending challenge cached for the challenged player, got %d", len(pending))
 	}
@@ -125,9 +142,9 @@ func TestDeclineChallengeHandler_WritesToOwnRepoAndClearsCache(t *testing.T) {
 	}))
 	defer mockPDS.Close()
 
-	store := challenge.NewStore()
+	store := newTestChallengeStore(t)
 	challengeURI := "at://did:plc:challenger/app.atchess.challenge/abc123"
-	store.Add(&challenge.PendingChallenge{
+	if _, err := store.Add(&challenge.PendingChallenge{
 		ChallengeURI:  challengeURI,
 		ChallengeCID:  "challenge-cid",
 		ChallengerDID: "did:plc:challenger",
@@ -135,7 +152,9 @@ func TestDeclineChallengeHandler_WritesToOwnRepoAndClearsCache(t *testing.T) {
 		Color:         "white",
 		CreatedAt:     time.Now(),
 		ExpiresAt:     time.Now().Add(24 * time.Hour),
-	})
+	}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
 
 	svc := &Service{config: &config.Config{}, challengeStore: store}
 
@@ -169,9 +188,12 @@ func TestDeclineChallengeHandler_WritesToOwnRepoAndClearsCache(t *testing.T) {
 		t.Errorf("expected collection app.atchess.challengeResponse, got %q", lastCollection)
 	}
 
-	remaining := store.ForPlayer("did:plc:responder")
+	remaining, err := store.ForPlayer("did:plc:responder")
+	if err != nil {
+		t.Fatalf("ForPlayer: %v", err)
+	}
 	if len(remaining) != 0 {
-		t.Errorf("expected the declined challenge to be removed from the local cache, got %d remaining", len(remaining))
+		t.Errorf("expected the declined challenge to be removed from the local index, got %d remaining", len(remaining))
 	}
 }
 
@@ -179,16 +201,18 @@ func TestDeclineChallengeHandler_WritesToOwnRepoAndClearsCache(t *testing.T) {
 // caller cannot decline a challenge that was not addressed to them (no
 // cached entry for their own DID matching that URI).
 func TestDeclineChallengeHandler_RejectsChallengeNotAddressedToCaller(t *testing.T) {
-	store := challenge.NewStore()
+	store := newTestChallengeStore(t)
 	challengeURI := "at://did:plc:challenger/app.atchess.challenge/abc123"
-	store.Add(&challenge.PendingChallenge{
+	if _, err := store.Add(&challenge.PendingChallenge{
 		ChallengeURI:  challengeURI,
 		ChallengeCID:  "challenge-cid",
 		ChallengerDID: "did:plc:challenger",
 		ChallengedDID: "did:plc:someoneelse",
 		CreatedAt:     time.Now(),
 		ExpiresAt:     time.Now().Add(24 * time.Hour),
-	})
+	}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
 
 	svc := &Service{config: &config.Config{}, challengeStore: store}
 
@@ -214,5 +238,94 @@ func TestDeclineChallengeHandler_RejectsChallengeNotAddressedToCaller(t *testing
 
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("expected HTTP 404 (challenge not addressed to this caller), got %d: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestGetChallengeNotificationsHandler_DoesNotLeakOtherPlayersChallenges is
+// the security property atchess-1c9.50 requires a test for: GET
+// /api/challenge-notifications must return ONLY the authenticated caller's
+// own challenges, keyed strictly by AuthenticatedDID(r), even when the
+// shared index holds challenges addressed to other DIDs too.
+func TestGetChallengeNotificationsHandler_DoesNotLeakOtherPlayersChallenges(t *testing.T) {
+	store := newTestChallengeStore(t)
+
+	toBob := "at://did:plc:challenger/app.atchess.challenge/to-bob"
+	toCarol := "at://did:plc:challenger/app.atchess.challenge/to-carol"
+	if _, err := store.Add(&challenge.PendingChallenge{
+		ChallengeURI:  toBob,
+		ChallengerDID: "did:plc:challenger",
+		ChallengedDID: "did:plc:bob",
+		CreatedAt:     time.Now(),
+		ExpiresAt:     time.Now().Add(24 * time.Hour),
+	}); err != nil {
+		t.Fatalf("Add(toBob): %v", err)
+	}
+	if _, err := store.Add(&challenge.PendingChallenge{
+		ChallengeURI:  toCarol,
+		ChallengerDID: "did:plc:challenger",
+		ChallengedDID: "did:plc:carol",
+		CreatedAt:     time.Now(),
+		ExpiresAt:     time.Now().Add(24 * time.Hour),
+	}); err != nil {
+		t.Fatalf("Add(toCarol): %v", err)
+	}
+
+	svc := &Service{config: &config.Config{}, challengeStore: store}
+
+	requestAs := func(did string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest("GET", "/api/challenge-notifications", nil)
+		ctx := context.WithValue(req.Context(), contextKeyDID, did)
+		req = req.WithContext(ctx)
+		w := httptest.NewRecorder()
+		svc.GetChallengeNotificationsHandler(w, req)
+		return w
+	}
+
+	bobResp := requestAs("did:plc:bob")
+	if bobResp.Code != http.StatusOK {
+		t.Fatalf("expected HTTP 200 for bob, got %d: %s", bobResp.Code, bobResp.Body.String())
+	}
+	var bobChallenges []*challenge.PendingChallenge
+	if err := json.Unmarshal(bobResp.Body.Bytes(), &bobChallenges); err != nil {
+		t.Fatalf("decoding bob's response: %v", err)
+	}
+	if len(bobChallenges) != 1 || bobChallenges[0].ChallengeURI != toBob {
+		t.Fatalf("bob should see exactly his own challenge, got %+v", bobChallenges)
+	}
+	for _, c := range bobChallenges {
+		if c.ChallengeURI == toCarol {
+			t.Fatalf("bob must not see carol's challenge in his own notifications response")
+		}
+	}
+
+	carolResp := requestAs("did:plc:carol")
+	if carolResp.Code != http.StatusOK {
+		t.Fatalf("expected HTTP 200 for carol, got %d: %s", carolResp.Code, carolResp.Body.String())
+	}
+	var carolChallenges []*challenge.PendingChallenge
+	if err := json.Unmarshal(carolResp.Body.Bytes(), &carolChallenges); err != nil {
+		t.Fatalf("decoding carol's response: %v", err)
+	}
+	if len(carolChallenges) != 1 || carolChallenges[0].ChallengeURI != toCarol {
+		t.Fatalf("carol should see exactly her own challenge, got %+v", carolChallenges)
+	}
+	for _, c := range carolChallenges {
+		if c.ChallengeURI == toBob {
+			t.Fatalf("carol must not see bob's challenge in her own notifications response")
+		}
+	}
+
+	// A DID with no challenges at all gets an empty list, not an error and
+	// not someone else's data.
+	strangerResp := requestAs("did:plc:stranger")
+	if strangerResp.Code != http.StatusOK {
+		t.Fatalf("expected HTTP 200 for stranger, got %d: %s", strangerResp.Code, strangerResp.Body.String())
+	}
+	var strangerChallenges []*challenge.PendingChallenge
+	if err := json.Unmarshal(strangerResp.Body.Bytes(), &strangerChallenges); err != nil {
+		t.Fatalf("decoding stranger's response: %v", err)
+	}
+	if len(strangerChallenges) != 0 {
+		t.Fatalf("stranger should see 0 challenges, got %d", len(strangerChallenges))
 	}
 }

@@ -12,6 +12,7 @@ type Config struct {
 	ATProto     ATProtoConfig     `mapstructure:"atproto"`
 	Development DevelopmentConfig `mapstructure:"development"`
 	Firehose    FirehoseConfig    `mapstructure:"firehose"`
+	Challenge   ChallengeConfig   `mapstructure:"challenge"`
 }
 
 type ServerConfig struct {
@@ -95,6 +96,24 @@ type FirehoseConfig struct {
 	Transport string `mapstructure:"transport"`
 }
 
+// ChallengeConfig configures the durable challenge index (atchess-1c9.50):
+// a SQLite-backed AppView, keyed by challenged DID, that
+// internal/firehose.EventProcessor and internal/backfill both write into
+// and internal/web.Service.GetChallengeNotificationsHandler queries. See
+// internal/challenge.Store's doc comment and docs/firehose-and-backfill.md
+// for what this does and does not make discoverable.
+type ChallengeConfig struct {
+	// DBPath is the SQLite database file used to persist the challenge
+	// index across restarts. Follows the same pattern as
+	// FirehoseConfig.StateDir: this project has no separate database
+	// server (see CLAUDE.md and the sizing note in atchess-1c9.50) --
+	// modernc.org/sqlite (a pure-Go, cgo-free driver, required since this
+	// project builds with CGO_ENABLED=0) reads and writes a single file on
+	// the same box. The parent directory is created automatically if it
+	// does not exist. Must be writable by the process.
+	DBPath string `mapstructure:"db_path"`
+}
+
 // SplitFirehoseURLs parses raw (see FirehoseConfig.URL's doc comment) as a
 // comma-separated list of com.atproto.sync.subscribeRepos websocket URLs,
 // trimming whitespace and dropping empty entries. Shared by
@@ -146,6 +165,7 @@ func Load() (*Config, error) {
 	viper.BindEnv("firehose.url", "FIREHOSE_URL", "ATCHESS_FIREHOSE_URL")
 	viper.BindEnv("firehose.state_dir", "FIREHOSE_STATE_DIR", "ATCHESS_FIREHOSE_STATE_DIR")
 	viper.BindEnv("firehose.transport", "FIREHOSE_TRANSPORT", "ATCHESS_FIREHOSE_TRANSPORT")
+	viper.BindEnv("challenge.db_path", "CHALLENGE_DB_PATH", "ATCHESS_CHALLENGE_DB_PATH")
 
 	// Set defaults
 	viper.SetDefault("server.host", "localhost")
@@ -159,6 +179,7 @@ func Load() (*Config, error) {
 	viper.SetDefault("firehose.url", "wss://bsky.social/xrpc/com.atproto.sync.subscribeRepos")
 	viper.SetDefault("firehose.state_dir", "./data/firehose")
 	viper.SetDefault("firehose.transport", "")
+	viper.SetDefault("challenge.db_path", "./data/challenges.db")
 
 	// Read config
 	if err := viper.ReadInConfig(); err != nil {
@@ -196,6 +217,9 @@ func loadDefaults() *Config {
 			URL:       "wss://bsky.social/xrpc/com.atproto.sync.subscribeRepos",
 			StateDir:  "./data/firehose",
 			Transport: "",
+		},
+		Challenge: ChallengeConfig{
+			DBPath: "./data/challenges.db",
 		},
 	}
 }

@@ -173,6 +173,18 @@ type Event struct {
 	CID       string // Content ID
 	Timestamp time.Time
 	Record    interface{} // Decoded record data
+	// Action is the repo operation that produced this event: "create",
+	// "update", or "delete" (the same three values
+	// com.atproto.sync.subscribeRepos' ops[].action and Jetstream's
+	// commit.operation use). A "delete" carries no Record body (see
+	// processCBORMessage/processJetstreamMessage) -- consumers that need
+	// to react to a record's removal (atchess-1c9.50's challenge
+	// tombstone handling, internal/firehose.EventProcessor.processChallengeEvent)
+	// must check Action rather than assume Record is populated. May be
+	// empty for transports/paths that do not carry it (defensive default,
+	// treated the same as "create"/"update" by existing callers that don't
+	// check it).
+	Action string
 }
 
 // EventHandler is called for each chess-related event
@@ -693,6 +705,7 @@ func (c *Client) processJetstreamMessage(data []byte) error {
 		CID:       evt.Commit.CID,
 		Timestamp: ts,
 		Record:    record,
+		Action:    evt.Commit.Operation,
 	}
 
 	if err := c.handler(event); err != nil {
@@ -855,6 +868,17 @@ func (c *Client) processCBORMessage(data []byte) error {
 			continue
 		}
 
+		// Extract the op's action ("create", "update", or "delete" --
+		// com.atproto.sync.subscribeRepos' ops[].action). A "delete" op
+		// carries no cid at all (see below), so a missing/unparsable
+		// action here is not itself an error -- it just leaves Action
+		// empty, matching the same "unknown, treat as create/update"
+		// default documented on Event.Action.
+		var action string
+		if actionNode, err := opEntry.LookupByString("action"); err == nil {
+			action, _ = actionNode.AsString()
+		}
+
 		// Extract CID string from the op
 		var cidStr string
 		if cidNode, err := opEntry.LookupByString("cid"); err == nil {
@@ -882,6 +906,7 @@ func (c *Client) processCBORMessage(data []byte) error {
 			CID:       cidStr,
 			Timestamp: time.Now(),
 			Record:    record,
+			Action:    action,
 		}
 
 		if err := c.handler(event); err != nil {
@@ -1037,6 +1062,7 @@ func (c *Client) processTestMessage(data []byte) error {
 			CID:       op.CID,
 			Timestamp: time.Now(),
 			Record:    map[string]interface{}{}, // Empty record for tests
+			Action:    op.Action,
 		}
 
 		if err := c.handler(event); err != nil {

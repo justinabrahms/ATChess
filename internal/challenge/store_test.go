@@ -1,12 +1,29 @@
 package challenge
 
 import (
+	"database/sql"
+	"errors"
+	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 )
 
+func newTestStore(t *testing.T) (*Store, string) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "challenges.db")
+	s, err := NewStore(path)
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = s.Close()
+	})
+	return s, path
+}
+
 func TestStoreAddAndForPlayer(t *testing.T) {
-	s := NewStore()
+	s, _ := newTestStore(t)
 
 	c := &PendingChallenge{
 		ChallengeURI:  "at://did:plc:alice/app.atchess.challenge/abc",
@@ -16,14 +33,25 @@ func TestStoreAddAndForPlayer(t *testing.T) {
 		ExpiresAt:     time.Now().Add(24 * time.Hour),
 	}
 
-	if !s.Add(c) {
+	added, err := s.Add(c)
+	if err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	if !added {
 		t.Fatal("expected Add to return true for new challenge")
 	}
-	if s.Add(c) {
+	added, err = s.Add(c)
+	if err != nil {
+		t.Fatalf("Add (duplicate): %v", err)
+	}
+	if added {
 		t.Fatal("expected Add to return false for duplicate challenge")
 	}
 
-	got := s.ForPlayer("did:plc:bob")
+	got, err := s.ForPlayer("did:plc:bob")
+	if err != nil {
+		t.Fatalf("ForPlayer: %v", err)
+	}
 	if len(got) != 1 {
 		t.Fatalf("expected 1 challenge, got %d", len(got))
 	}
@@ -31,14 +59,72 @@ func TestStoreAddAndForPlayer(t *testing.T) {
 		t.Errorf("wrong URI: %s", got[0].ChallengeURI)
 	}
 
-	got = s.ForPlayer("did:plc:alice")
+	got, err = s.ForPlayer("did:plc:alice")
+	if err != nil {
+		t.Fatalf("ForPlayer(alice): %v", err)
+	}
 	if len(got) != 0 {
 		t.Fatalf("expected 0 challenges for alice, got %d", len(got))
 	}
 }
 
+// TestStore_ForPlayer_DoesNotLeakOtherPlayersChallenges is the security
+// property the whole point of the DID-keyed index rests on: a player must
+// never see a challenge addressed to someone else, even when both are
+// present in the same store.
+func TestStore_ForPlayer_DoesNotLeakOtherPlayersChallenges(t *testing.T) {
+	s, _ := newTestStore(t)
+
+	toBob := &PendingChallenge{
+		ChallengeURI:  "at://did:plc:alice/app.atchess.challenge/to-bob",
+		ChallengerDID: "did:plc:alice",
+		ChallengedDID: "did:plc:bob",
+		CreatedAt:     time.Now(),
+		ExpiresAt:     time.Now().Add(24 * time.Hour),
+	}
+	toCarol := &PendingChallenge{
+		ChallengeURI:  "at://did:plc:alice/app.atchess.challenge/to-carol",
+		ChallengerDID: "did:plc:alice",
+		ChallengedDID: "did:plc:carol",
+		CreatedAt:     time.Now(),
+		ExpiresAt:     time.Now().Add(24 * time.Hour),
+	}
+	if _, err := s.Add(toBob); err != nil {
+		t.Fatalf("Add(toBob): %v", err)
+	}
+	if _, err := s.Add(toCarol); err != nil {
+		t.Fatalf("Add(toCarol): %v", err)
+	}
+
+	bobsChallenges, err := s.ForPlayer("did:plc:bob")
+	if err != nil {
+		t.Fatalf("ForPlayer(bob): %v", err)
+	}
+	if len(bobsChallenges) != 1 || bobsChallenges[0].ChallengeURI != toBob.ChallengeURI {
+		t.Fatalf("bob should see exactly his own challenge, got %+v", bobsChallenges)
+	}
+	for _, c := range bobsChallenges {
+		if c.ChallengeURI == toCarol.ChallengeURI {
+			t.Fatalf("bob must not see carol's challenge")
+		}
+	}
+
+	carolsChallenges, err := s.ForPlayer("did:plc:carol")
+	if err != nil {
+		t.Fatalf("ForPlayer(carol): %v", err)
+	}
+	if len(carolsChallenges) != 1 || carolsChallenges[0].ChallengeURI != toCarol.ChallengeURI {
+		t.Fatalf("carol should see exactly her own challenge, got %+v", carolsChallenges)
+	}
+	for _, c := range carolsChallenges {
+		if c.ChallengeURI == toBob.ChallengeURI {
+			t.Fatalf("carol must not see bob's challenge")
+		}
+	}
+}
+
 func TestStoreExpiration(t *testing.T) {
-	s := NewStore()
+	s, _ := newTestStore(t)
 
 	expired := &PendingChallenge{
 		ChallengeURI:  "at://did:plc:alice/app.atchess.challenge/old",
@@ -55,24 +141,39 @@ func TestStoreExpiration(t *testing.T) {
 		ExpiresAt:     time.Now().Add(24 * time.Hour),
 	}
 
-	s.Add(expired)
-	s.Add(valid)
+	if _, err := s.Add(expired); err != nil {
+		t.Fatalf("Add(expired): %v", err)
+	}
+	if _, err := s.Add(valid); err != nil {
+		t.Fatalf("Add(valid): %v", err)
+	}
 
 	// ForPlayer should only return non-expired
-	got := s.ForPlayer("did:plc:bob")
+	got, err := s.ForPlayer("did:plc:bob")
+	if err != nil {
+		t.Fatalf("ForPlayer: %v", err)
+	}
 	if len(got) != 1 {
 		t.Fatalf("expected 1 non-expired challenge, got %d", len(got))
 	}
 
 	// PruneExpired should clean up
-	pruned := s.PruneExpired()
+	pruned, err := s.PruneExpired()
+	if err != nil {
+		t.Fatalf("PruneExpired: %v", err)
+	}
 	if pruned != 1 {
 		t.Fatalf("expected 1 pruned, got %d", pruned)
 	}
 }
 
-func TestStoreRemove(t *testing.T) {
-	s := NewStore()
+// TestStore_DeclineSurvivesReplayAndRestart is the atchess-1c9.47
+// regression test: a declined challenge must NOT reappear -- neither from
+// an idempotent replay of the same "create" event within the same process,
+// nor after the store is closed and reopened from the same file (the
+// atchess-1c9.50 durability claim).
+func TestStore_DeclineSurvivesReplayAndRestart(t *testing.T) {
+	s, path := newTestStore(t)
 
 	c := &PendingChallenge{
 		ChallengeURI:  "at://did:plc:alice/app.atchess.challenge/abc",
@@ -81,18 +182,345 @@ func TestStoreRemove(t *testing.T) {
 		CreatedAt:     time.Now(),
 		ExpiresAt:     time.Now().Add(24 * time.Hour),
 	}
-	s.Add(c)
-	s.Remove(c.ChallengeURI)
+	if added, err := s.Add(c); err != nil || !added {
+		t.Fatalf("initial Add: added=%v err=%v", added, err)
+	}
 
-	got := s.ForPlayer("did:plc:bob")
+	if err := s.Remove(c.ChallengeURI); err != nil {
+		t.Fatalf("Remove (decline): %v", err)
+	}
+
+	got, err := s.ForPlayer("did:plc:bob")
+	if err != nil {
+		t.Fatalf("ForPlayer after decline: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("expected 0 after decline, got %d", len(got))
+	}
+
+	// Replay of the same "create" event (e.g. the firehose or a rerun
+	// backfill seeing the same record again) must NOT resurrect it.
+	added, err := s.Add(c)
+	if err != nil {
+		t.Fatalf("Add (replay after decline): %v", err)
+	}
+	if added {
+		t.Fatal("expected Add to report the URI as already present, not newly added, after a decline")
+	}
+	got, err = s.ForPlayer("did:plc:bob")
+	if err != nil {
+		t.Fatalf("ForPlayer after replay: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("expected declined challenge to stay declined after replay, got %d", len(got))
+	}
+
+	// Close and reopen from the same file: the decline must survive a
+	// restart.
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	reopened, err := NewStore(path)
+	if err != nil {
+		t.Fatalf("NewStore (reopen): %v", err)
+	}
+	defer reopened.Close()
+
+	got, err = reopened.ForPlayer("did:plc:bob")
+	if err != nil {
+		t.Fatalf("ForPlayer after reopen: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("expected declined challenge to stay declined after restart, got %d", len(got))
+	}
+
+	// And a replay against the reopened store still must not resurrect it.
+	added, err = reopened.Add(c)
+	if err != nil {
+		t.Fatalf("Add (replay after restart): %v", err)
+	}
+	if added {
+		t.Fatal("expected Add to report the URI as already present after restart, not newly added")
+	}
+}
+
+// TestStore_DurableAcrossRestart is atchess-1c9.50's core claim in
+// isolation, independent of decline: data written before a close is still
+// there after reopening the same file. This is what distinguishes the new
+// Store from the in-memory cache it replaces.
+func TestStore_DurableAcrossRestart(t *testing.T) {
+	s, path := newTestStore(t)
+
+	c := &PendingChallenge{
+		ChallengeURI:     "at://did:plc:alice/app.atchess.challenge/durable",
+		ChallengerDID:    "did:plc:alice",
+		ChallengerHandle: "alice.test",
+		ChallengedDID:    "did:plc:bob",
+		Color:            "white",
+		Message:          "hello",
+		ProposedGameID:   "game-1",
+		CreatedAt:        time.Now().Truncate(time.Second),
+		ExpiresAt:        time.Now().Add(24 * time.Hour).Truncate(time.Second),
+	}
+	if _, err := s.Add(c); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	reopened, err := NewStore(path)
+	if err != nil {
+		t.Fatalf("NewStore (reopen): %v", err)
+	}
+	defer reopened.Close()
+
+	got, err := reopened.ForPlayer("did:plc:bob")
+	if err != nil {
+		t.Fatalf("ForPlayer after reopen: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected the challenge written before restart to still be there, got %d", len(got))
+	}
+	if got[0].ChallengeURI != c.ChallengeURI || got[0].ChallengerHandle != c.ChallengerHandle || got[0].Message != c.Message {
+		t.Fatalf("challenge fields did not survive restart intact: %+v", got[0])
+	}
+}
+
+// TestStore_IdempotentReplay verifies that replaying the exact same
+// challenge event any number of times never produces more than one row
+// for that URI.
+func TestStore_IdempotentReplay(t *testing.T) {
+	s, _ := newTestStore(t)
+
+	c := &PendingChallenge{
+		ChallengeURI:  "at://did:plc:alice/app.atchess.challenge/dup",
+		ChallengerDID: "did:plc:alice",
+		ChallengedDID: "did:plc:bob",
+		CreatedAt:     time.Now(),
+		ExpiresAt:     time.Now().Add(24 * time.Hour),
+	}
+
+	for i := 0; i < 5; i++ {
+		if _, err := s.Add(c); err != nil {
+			t.Fatalf("Add (iteration %d): %v", i, err)
+		}
+	}
+
+	got, err := s.ForPlayer("did:plc:bob")
+	if err != nil {
+		t.Fatalf("ForPlayer: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected exactly 1 row after 5 replays, got %d", len(got))
+	}
+}
+
+func TestStoreRemove(t *testing.T) {
+	s, _ := newTestStore(t)
+
+	c := &PendingChallenge{
+		ChallengeURI:  "at://did:plc:alice/app.atchess.challenge/abc",
+		ChallengerDID: "did:plc:alice",
+		ChallengedDID: "did:plc:bob",
+		CreatedAt:     time.Now(),
+		ExpiresAt:     time.Now().Add(24 * time.Hour),
+	}
+	if _, err := s.Add(c); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	if err := s.Remove(c.ChallengeURI); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+
+	got, err := s.ForPlayer("did:plc:bob")
+	if err != nil {
+		t.Fatalf("ForPlayer: %v", err)
+	}
 	if len(got) != 0 {
 		t.Fatalf("expected 0 after remove, got %d", len(got))
 	}
 
-	// Re-adding after remove should work
-	if !s.Add(c) {
-		t.Fatal("expected Add to succeed after Remove")
+	// Removing an unknown URI is not an error (mirrors the old in-memory
+	// Store's no-op-if-unknown behavior).
+	if err := s.Remove("at://did:plc:nobody/app.atchess.challenge/never-existed"); err != nil {
+		t.Fatalf("Remove(unknown URI) should not error, got %v", err)
 	}
+}
+
+// TestStore_MarkRemoved_TombstonesDeletedChallenge covers the delete/
+// tombstone case: a challenge whose record was deleted upstream (from the
+// challenger's repo) must not linger as open, and a later out-of-order
+// replay of its original "create" must not resurrect it either.
+func TestStore_MarkRemoved_TombstonesDeletedChallenge(t *testing.T) {
+	s, _ := newTestStore(t)
+
+	c := &PendingChallenge{
+		ChallengeURI:  "at://did:plc:alice/app.atchess.challenge/abc",
+		ChallengerDID: "did:plc:alice",
+		ChallengedDID: "did:plc:bob",
+		CreatedAt:     time.Now(),
+		ExpiresAt:     time.Now().Add(24 * time.Hour),
+	}
+	if _, err := s.Add(c); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	if err := s.MarkRemoved(c.ChallengeURI, c.ChallengerDID, c.ChallengedDID); err != nil {
+		t.Fatalf("MarkRemoved: %v", err)
+	}
+
+	got, err := s.ForPlayer("did:plc:bob")
+	if err != nil {
+		t.Fatalf("ForPlayer: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("expected 0 after MarkRemoved, got %d", len(got))
+	}
+
+	// An out-of-order replay of the original create must not resurrect it.
+	added, err := s.Add(c)
+	if err != nil {
+		t.Fatalf("Add (replay after MarkRemoved): %v", err)
+	}
+	if added {
+		t.Fatal("expected Add to report the URI as already present after MarkRemoved")
+	}
+	got, err = s.ForPlayer("did:plc:bob")
+	if err != nil {
+		t.Fatalf("ForPlayer after replay: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("expected removed challenge to stay removed after replay, got %d", len(got))
+	}
+}
+
+// TestStore_MarkRemoved_BeforeCreate covers observing a delete before ever
+// observing the corresponding create (e.g. this instance started watching
+// partway through the challenge's lifetime): MarkRemoved must still leave
+// a durable tombstone so a LATER out-of-order create replay cannot
+// resurrect it.
+func TestStore_MarkRemoved_BeforeCreate(t *testing.T) {
+	s, _ := newTestStore(t)
+
+	uri := "at://did:plc:alice/app.atchess.challenge/never-seen-created"
+	if err := s.MarkRemoved(uri, "did:plc:alice", "did:plc:bob"); err != nil {
+		t.Fatalf("MarkRemoved: %v", err)
+	}
+
+	c := &PendingChallenge{
+		ChallengeURI:  uri,
+		ChallengerDID: "did:plc:alice",
+		ChallengedDID: "did:plc:bob",
+		CreatedAt:     time.Now(),
+		ExpiresAt:     time.Now().Add(24 * time.Hour),
+	}
+	added, err := s.Add(c)
+	if err != nil {
+		t.Fatalf("Add (create arriving after delete): %v", err)
+	}
+	if added {
+		t.Fatal("expected Add to report the URI as already tombstoned, not newly added")
+	}
+
+	got, err := s.ForPlayer("did:plc:bob")
+	if err != nil {
+		t.Fatalf("ForPlayer: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("expected tombstoned challenge to stay excluded, got %d", len(got))
+	}
+}
+
+// TestStore_QueryErrorSurfaces proves ForPlayer returns a genuine error
+// (not an empty, successful-looking result) when the underlying database
+// is unusable -- the property atchess-1c9.51 established and this store
+// must not regress.
+func TestStore_QueryErrorSurfaces(t *testing.T) {
+	s, _ := newTestStore(t)
+
+	// Sabotage the schema out from under the store to force a query
+	// failure that has nothing to do with "no rows".
+	if _, err := s.db.Exec(`DROP TABLE challenges`); err != nil {
+		t.Fatalf("dropping table for test setup: %v", err)
+	}
+
+	_, err := s.ForPlayer("did:plc:bob")
+	if err == nil {
+		t.Fatal("expected ForPlayer to return an error when the underlying table is gone, not a nil error with an empty result")
+	}
+}
+
+// TestStore_AddErrorSurfaces is Add's equivalent of
+// TestStore_QueryErrorSurfaces: a write failure must be reported, not
+// silently discarded (which, prior to atchess-1c9.50, is exactly what the
+// old in-memory Store's bool-only Add signature made impossible to even
+// express).
+func TestStore_AddErrorSurfaces(t *testing.T) {
+	s, _ := newTestStore(t)
+
+	if _, err := s.db.Exec(`DROP TABLE challenges`); err != nil {
+		t.Fatalf("dropping table for test setup: %v", err)
+	}
+
+	_, err := s.Add(&PendingChallenge{
+		ChallengeURI:  "at://did:plc:alice/app.atchess.challenge/abc",
+		ChallengerDID: "did:plc:alice",
+		ChallengedDID: "did:plc:bob",
+		CreatedAt:     time.Now(),
+		ExpiresAt:     time.Now().Add(24 * time.Hour),
+	})
+	if err == nil {
+		t.Fatal("expected Add to return an error when the underlying table is gone")
+	}
+}
+
+// TestStore_ConcurrentAccess exercises Add/ForPlayer/Remove from many
+// goroutines at once against a single Store, for both correctness (run
+// under `go test -race`) and to make sure SetMaxOpenConns(1) serialization
+// doesn't deadlock or drop writes under concurrent load.
+func TestStore_ConcurrentAccess(t *testing.T) {
+	s, _ := newTestStore(t)
+
+	const n = 50
+	var wg sync.WaitGroup
+	wg.Add(n * 2)
+
+	for i := 0; i < n; i++ {
+		i := i
+		go func() {
+			defer wg.Done()
+			_, err := s.Add(&PendingChallenge{
+				ChallengeURI:  "at://did:plc:alice/app.atchess.challenge/" + sqlSafeRkey(i),
+				ChallengerDID: "did:plc:alice",
+				ChallengedDID: "did:plc:bob",
+				CreatedAt:     time.Now(),
+				ExpiresAt:     time.Now().Add(24 * time.Hour),
+			})
+			if err != nil {
+				t.Errorf("concurrent Add: %v", err)
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			if _, err := s.ForPlayer("did:plc:bob"); err != nil {
+				t.Errorf("concurrent ForPlayer: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	got, err := s.ForPlayer("did:plc:bob")
+	if err != nil {
+		t.Fatalf("ForPlayer: %v", err)
+	}
+	if len(got) != n {
+		t.Fatalf("expected %d distinct challenges after concurrent adds, got %d", n, len(got))
+	}
+}
+
+func sqlSafeRkey(i int) string {
+	return "rkey-" + string(rune('a'+i%26)) + string(rune('0'+i/26))
 }
 
 func TestFromChallengeRecord(t *testing.T) {
@@ -147,5 +575,33 @@ func TestFromChallengeRecord_DefaultsWhenTimestampsMissing(t *testing.T) {
 	}
 	if !pc.ExpiresAt.Equal(pc.CreatedAt.Add(24 * time.Hour)) {
 		t.Errorf("expected ExpiresAt to default to CreatedAt+24h, got created=%v expires=%v", pc.CreatedAt, pc.ExpiresAt)
+	}
+}
+
+func TestBuildChallengeURI(t *testing.T) {
+	got := BuildChallengeURI("did:plc:alice", "abc123")
+	want := "at://did:plc:alice/app.atchess.challenge/abc123"
+	if got != want {
+		t.Errorf("BuildChallengeURI = %q, want %q", got, want)
+	}
+}
+
+// ensure sql.ErrNoRows itself never leaks out of ForPlayer as a
+// success-shaped "no error" -- sanity check that ForPlayer's error
+// handling doesn't accidentally treat a driver sentinel as "no rows found,
+// return empty" when it doesn't apply to a multi-row Query in the first
+// place (defensive; ForPlayer uses Query, not QueryRow, so this should
+// never trigger, but pins the assumption explicitly).
+func TestStore_ForPlayer_EmptyIsNotAnError(t *testing.T) {
+	s, _ := newTestStore(t)
+	got, err := s.ForPlayer("did:plc:nobody-has-challenged-this-did")
+	if err != nil {
+		t.Fatalf("expected no error for a DID with zero challenges, got %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("expected empty result, got %d", len(got))
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		t.Fatal("ForPlayer must never return sql.ErrNoRows for an empty result")
 	}
 }

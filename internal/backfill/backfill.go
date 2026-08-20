@@ -283,7 +283,23 @@ func (b *Backfiller) backfillHost(ctx context.Context, base, userDID string) Hos
 		hr.ReposScanned++
 
 		for _, pc := range found {
-			if b.store.Add(pc) {
+			added, err := b.store.Add(pc)
+			if err != nil {
+				// Mirrors the per-repo listChallengesForRepo failure handling
+				// just above: one challenge failing to index into the local
+				// store is logged and skipped, not fatal to the rest of this
+				// host's backfill -- a single storage hiccup for one record
+				// must not abort discovery of every other challenge on this
+				// host. This is distinct from a QUERY failure (see
+				// internal/web.Service.GetChallengeNotificationsHandler),
+				// which must surface as an error rather than being
+				// swallowed: this is a best-effort write path that other
+				// ingestion paths (firehose, a future backfill run) can
+				// still repair.
+				b.logger.Warn().Err(err).Str("host", base).Str("repo", repoDID).Str("uri", pc.ChallengeURI).Msg("login backfill: failed to index challenge into store")
+				continue
+			}
+			if added {
 				hr.ChallengesFound++
 			}
 		}

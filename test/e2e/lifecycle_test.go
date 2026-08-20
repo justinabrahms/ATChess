@@ -50,10 +50,10 @@ func TestFullGameLifecycle(t *testing.T) {
 	t.Logf("Challenge created: URI=%s, ProposedGameID=%s", ch.ID, ch.ProposedGameId)
 
 	// --- Step 3: Index the challenge locally (simulating server behavior) ---
-	store := challenge.NewStore()
+	store := newTestChallengeStore(t)
 	createdAt, _ := time.Parse(time.RFC3339, ch.CreatedAt)
 	expiresAt, _ := time.Parse(time.RFC3339, ch.ExpiresAt)
-	added := store.Add(&challenge.PendingChallenge{
+	added, err := store.Add(&challenge.PendingChallenge{
 		ChallengeURI:     ch.ID,
 		ChallengerDID:    ch.Challenger,
 		ChallengerHandle: env.aliceHandle,
@@ -64,11 +64,13 @@ func TestFullGameLifecycle(t *testing.T) {
 		CreatedAt:        createdAt,
 		ExpiresAt:        expiresAt,
 	})
+	require.NoError(t, err)
 	assert.True(t, added, "Challenge should be indexed successfully")
 
 	// --- Step 4: Bob discovers the challenge ---
 	t.Log("--- Discovery Phase ---")
-	pending := store.ForPlayer(bobDID)
+	pending, err := store.ForPlayer(bobDID)
+	require.NoError(t, err)
 	require.Len(t, pending, 1, "Bob should see exactly one pending challenge")
 
 	discovered := pending[0]
@@ -87,8 +89,8 @@ func TestFullGameLifecycle(t *testing.T) {
 
 	game, err := bobClient.CreateGameFromChallenge(
 		context.Background(),
-		aliceDID,       // opponent is Alice
-		"black",        // Bob plays black (Alice chose white)
+		aliceDID, // opponent is Alice
+		"black",  // Bob plays black (Alice chose white)
 		discovered.ProposedGameID,
 		challengeURI,
 		challengeCID,
@@ -101,8 +103,10 @@ func TestFullGameLifecycle(t *testing.T) {
 	t.Logf("Game created: %s", game.ID)
 
 	// Remove accepted challenge from store
-	store.Remove(challengeURI)
-	assert.Empty(t, store.ForPlayer(bobDID), "No more pending challenges for Bob")
+	require.NoError(t, store.Remove(challengeURI))
+	remainingForBob, err := store.ForPlayer(bobDID)
+	require.NoError(t, err)
+	assert.Empty(t, remainingForBob, "No more pending challenges for Bob")
 
 	// --- Step 6: Play Scholar's Mate (e4 e5 Bc4 Nc6 Qh5 Nf6 Qxf7#) ---
 	t.Log("--- Move Phase: Scholar's Mate ---")

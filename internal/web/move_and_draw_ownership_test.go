@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/justinabrahms/atchess/internal/atproto"
-	"github.com/justinabrahms/atchess/internal/challenge"
 	"github.com/justinabrahms/atchess/internal/config"
 	"github.com/justinabrahms/atchess/internal/oauth"
 )
@@ -245,7 +244,7 @@ func TestMakeMoveHandler_NonOwnerMove_NoCrossRepoWriteAttempted(t *testing.T) {
 
 	svc := &Service{
 		config:         &config.Config{ATProto: config.ATProtoConfig{PLCDirectoryURL: srv.URL}},
-		challengeStore: challenge.NewStore(),
+		challengeStore: newTestChallengeStore(t),
 	}
 
 	session := &oauth.Session{
@@ -330,7 +329,7 @@ func TestRespondToDrawHandler_NonOwnerAccept_NoCrossRepoWriteAttempted(t *testin
 
 	svc := &Service{
 		config:         &config.Config{ATProto: config.ATProtoConfig{PLCDirectoryURL: srv.URL}},
-		challengeStore: challenge.NewStore(),
+		challengeStore: newTestChallengeStore(t),
 	}
 
 	session := &oauth.Session{
@@ -418,7 +417,7 @@ func TestMakeMoveHandler_TerminalGame_MoveRejected(t *testing.T) {
 
 	svc := &Service{
 		config:         &config.Config{ATProto: config.ATProtoConfig{PLCDirectoryURL: srv.URL}},
-		challengeStore: challenge.NewStore(),
+		challengeStore: newTestChallengeStore(t),
 	}
 
 	session := &oauth.Session{
@@ -495,7 +494,7 @@ func TestMakeMoveHandler_IncompleteDerivation_MoveRejected(t *testing.T) {
 
 	svc := &Service{
 		config:         &config.Config{ATProto: config.ATProtoConfig{PLCDirectoryURL: srv.URL}},
-		challengeStore: challenge.NewStore(),
+		challengeStore: newTestChallengeStore(t),
 	}
 
 	session := &oauth.Session{

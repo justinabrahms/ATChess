@@ -4,6 +4,7 @@ package e2e
 
 import (
 	"context"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -13,6 +14,18 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// newTestChallengeStore opens a fresh, file-backed challenge.Store under
+// t.TempDir() (never a shared/global DB across tests -- see
+// atchess-1c9.50's brief). Shared by every e2e test file in this package
+// that needs to simulate the protocol service's local challenge index.
+func newTestChallengeStore(t *testing.T) *challenge.Store {
+	t.Helper()
+	s, err := challenge.NewStore(filepath.Join(t.TempDir(), "challenges.db"))
+	require.NoError(t, err, "challenge.NewStore")
+	t.Cleanup(func() { _ = s.Close() })
+	return s
+}
 
 // TestChallengeCreate tests that Alice can create a challenge directed at Bob.
 func TestChallengeCreate(t *testing.T) {
@@ -57,10 +70,10 @@ func TestChallengeDiscoverViaStore(t *testing.T) {
 
 	// Simulate the protocol service indexing the challenge in the store
 	// (this is what CreateChallengeHandler does in internal/web/service.go)
-	store := challenge.NewStore()
+	store := newTestChallengeStore(t)
 	createdAt, _ := time.Parse(time.RFC3339, ch.CreatedAt)
 	expiresAt, _ := time.Parse(time.RFC3339, ch.ExpiresAt)
-	added := store.Add(&challenge.PendingChallenge{
+	added, err := store.Add(&challenge.PendingChallenge{
 		ChallengeURI:     ch.ID,
 		ChallengerDID:    ch.Challenger,
 		ChallengerHandle: aliceClient.GetHandle(),
@@ -71,10 +84,12 @@ func TestChallengeDiscoverViaStore(t *testing.T) {
 		CreatedAt:        createdAt,
 		ExpiresAt:        expiresAt,
 	})
+	require.NoError(t, err)
 	require.True(t, added, "challenge should be added to store")
 
 	// Bob queries for his challenges
-	pending := store.ForPlayer(bobClient.GetDID())
+	pending, err := store.ForPlayer(bobClient.GetDID())
+	require.NoError(t, err)
 	require.Len(t, pending, 1, "Bob should see exactly one pending challenge")
 
 	found := pending[0]
@@ -85,7 +100,8 @@ func TestChallengeDiscoverViaStore(t *testing.T) {
 	assert.Equal(t, "Game on!", found.Message)
 
 	// Alice should NOT see the challenge as a challenged player
-	alicePending := store.ForPlayer(aliceClient.GetDID())
+	alicePending, err := store.ForPlayer(aliceClient.GetDID())
+	require.NoError(t, err)
 	assert.Empty(t, alicePending, "Alice should not see challenges directed at Bob")
 
 	t.Logf("Bob discovered challenge: %s from %s", found.ChallengeURI, found.ChallengerHandle)
@@ -109,10 +125,10 @@ func TestChallengeAcceptCreatesGame(t *testing.T) {
 	t.Logf("Challenge created: %s", ch.ID)
 
 	// Step 2: Index in store and Bob discovers it
-	store := challenge.NewStore()
+	store := newTestChallengeStore(t)
 	createdAt, _ := time.Parse(time.RFC3339, ch.CreatedAt)
 	expiresAt, _ := time.Parse(time.RFC3339, ch.ExpiresAt)
-	store.Add(&challenge.PendingChallenge{
+	_, err = store.Add(&challenge.PendingChallenge{
 		ChallengeURI:     ch.ID,
 		ChallengerDID:    ch.Challenger,
 		ChallengerHandle: aliceClient.GetHandle(),
@@ -123,8 +139,10 @@ func TestChallengeAcceptCreatesGame(t *testing.T) {
 		CreatedAt:        createdAt,
 		ExpiresAt:        expiresAt,
 	})
+	require.NoError(t, err)
 
-	pending := store.ForPlayer(bobClient.GetDID())
+	pending, err := store.ForPlayer(bobClient.GetDID())
+	require.NoError(t, err)
 	require.Len(t, pending, 1)
 	found := pending[0]
 
@@ -133,7 +151,7 @@ func TestChallengeAcceptCreatesGame(t *testing.T) {
 	game, err := bobClient.CreateGameFromChallenge(
 		context.Background(),
 		aliceClient.GetDID(), // opponent
-		"black",             // Bob's color
+		"black",              // Bob's color
 		found.ProposedGameID,
 		found.ChallengeURI,
 		"", // CID not strictly needed for game creation
@@ -146,8 +164,9 @@ func TestChallengeAcceptCreatesGame(t *testing.T) {
 	assert.Contains(t, game.FEN, "rnbqkbnr", "should have starting position")
 
 	// Step 4: Remove from store after acceptance
-	store.Remove(found.ChallengeURI)
-	remaining := store.ForPlayer(bobClient.GetDID())
+	require.NoError(t, store.Remove(found.ChallengeURI))
+	remaining, err := store.ForPlayer(bobClient.GetDID())
+	require.NoError(t, err)
 	assert.Empty(t, remaining, "challenge should be removed after acceptance")
 
 	t.Logf("Game created from challenge: %s (white=%s, black=%s)", game.ID, game.White, game.Black)
@@ -169,10 +188,10 @@ func TestChallengeDeclineNoGame(t *testing.T) {
 	require.NoError(t, err)
 
 	// Index in store
-	store := challenge.NewStore()
+	store := newTestChallengeStore(t)
 	createdAt, _ := time.Parse(time.RFC3339, ch.CreatedAt)
 	expiresAt, _ := time.Parse(time.RFC3339, ch.ExpiresAt)
-	store.Add(&challenge.PendingChallenge{
+	_, err = store.Add(&challenge.PendingChallenge{
 		ChallengeURI:     ch.ID,
 		ChallengerDID:    ch.Challenger,
 		ChallengerHandle: aliceClient.GetHandle(),
@@ -183,16 +202,19 @@ func TestChallengeDeclineNoGame(t *testing.T) {
 		CreatedAt:        createdAt,
 		ExpiresAt:        expiresAt,
 	})
+	require.NoError(t, err)
 
 	// Bob discovers the challenge
-	pending := store.ForPlayer(bobClient.GetDID())
+	pending, err := store.ForPlayer(bobClient.GetDID())
+	require.NoError(t, err)
 	require.Len(t, pending, 1)
 
-	// Bob declines — simply remove from store, do NOT create a game
-	store.Remove(ch.ID)
+	// Bob declines — simply mark declined in the store, do NOT create a game
+	require.NoError(t, store.Remove(ch.ID))
 
 	// Verify challenge is gone
-	remaining := store.ForPlayer(bobClient.GetDID())
+	remaining, err := store.ForPlayer(bobClient.GetDID())
+	require.NoError(t, err)
 	assert.Empty(t, remaining, "declined challenge should be removed")
 
 	// Verify no game was created (Bob never called CreateGameFromChallenge)
@@ -261,23 +283,26 @@ func TestChallengeNonexistentDID(t *testing.T) {
 	assert.Equal(t, "pending", ch.Status)
 
 	// The challenge exists but nobody will ever discover it
-	store := challenge.NewStore()
+	store := newTestChallengeStore(t)
 	createdAt, _ := time.Parse(time.RFC3339, ch.CreatedAt)
 	expiresAt, _ := time.Parse(time.RFC3339, ch.ExpiresAt)
-	store.Add(&challenge.PendingChallenge{
+	_, err = store.Add(&challenge.PendingChallenge{
 		ChallengeURI:  ch.ID,
 		ChallengerDID: ch.Challenger,
 		ChallengedDID: ch.Challenged,
 		CreatedAt:     createdAt,
 		ExpiresAt:     expiresAt,
 	})
+	require.NoError(t, err)
 
 	// Nobody with that DID will query — the challenge just expires
-	pending := store.ForPlayer(fakeDID)
+	pending, err := store.ForPlayer(fakeDID)
+	require.NoError(t, err)
 	assert.Len(t, pending, 1, "challenge should exist in store even for fake DID")
 
 	// No real player sees it
-	pending = store.ForPlayer(aliceClient.GetDID())
+	pending, err = store.ForPlayer(aliceClient.GetDID())
+	require.NoError(t, err)
 	assert.Empty(t, pending, "Alice should not see her own outgoing challenge")
 
 	t.Logf("Challenge to nonexistent DID handled gracefully: %s", ch.ID)
@@ -297,7 +322,7 @@ func TestChallengeStoreDedup(t *testing.T) {
 	ch, err := aliceClient.CreateChallenge(context.Background(), bobClient.GetDID(), "white", "")
 	require.NoError(t, err)
 
-	store := challenge.NewStore()
+	store := newTestChallengeStore(t)
 	createdAt, _ := time.Parse(time.RFC3339, ch.CreatedAt)
 	expiresAt, _ := time.Parse(time.RFC3339, ch.ExpiresAt)
 	pc := &challenge.PendingChallenge{
@@ -308,39 +333,48 @@ func TestChallengeStoreDedup(t *testing.T) {
 		ExpiresAt:     expiresAt,
 	}
 
-	assert.True(t, store.Add(pc), "first add should succeed")
-	assert.False(t, store.Add(pc), "duplicate add should be rejected")
+	firstAdd, err := store.Add(pc)
+	require.NoError(t, err)
+	assert.True(t, firstAdd, "first add should succeed")
+	secondAdd, err := store.Add(pc)
+	require.NoError(t, err)
+	assert.False(t, secondAdd, "duplicate add should be rejected")
 
-	pending := store.ForPlayer(bobClient.GetDID())
+	pending, err := store.ForPlayer(bobClient.GetDID())
+	require.NoError(t, err)
 	assert.Len(t, pending, 1, "Bob should see exactly one challenge, not a duplicate")
 }
 
 // TestChallengeExpiry verifies that expired challenges are not returned by ForPlayer.
 func TestChallengeExpiry(t *testing.T) {
-	store := challenge.NewStore()
+	store := newTestChallengeStore(t)
 
 	// Add a challenge that already expired
-	store.Add(&challenge.PendingChallenge{
+	_, err := store.Add(&challenge.PendingChallenge{
 		ChallengeURI:  "at://did:plc:test/app.atchess.challenge/expired",
 		ChallengerDID: "did:plc:alice",
 		ChallengedDID: "did:plc:bob",
 		CreatedAt:     time.Now().Add(-48 * time.Hour),
 		ExpiresAt:     time.Now().Add(-24 * time.Hour), // expired yesterday
 	})
+	require.NoError(t, err)
 
 	// Add a valid challenge
-	store.Add(&challenge.PendingChallenge{
+	_, err = store.Add(&challenge.PendingChallenge{
 		ChallengeURI:  "at://did:plc:test/app.atchess.challenge/valid",
 		ChallengerDID: "did:plc:alice",
 		ChallengedDID: "did:plc:bob",
 		CreatedAt:     time.Now(),
 		ExpiresAt:     time.Now().Add(24 * time.Hour), // expires tomorrow
 	})
+	require.NoError(t, err)
 
-	pending := store.ForPlayer("did:plc:bob")
+	pending, err := store.ForPlayer("did:plc:bob")
+	require.NoError(t, err)
 	assert.Len(t, pending, 1, "only non-expired challenge should be returned")
 	assert.Equal(t, "at://did:plc:test/app.atchess.challenge/valid", pending[0].ChallengeURI)
 
-	pruned := store.PruneExpired()
+	pruned, err := store.PruneExpired()
+	require.NoError(t, err)
 	assert.Equal(t, 1, pruned, "one expired challenge should be pruned")
 }

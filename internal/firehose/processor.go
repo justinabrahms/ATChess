@@ -211,27 +211,54 @@ func (p *EventProcessor) processResignationEvent(ctx context.Context, event Even
 // atchess-1c9.46; the OFFLINE case -- a challenge issued while this
 // process wasn't running -- is instead covered by internal/backfill's
 // login-time repo-read backfill, not by the firehose) and indexes them
-// into the shared challenge.Store CACHE (never a write path -- see that
-// package's doc comment) so GET /api/challenge-notifications can serve
-// them without a repo round trip per request.
+// into the shared challenge.Store durable index (atchess-1c9.50) so
+// GET /api/challenge-notifications can serve them without a repo round
+// trip per request, and independent of how long this process was down.
+//
+// A "delete" op (event.Action == "delete") carries no record body at all
+// -- the challenge was removed from the challenger's repo -- so it is
+// handled separately via challenge.Store.MarkRemoved rather than
+// challenge.FromChallengeRecord, which requires record fields a delete op
+// does not have.
 func (p *EventProcessor) processChallengeEvent(ctx context.Context, event Event) error {
+	rkey := strings.TrimPrefix(event.Path, "app.atchess.challenge/")
+
+	if event.Action == "delete" {
+		if p.challengeStore != nil {
+			uri := challenge.BuildChallengeURI(event.Repo, rkey)
+			if err := p.challengeStore.MarkRemoved(uri, event.Repo, ""); err != nil {
+				log.Error().Err(err).Str("uri", uri).Msg("Failed to mark deleted challenge as removed in index")
+				return fmt.Errorf("marking challenge %s removed: %w", uri, err)
+			}
+			log.Info().Str("repo", event.Repo).Str("path", event.Path).Msg("Marked deleted challenge as removed in index")
+		}
+		return nil
+	}
+
 	record, ok := event.Record.(map[string]interface{})
 	if !ok {
 		return fmt.Errorf("invalid challenge record format")
 	}
 
-	rkey := strings.TrimPrefix(event.Path, "app.atchess.challenge/")
-
-	// Index the challenge so the challenged player can discover it
+	// Index the challenge so the challenged player can discover it. A
+	// failure here is logged AND returned (rather than swallowed): the
+	// caller (firehose.Client) logs it too and continues processing
+	// subsequent events, but this record's own indexing failure must not
+	// look identical to a successfully-processed event -- see
+	// internal/challenge.Store's doc comment on never letting a storage
+	// failure degrade into a confidently-wrong "no challenges" answer.
 	if p.challengeStore != nil {
 		pending := challenge.FromChallengeRecord(event.Repo, rkey, event.CID, record)
-		p.challengeStore.Add(pending)
+		if _, err := p.challengeStore.Add(pending); err != nil {
+			log.Error().Err(err).Str("uri", pending.ChallengeURI).Msg("Failed to index challenge from firehose")
+			return fmt.Errorf("indexing challenge %s: %w", pending.ChallengeURI, err)
+		}
 	}
 
 	// Notify challenged player via WebSocket, for clients connected right
-	// now (this is purely a UX nicety layered on top of the Store cache
-	// above -- GET /api/challenge-notifications does not depend on it, so a
-	// dropped WebSocket message is not a delivery failure).
+	// now (this is purely a UX nicety layered on top of the Store above --
+	// GET /api/challenge-notifications does not depend on it, so a dropped
+	// WebSocket message is not a delivery failure).
 	challengedDID, _ := record["challenged"].(string)
 	if challengedDID != "" {
 		update := web.GameUpdate{

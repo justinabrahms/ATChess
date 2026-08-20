@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -14,6 +15,18 @@ import (
 	"github.com/justinabrahms/atchess/internal/challenge"
 	"github.com/rs/zerolog"
 )
+
+// newTestChallengeStore opens a fresh, file-backed challenge.Store under
+// t.TempDir() (never a shared/global DB across tests).
+func newTestChallengeStore(t *testing.T) *challenge.Store {
+	t.Helper()
+	s, err := challenge.NewStore(filepath.Join(t.TempDir(), "challenges.db"))
+	if err != nil {
+		t.Fatalf("challenge.NewStore: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+	return s
+}
 
 const (
 	aliceDID = "did:plc:alice"
@@ -91,7 +104,7 @@ func TestBackfillChallengesForUser_FindsChallengeAddressedToUser(t *testing.T) {
 	})
 	defer server.Close()
 
-	store := challenge.NewStore()
+	store := newTestChallengeStore(t)
 	b := New(store, zerolog.Nop())
 
 	result := b.BackfillChallengesForUser(context.Background(), bobDID, []string{wsURLFor(server.URL)})
@@ -100,7 +113,10 @@ func TestBackfillChallengesForUser_FindsChallengeAddressedToUser(t *testing.T) {
 		t.Fatalf("expected 1 challenge found, got %d (hosts: %+v)", result.TotalFound(), result.Hosts)
 	}
 
-	pending := store.ForPlayer(bobDID)
+	pending, err := store.ForPlayer(bobDID)
+	if err != nil {
+		t.Fatalf("ForPlayer: %v", err)
+	}
 	if len(pending) != 1 {
 		t.Fatalf("expected 1 pending challenge indexed for bob, got %d", len(pending))
 	}
@@ -117,7 +133,7 @@ func TestBackfillChallengesForUser_IgnoresChallengesAddressedToSomeoneElse(t *te
 	})
 	defer server.Close()
 
-	store := challenge.NewStore()
+	store := newTestChallengeStore(t)
 	b := New(store, zerolog.Nop())
 
 	result := b.BackfillChallengesForUser(context.Background(), bobDID, []string{wsURLFor(server.URL)})
@@ -125,7 +141,11 @@ func TestBackfillChallengesForUser_IgnoresChallengesAddressedToSomeoneElse(t *te
 	if result.TotalFound() != 0 {
 		t.Fatalf("expected 0 challenges found for bob, got %d", result.TotalFound())
 	}
-	if got := store.ForPlayer(bobDID); len(got) != 0 {
+	got, err := store.ForPlayer(bobDID)
+	if err != nil {
+		t.Fatalf("ForPlayer: %v", err)
+	}
+	if len(got) != 0 {
 		t.Errorf("expected no pending challenges for bob, got %d", len(got))
 	}
 }
@@ -140,7 +160,7 @@ func TestBackfillChallengesForUser_MultipleHosts(t *testing.T) {
 	})
 	defer serverB.Close()
 
-	store := challenge.NewStore()
+	store := newTestChallengeStore(t)
 	b := New(store, zerolog.Nop())
 
 	result := b.BackfillChallengesForUser(context.Background(), bobDID, []string{wsURLFor(serverA.URL), wsURLFor(serverB.URL)})
@@ -159,16 +179,18 @@ func TestBackfillChallengesForUser_DedupesAgainstAlreadyIndexedChallenge(t *test
 	})
 	defer server.Close()
 
-	store := challenge.NewStore()
+	store := newTestChallengeStore(t)
 	// Pre-seed the store with the same challenge (as if the live firehose
 	// subscription had already indexed it) to prove Store.Add's dedup
 	// prevents double counting.
-	store.Add(&challenge.PendingChallenge{
+	if _, err := store.Add(&challenge.PendingChallenge{
 		ChallengeURI:  fmt.Sprintf("at://%s/app.atchess.challenge/challenge1", aliceDID),
 		ChallengerDID: aliceDID,
 		ChallengedDID: bobDID,
 		ExpiresAt:     time.Now().Add(time.Hour),
-	})
+	}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
 
 	b := New(store, zerolog.Nop())
 	result := b.BackfillChallengesForUser(context.Background(), bobDID, []string{wsURLFor(server.URL)})
@@ -176,7 +198,11 @@ func TestBackfillChallengesForUser_DedupesAgainstAlreadyIndexedChallenge(t *test
 	if result.TotalFound() != 0 {
 		t.Errorf("expected 0 NEWLY found challenges (already indexed), got %d", result.TotalFound())
 	}
-	if got := store.ForPlayer(bobDID); len(got) != 1 {
+	got, err := store.ForPlayer(bobDID)
+	if err != nil {
+		t.Fatalf("ForPlayer: %v", err)
+	}
+	if len(got) != 1 {
 		t.Errorf("expected exactly 1 pending challenge for bob (no duplicate), got %d", len(got))
 	}
 }
@@ -187,7 +213,7 @@ func TestBackfillChallengesForUser_UnreachableHost_DoesNotErrorOtherHosts(t *tes
 	})
 	defer server.Close()
 
-	store := challenge.NewStore()
+	store := newTestChallengeStore(t)
 	b := New(store, zerolog.Nop())
 
 	// A bogus host (connection refused) alongside a working one: the
@@ -268,7 +294,7 @@ func TestBackfillChallengesForUser_WedgedHost_DoesNotStarveOtherHosts(t *testing
 	})
 	defer workingServer.Close()
 
-	store := challenge.NewStore()
+	store := newTestChallengeStore(t)
 	b := New(store, zerolog.Nop())
 	// A short per-host timeout keeps this test fast while still exercising
 	// the real mechanism (BackfillChallengesForUser bounds EVERY host to
@@ -329,7 +355,7 @@ func TestBackfillChallengesForUser_CapsRepoEnumeration(t *testing.T) {
 	server := newMockPDS(t, repos)
 	defer server.Close()
 
-	store := challenge.NewStore()
+	store := newTestChallengeStore(t)
 	b := New(store, zerolog.Nop())
 	b.maxReposPerHost = 2 // force capping well below the 5 repos present
 
@@ -353,7 +379,7 @@ func TestBackfillChallengesForUser_ContextDeadlineExceeded_ReturnsPartialResults
 	})
 	defer server.Close()
 
-	store := challenge.NewStore()
+	store := newTestChallengeStore(t)
 	b := New(store, zerolog.Nop())
 
 	ctx, cancel := context.WithTimeout(context.Background(), 0) // already expired

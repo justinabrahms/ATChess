@@ -58,7 +58,21 @@ func main() {
 	go hub.Run()
 
 	// Create challenge store for cross-federation challenge discovery
-	challengeStore := challenge.NewStore()
+	// (atchess-1c9.50): a durable, SQLite-backed index keyed by challenged
+	// DID, so a challenge issued while this process was down -- even past
+	// a relay's retention window -- is still discoverable once the
+	// firehose subscription or the login backfill catches up. See
+	// internal/challenge.Store's doc comment and
+	// docs/firehose-and-backfill.md.
+	challengeStore, err := challenge.NewStore(cfg.Challenge.DBPath)
+	if err != nil {
+		log.Fatal().Err(err).Str("dbPath", cfg.Challenge.DBPath).Msg("Failed to open challenge store")
+	}
+	defer func() {
+		if err := challengeStore.Close(); err != nil {
+			log.Error().Err(err).Msg("Failed to close challenge store cleanly")
+		}
+	}()
 
 	// Create service
 	service := web.NewService(client, cfg, challengeStore)

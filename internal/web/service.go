@@ -473,7 +473,12 @@ func (s *Service) CreateChallengeHandler(w http.ResponseWriter, r *http.Request)
 	if s.challengeStore != nil {
 		createdAt, _ := time.Parse(time.RFC3339, ch.CreatedAt)
 		expiresAt, _ := time.Parse(time.RFC3339, ch.ExpiresAt)
-		s.challengeStore.Add(&challenge.PendingChallenge{
+		// Logged, not fatal to this request: the AT Protocol write above
+		// already succeeded (that record is the actual source of truth),
+		// and the firehose subscription / the challenged player's next
+		// login backfill will still index it even if this optimization
+		// fails.
+		if _, err := s.challengeStore.Add(&challenge.PendingChallenge{
 			ChallengeURI:     ch.ID,
 			ChallengerDID:    ch.Challenger,
 			ChallengerHandle: client.GetHandle(),
@@ -483,7 +488,9 @@ func (s *Service) CreateChallengeHandler(w http.ResponseWriter, r *http.Request)
 			ProposedGameID:   ch.ProposedGameId,
 			CreatedAt:        createdAt,
 			ExpiresAt:        expiresAt,
-		})
+		}); err != nil {
+			log.Error().Err(err).Str("challengeUri", ch.ID).Msg("Failed to index newly-created challenge into local store")
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -491,18 +498,35 @@ func (s *Service) CreateChallengeHandler(w http.ResponseWriter, r *http.Request)
 }
 
 // GetChallengeNotificationsHandler returns pending challenges addressed to
-// the authenticated caller, sourced from this instance's challenge.Store
-// cache (atchess-1c9.11) -- populated by internal/firehose.EventProcessor as
-// app.atchess.challenge commits arrive from every watched PDS, live and via
-// the startup backfill resubscribe (see cmd/protocol/main.go). There is no
-// remaining fallback to a per-repo notification record: that mechanism
-// (app.atchess.challengeNotification, written cross-repo) has been removed
-// entirely because AT Protocol never permitted the write it depended on to
-// succeed.
+// the authenticated caller, sourced from this instance's durable
+// challenge.Store index (atchess-1c9.50) -- populated by
+// internal/firehose.EventProcessor as app.atchess.challenge commits arrive
+// from every watched PDS, live and via the startup backfill resubscribe
+// (see cmd/protocol/main.go), and by internal/backfill's login-time
+// repo-read backfill. There is no remaining fallback to a per-repo
+// notification record: that mechanism (app.atchess.challengeNotification,
+// written cross-repo) has been removed entirely because AT Protocol never
+// permitted the write it depended on to succeed.
+//
+// challenge.Store.ForPlayer is keyed strictly by the DID passed in, and
+// AuthenticatedDID(r) is always the authenticated caller's own DID -- this
+// is the entire enforcement of "a user can only ever see challenges
+// addressed to them" (see TestGetChallengeNotifications_DoesNotLeakOtherPlayersChallenges).
+//
+// A store query failure is surfaced as a 500, NEVER silently mapped to an
+// empty list: an empty list is indistinguishable from "you really have no
+// pending challenges," and a storage failure must not masquerade as that
+// (atchess-1c9.51's rule; see challenge.Store's doc comment).
 func (s *Service) GetChallengeNotificationsHandler(w http.ResponseWriter, r *http.Request) {
 	var challenges []*challenge.PendingChallenge
 	if s.challengeStore != nil {
-		challenges = s.challengeStore.ForPlayer(AuthenticatedDID(r))
+		var err error
+		challenges, err = s.challengeStore.ForPlayer(AuthenticatedDID(r))
+		if err != nil {
+			log.Error().Err(err).Str("did", AuthenticatedDID(r)).Msg("Failed to query challenge index")
+			http.Error(w, "Failed to load challenge notifications", http.StatusInternalServerError)
+			return
+		}
 	}
 	w.Header().Set("Content-Type", "application/json")
 	if challenges == nil {
@@ -554,8 +578,14 @@ func (s *Service) DeclineChallengeHandler(w http.ResponseWriter, r *http.Request
 	}
 
 	authedDID := AuthenticatedDID(r)
+	callerChallenges, err := s.challengeStore.ForPlayer(authedDID)
+	if err != nil {
+		log.Error().Err(err).Str("did", authedDID).Msg("Failed to query challenge index")
+		http.Error(w, "Failed to load challenge notifications", http.StatusInternalServerError)
+		return
+	}
 	var target *challenge.PendingChallenge
-	for _, c := range s.challengeStore.ForPlayer(authedDID) {
+	for _, c := range callerChallenges {
 		if c.ChallengeURI == challengeURI {
 			target = c
 			break
@@ -577,7 +607,11 @@ func (s *Service) DeclineChallengeHandler(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	s.challengeStore.Remove(challengeURI)
+	if err := s.challengeStore.Remove(challengeURI); err != nil {
+		log.Error().Err(err).Str("challengeURI", challengeURI).Msg("Failed to record challenge decline in index")
+		http.Error(w, "Failed to decline challenge", http.StatusInternalServerError)
+		return
+	}
 
 	w.WriteHeader(http.StatusNoContent)
 }

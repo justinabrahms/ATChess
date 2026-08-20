@@ -2,12 +2,14 @@
 
 This document covers `FIREHOSE_URL`/`firehose.*` configuration, how ATChess
 avoids replaying a host's entire commit history on every restart
-(atchess-1c9.46), and exactly what the login-time challenge backfill can and
-cannot find. It exists because challenge delivery
-(`app.atchess.challenge`) depends on all of this working together: a
-challenge record only ever lives in its **challenger's own repo** (AT
-Protocol never permits writing into a repo that isn't your own), so the
-challenged player's own protocol-service instance has to go find it.
+(atchess-1c9.46), exactly what the login-time challenge backfill can and
+cannot find, and (atchess-1c9.50) the durable, SQLite-backed challenge index
+("AppView") both feed into and `GET /api/challenge-notifications` serves
+from. It exists because challenge delivery (`app.atchess.challenge`)
+depends on all of this working together: a challenge record only ever lives
+in its **challenger's own repo** (AT Protocol never permits writing into a
+repo that isn't your own), so the challenged player's own protocol-service
+instance has to go find it.
 
 ## `FIREHOSE_ENABLED` / `FIREHOSE_URL`
 
@@ -164,9 +166,96 @@ user.
   scale, and does not claim to.
 
 If you need that general case, it requires a separate indexing service
-(consuming the relevant firehose ahead of time and maintaining a
-`challenged DID -> challenge records` index) -- out of scope for this
-mechanism.
+consuming the relevant firehose ahead of time and maintaining a `challenged
+DID -> challenge records` index. atchess-1c9.50, covered next, builds
+exactly that -- read it before assuming it solves the production-scale
+problem above, because it does not.
+
+## The challenge index (AppView): what's discoverable now, and what still isn't (atchess-1c9.50)
+
+Everything above this section (the firehose subscription and the login
+backfill) are the two *ingestion* paths. Historically, this project had no
+durable *query* side: `internal/challenge.Store` was an in-memory cache, so
+"who has challenged me" was only ever answerable for however long this
+process happened to have been running continuously, and a decline could be
+un-done by a restart (atchess-1c9.47). atchess-1c9.50 replaced that cache
+with a durable, SQLite-backed index (`internal/challenge.Store`, one file
+on the same box -- see `challenge.db_path` / `CHALLENGE_DB_PATH`, following
+the exact same "no separate database server" pattern as
+`FIREHOSE_STATE_DIR` above; the driver is `modernc.org/sqlite`, a pure-Go,
+cgo-free implementation, specifically because this project builds with
+`CGO_ENABLED=0`). This is what every real AT Protocol app does to answer
+"who wrote a record addressed to me": bsky.app itself is an AppView over
+the same protocol.
+
+Both ingestion paths above write into this same index, idempotently: the
+firehose subscription's `EventProcessor` on every `create`/`update` (and,
+new in atchess-1c9.50, `delete` -- a challenge record removed from the
+challenger's repo is tombstoned rather than left to linger as open), and
+the login backfill on every repo it reads. Replaying the same event, or
+re-running the backfill, can never duplicate a row or resurrect a
+previously-declined or previously-removed challenge (`Store.Add`'s `ON
+CONFLICT(uri) DO NOTHING` combined with a `status` column that a decline or
+a delete sets and a later replay never overwrites) -- this is the
+atchess-1c9.47 regression, closed for good now that the data lives in a
+file survivable across a restart rather than in memory.
+
+**What this makes newly discoverable**: a challenge issued while THIS
+instance was down -- including for *longer than a relay's ~72h retention
+window*, the exact gap atchess-1c9.50 exists to close -- is discoverable
+once either (a) this instance's firehose subscription resumes (from its
+persisted cursor, or via the login backfill) and observes it, or (b) a
+login backfill run actually reads the challenger's repo and finds it. Once
+either of those has happened even once, the challenge is in the index
+permanently (until declined, removed, or pruned as expired), queryable in
+constant time by `GET /api/challenge-notifications`, independent of
+whether this process has restarted since, or how long ago the ingestion
+happened.
+
+**What remains genuinely undiscoverable, stated plainly -- do not read
+atchess-1c9.50 as having solved general network-wide discovery, because it
+has not**:
+
+1. **An AppView that was itself never running to see the event, and whose
+   backfill never covered it either, still has nothing.** If this specific
+   deployment was down (or not yet deployed) for the *entire* window during
+   which a challenge existed on the firehose -- longer than the relay's
+   retention floor -- **and** the challenger's repo falls outside backfill's
+   bounded, closed list of configured hosts (`FIREHOSE_URL`) by the time
+   anyone next logs in, there is no remaining path to that challenge. This
+   is not a defect specific to this implementation; it is the fundamental
+   limitation of *every* AT Protocol AppView: you can only index what you
+   actually observed live, or what you explicitly went and fetched. An
+   AppView cannot retroactively see an event it was never subscribed for
+   and never backfilled.
+2. **Backfill's scale limits are unchanged by the index existing.** The
+   index is only ever as complete as what its two ingestion paths actually
+   fed it. Backfill is still bounded to the same closed, explicitly
+   configured `FIREHOSE_URL` host list, and still capped per host at
+   `defaultMaxReposPerHost` (2000) repos -- see the section above. A
+   challenger on a PDS this deployment has never configured, or buried past
+   the cap on a host that size, is not found by backfill, and therefore
+   never enters the index via that path either. Adding the durable index
+   did not add a way to discover challengers outside this deployment's
+   configured, bounded view of the network.
+3. **This is not a general-purpose, network-wide `app.atchess.challenge`
+   AppView.** It indexes exactly what this deployment's own two ingestion
+   paths (a specific, operator-configured list of watched PDS/relay
+   endpoints, plus a bounded backfill against that same list) have actually
+   seen -- nothing more. A stranger on a PDS never configured into
+   `FIREHOSE_URL`, challenging a user of this deployment, is invisible to
+   both mechanisms and therefore to the index, regardless of how long the
+   challenge has existed or how long this process has been running.
+4. **What a user should actually do about an undiscovered challenge**: ask
+   the challenger to re-send it -- a fresh `create` commit is immediately
+   visible to a live firehose subscription that is currently up and
+   watching the challenger's host. If you operate this deployment, the
+   structural fix is adding the challenger's PDS host to `FIREHOSE_URL` (or
+   sitting behind a genuine network-wide relay, `wss://bsky.network/...`,
+   rather than a single PDS -- see above), so both the firehose subscription
+   and the login backfill start covering it going forward. There is no
+   retroactive fix for a challenge from a host this deployment was never
+   watching and never configured to backfill.
 
 ## Jetstream transport (atchess-1c9.49): connecting to a public instance, and the live-verified numbers
 
