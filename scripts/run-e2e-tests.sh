@@ -1,73 +1,67 @@
 #!/bin/bash
 
-# End-to-end test runner for ATChess
-# This script runs the full e2e test suite with proper service orchestration
+# End-to-end test runner for ATChess.
+#
+# atchess-1c9.26: the legacy single-PDS e2e suite (localhost:3000,
+# player1.test/player2.test) was retired. The remaining test/e2e/*.go tests
+# (ownership_test.go, federation_test.go, challenge_delivery_test.go) build
+# on test/harness, which spins up its own protocol-service instances per
+# test and talks to the dual-PDS local harness stack
+# (alice.test@https://alice.pds.test, bob.test@https://bob.pds.test)
+# started via 'make test-federation-up'/'make test-federation-up-ci'. This
+# script only preflights that stack; it does not start or stop it.
 
 set -e
 
 echo "🧪 Running ATChess End-to-End Tests"
 echo "=================================="
 
-# Check if PDS is running
-if ! curl -f -s http://localhost:3000/xrpc/com.atproto.server.describeServer >/dev/null 2>&1; then
-    echo "❌ PDS is not running. Please start it first:"
-    echo "   docker-compose up -d"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+ACCOUNTS_FILE="$REPO_ROOT/test/.harness-accounts.json"
+PDS_A_URL="${PDS_A_URL:-https://alice.pds.test}"
+PDS_B_URL="${PDS_B_URL:-https://bob.pds.test}"
+DUAL_PDS_CACERT="${DUAL_PDS_CACERT:-$REPO_ROOT/certs/dual-pds/ca.pem}"
+
+fail_with_remedy() {
+    echo "❌ $1" >&2
+    echo "   Start the dual-PDS harness stack first:" >&2
+    echo "   make test-federation-up-ci" >&2
     exit 1
+}
+
+CURL_CA_ARGS=()
+if [ -f "$DUAL_PDS_CACERT" ]; then
+    CURL_CA_ARGS=(--cacert "$DUAL_PDS_CACERT")
 fi
 
-echo "✅ PDS is running"
+echo "🔍 Checking dual-PDS harness preconditions..."
 
-# Check if protocol service is running
-if ! curl -f -s http://localhost:8080/api/health >/dev/null 2>&1; then
-    echo "❌ Protocol service is not running. Please start it first:"
-    echo "   make run-protocol"
-    exit 1
+if [ ! -f "$ACCOUNTS_FILE" ]; then
+    fail_with_remedy "Harness account data not found at $ACCOUNTS_FILE."
 fi
+echo "✅ Harness account data found"
 
-echo "✅ Protocol service is running"
-
-# Verify test accounts exist
-echo "🔍 Verifying test accounts..."
-
-# Test player1.test login
-if ! curl -f -s -X POST http://localhost:3000/xrpc/com.atproto.server.createSession \
-    -H "Content-Type: application/json" \
-    -d '{"identifier": "player1.test", "password": "player1pass"}' >/dev/null 2>&1; then
-    echo "❌ player1.test account not found. Please create test accounts:"
-    echo "   ./scripts/create-test-accounts.sh"
-    exit 1
+if ! curl -f -s "${CURL_CA_ARGS[@]}" "$PDS_A_URL/xrpc/com.atproto.server.describeServer" >/dev/null 2>&1; then
+    fail_with_remedy "$PDS_A_URL is not answering."
 fi
+echo "✅ $PDS_A_URL is up"
 
-# Test player2.test login
-if ! curl -f -s -X POST http://localhost:3000/xrpc/com.atproto.server.createSession \
-    -H "Content-Type: application/json" \
-    -d '{"identifier": "player2.test", "password": "player2pass"}' >/dev/null 2>&1; then
-    echo "❌ player2.test account not found. Please create test accounts:"
-    echo "   ./scripts/create-test-accounts.sh"
-    exit 1
+if ! curl -f -s "${CURL_CA_ARGS[@]}" "$PDS_B_URL/xrpc/com.atproto.server.describeServer" >/dev/null 2>&1; then
+    fail_with_remedy "$PDS_B_URL is not answering."
 fi
-
-echo "✅ Test accounts verified"
+echo "✅ $PDS_B_URL is up"
 
 # Run the e2e tests
 echo ""
 echo "🚀 Running end-to-end tests..."
 echo ""
 
-# Run with verbose output and race detection
-go test -v -race -tags=e2e -timeout 60s ./test/e2e/...
+# Run with verbose output and race detection. Federated tests poll across
+# two PDSes and spin up protocol-service instances per test, so this needs
+# considerably more headroom than a typical unit test timeout.
+go test -v -race -tags=e2e -timeout 20m ./test/e2e/...
 
 echo ""
 echo "🎉 All end-to-end tests completed successfully!"
-echo ""
-echo "📋 Test Summary:"
-echo "   ✅ Full game lifecycle (challenge → accept → moves → checkmate)"
-echo "   ✅ Fool's mate (white wins): e4 e5 Qh5 Ke7 Qxe5#"
-echo "   ✅ Scholar's mate variant (black wins): g4 e5 f4 Qh4#"
-echo "   ✅ REST API endpoints tested"
-echo "   ✅ AT Protocol integration verified"
-echo ""
-echo "💡 Next steps:"
-echo "   - Run 'make run-web' to start the web interface"
-echo "   - Open http://localhost:8081 to play interactively"
-echo "   - Test with real moves on the visual chessboard"
