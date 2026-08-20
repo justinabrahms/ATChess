@@ -253,6 +253,26 @@ func startProtocolService(t *testing.T, binPath string, account Account, port in
 	// doc comment for what that sharing broke.
 	stateDir := filepath.Join(t.TempDir(), "firehose-state")
 
+	// CHALLENGE_DB_PATH (atchess-1c9.76): must be per-instance, for exactly
+	// the same reason as FIREHOSE_STATE_DIR above. internal/config.Load
+	// binds CHALLENGE_DB_PATH ahead of its own package default
+	// (./data/challenges.db, relative to the repo root -- see
+	// internal/challenge.NewStore's caller, cmd/protocol/main.go). Without
+	// a per-instance override here, every protocol-service instance this
+	// harness starts -- from every test in the package, across every run --
+	// opens that ONE shared SQLite file (cmd.Dir is the repo root, so a
+	// relative default resolves there), which lets one instance observe
+	// challenge rows a DIFFERENT instance's own HTTP handler inserted
+	// directly, without any firehose delivery or backfill-on-login ever
+	// occurring. That is not cross-instance delivery; it is two processes
+	// sharing one database file. t.TempDir() gives an absolute path, so
+	// this cannot silently re-resolve against cmd.Dir the way a relative
+	// path would.
+	challengeDBPath := filepath.Join(t.TempDir(), "challenge-state", "challenges.db")
+	if err := os.MkdirAll(filepath.Dir(challengeDBPath), 0o755); err != nil {
+		t.Fatalf("failed to create per-instance challenge DB directory %s: %v", filepath.Dir(challengeDBPath), err)
+	}
+
 	cmd := exec.Command(binPath)
 	cmd.Dir = repoRootDir()
 	cmd.Env = append(os.Environ(),
@@ -266,6 +286,7 @@ func startProtocolService(t *testing.T, binPath string, account Account, port in
 		"FIREHOSE_ENABLED=true",
 		"FIREHOSE_URL="+firehoseURLs,
 		"FIREHOSE_STATE_DIR="+stateDir,
+		"CHALLENGE_DB_PATH="+challengeDBPath,
 	)
 	if plcDirectoryURL != "" {
 		cmd.Env = append(cmd.Env, "ATPROTO_PLC_DIRECTORY_URL="+plcDirectoryURL)
