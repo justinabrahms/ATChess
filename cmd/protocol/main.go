@@ -127,6 +127,25 @@ func main() {
 		for _, u := range urls {
 			u := u
 
+			// Transport selection (atchess-1c9.49): guessed per-URL from
+			// its shape (a Jetstream "/subscribe" path vs. the original
+			// com.atproto.sync.subscribeRepos XRPC path), unless
+			// cfg.Firehose.Transport forces one explicitly for every
+			// configured URL. This means a mixed comma-separated URL list
+			// (some subscribeRepos hosts, some Jetstream instances) just
+			// works: each firehose.Client independently detects its own
+			// URL's transport, with no shared/global transport state
+			// between them -- unless the config override is set, in which
+			// case it applies uniformly to every URL in the list.
+			transport := firehose.DetectTransport(u)
+			if cfg.Firehose.Transport != "" {
+				if t, ok := firehose.ParseTransportOverride(cfg.Firehose.Transport); ok {
+					transport = t
+				} else {
+					log.Warn().Str("value", cfg.Firehose.Transport).Str("url", u).Msg("unrecognized firehose.transport override; falling back to automatic per-URL transport detection")
+				}
+			}
+
 			// WithLogger (atchess-1c9.46 review fix): without this, Client
 			// falls back to zerolog.Nop() (see firehose.NewClient) and
 			// every #info/OutdatedCursor/FutureCursor/error-frame log this
@@ -137,7 +156,8 @@ func main() {
 			// tell which client emitted a given line.
 			opts := []firehose.Option{
 				firehose.WithURL(u),
-				firehose.WithLogger(log.Logger.With().Str("firehoseURL", u).Logger()),
+				firehose.WithTransport(transport),
+				firehose.WithLogger(log.Logger.With().Str("firehoseURL", u).Str("firehoseTransport", string(transport)).Logger()),
 			}
 
 			// BOUNDED INITIAL BACKFILL (atchess-1c9.46): when there is no
@@ -159,7 +179,7 @@ func main() {
 			// specifically for the logging-in user rather than replaying
 			// every record for every user on the host.
 			if cursorStore != nil {
-				if stored, ok := cursorStore.Get(u); ok {
+				if stored, ok := cursorStore.Get(u, transport); ok {
 					opts = append(opts, firehose.WithCursor(stored))
 					log.Info().Str("url", u).Int64("cursor", stored).Msg("resuming firehose subscription from persisted cursor")
 				} else {
@@ -412,7 +432,7 @@ func persistFirehoseCursorsPeriodically(store *firehose.CursorStore, clients []*
 func flushFirehoseCursors(store *firehose.CursorStore, clients []*firehose.Client, urls []string) {
 	for i, c := range clients {
 		seq := c.LastSequence()
-		if err := store.Store(urls[i], seq); err != nil {
+		if err := store.Store(urls[i], c.Transport(), seq); err != nil {
 			log.Error().Err(err).Str("url", urls[i]).Msg("failed to persist firehose cursor")
 		}
 	}

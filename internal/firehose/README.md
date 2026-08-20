@@ -65,6 +65,46 @@ The client recognizes the following chess event types:
 - `WithURL(url)` - Set a custom firehose URL (default: Bluesky's public firehose)
 - `WithLogger(logger)` - Set a custom zerolog logger
 - `WithInitialReconnectDelay(delay)` - Set initial reconnection delay (default: 1s)
+- `WithTransport(transport)` - Force which wire protocol to speak
+  (`firehose.TransportSubscribeRepos` or `firehose.TransportJetstream`),
+  overriding the automatic per-URL guess. See "Transports" below.
+
+## Transports (atchess-1c9.49)
+
+This client supports two wire protocols:
+
+- **`TransportSubscribeRepos`** (the original, default transport): real AT
+  Protocol `com.atproto.sync.subscribeRepos` CBOR frames. No server-side
+  filtering -- every commit on whatever host/relay this is pointed at
+  arrives and is filtered client-side by `isChessRecord`'s
+  `app.atchess.` prefix check.
+- **`TransportJetstream`**: JSON events from a public
+  [Jetstream](https://github.com/bluesky-social/jetstream) instance's
+  `/subscribe` endpoint (e.g. `wss://jetstream1.us-east.bsky.network/subscribe`),
+  filtered **server-side** by the `wantedCollections` query parameter
+  (`firehose.WantedCollections` -- the closed list of `app.atchess.*`
+  NSIDs this deployment actually writes). This is what makes a
+  self-hosted deployment on a small VPS viable against the real network:
+  pointing the CBOR transport at a real relay means decoding and
+  discarding the *entire* Bluesky firehose client-side; Jetstream moves
+  that filtering server-side, leaving a near-idle connection (see
+  `docs/firehose-and-backfill.md` for live-measured numbers, including a
+  caveat about `identity`/`account` events, which Jetstream does not
+  filter by `wantedCollections`).
+
+Transport is selected automatically from the URL's shape
+(`firehose.DetectTransport`: a path ending in `/subscribe` means
+Jetstream; anything else, notably a `com.atproto.sync.subscribeRepos` XRPC
+path, means the original CBOR transport -- unchanged default behavior),
+or forced via `WithTransport` / the `FIREHOSE_TRANSPORT` config-env
+variable (`internal/config.FirehoseConfig.Transport`).
+
+**Cursors are transport-specific and not interchangeable.**
+`subscribeRepos` cursors are small, host-local sequence numbers; Jetstream
+cursors are unix **microseconds** (`time_us`). `CursorStore` tags every
+persisted cursor with the transport it was recorded under and refuses to
+hand a cursor recorded under one transport back to a connection using the
+other (see `cursorstore.go`).
 
 ## Reconnection Logic
 

@@ -74,6 +74,25 @@ type FirehoseConfig struct {
 	// this directory is the natural fit. Must be writable by the process;
 	// created if it does not exist.
 	StateDir string `mapstructure:"state_dir"`
+
+	// Transport optionally forces which wire protocol every
+	// firehose.Client built from URL speaks, overriding the automatic
+	// per-URL guess (firehose.DetectTransport: a URL whose path ends in
+	// "/subscribe" is treated as Jetstream's JSON transport, everything
+	// else -- notably a com.atproto.sync.subscribeRepos XRPC path -- as
+	// the original CBOR transport). Recognized values: "subscribeRepos"
+	// (or "cbor") and "jetstream". Empty (the default) means "guess per
+	// URL", which is unchanged behavior for every existing deployment's
+	// configured URL (see atchess-1c9.49).
+	//
+	// Jetstream (https://github.com/bluesky-social/jetstream) is a public
+	// service that filters com.atproto.sync.subscribeRepos server-side by
+	// collection NSID (wantedCollections) and re-emits matching commits as
+	// JSON, so a self-hosted deployment on a small VPS does not have to
+	// decode and discard the entire Bluesky network firehose in CBOR just
+	// to find the near-zero fraction of it that is app.atchess.* --
+	// see docs/firehose-and-backfill.md and internal/firehose/README.md.
+	Transport string `mapstructure:"transport"`
 }
 
 // SplitFirehoseURLs parses raw (see FirehoseConfig.URL's doc comment) as a
@@ -126,6 +145,7 @@ func Load() (*Config, error) {
 	viper.BindEnv("firehose.enabled", "FIREHOSE_ENABLED", "ATCHESS_FIREHOSE_ENABLED")
 	viper.BindEnv("firehose.url", "FIREHOSE_URL", "ATCHESS_FIREHOSE_URL")
 	viper.BindEnv("firehose.state_dir", "FIREHOSE_STATE_DIR", "ATCHESS_FIREHOSE_STATE_DIR")
+	viper.BindEnv("firehose.transport", "FIREHOSE_TRANSPORT", "ATCHESS_FIREHOSE_TRANSPORT")
 
 	// Set defaults
 	viper.SetDefault("server.host", "localhost")
@@ -138,6 +158,7 @@ func Load() (*Config, error) {
 	viper.SetDefault("firehose.enabled", false)
 	viper.SetDefault("firehose.url", "wss://bsky.social/xrpc/com.atproto.sync.subscribeRepos")
 	viper.SetDefault("firehose.state_dir", "./data/firehose")
+	viper.SetDefault("firehose.transport", "")
 
 	// Read config
 	if err := viper.ReadInConfig(); err != nil {
@@ -171,9 +192,10 @@ func loadDefaults() *Config {
 			LogLevel: "info",
 		},
 		Firehose: FirehoseConfig{
-			Enabled:  false,
-			URL:      "wss://bsky.social/xrpc/com.atproto.sync.subscribeRepos",
-			StateDir: "./data/firehose",
+			Enabled:   false,
+			URL:       "wss://bsky.social/xrpc/com.atproto.sync.subscribeRepos",
+			StateDir:  "./data/firehose",
+			Transport: "",
 		},
 	}
 }

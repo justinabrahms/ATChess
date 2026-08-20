@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -34,6 +36,115 @@ const (
 	pongTimeout  = 10 * time.Second
 	writeTimeout = 10 * time.Second
 )
+
+// Transport identifies which wire protocol a firehose.Client speaks, and
+// therefore -- critically -- what its cursor value MEANS. This distinction
+// exists because atchess-1c9.49 added a second transport alongside the
+// original CBOR one, and the two transports' cursors are not
+// interchangeable:
+//
+//   - TransportSubscribeRepos speaks the original AT Protocol
+//     com.atproto.sync.subscribeRepos CBOR frames directly. Its cursor is a
+//     small, host-local, monotonically increasing SEQUENCE NUMBER assigned
+//     by that specific PDS/relay's own commit log.
+//   - TransportJetstream speaks a public Jetstream instance's JSON
+//     `/subscribe` endpoint (https://github.com/bluesky-social/jetstream),
+//     which filters server-side by collection NSID (wantedCollections) so
+//     only app.atchess.* events cross the wire at all -- the whole point of
+//     this transport existing, since decoding and discarding the entire
+//     Bluesky network firehose in CBOR is untenable on a small single-vCPU
+//     deployment. Its cursor is unix MICROSECONDS (time_us), a wall-clock
+//     derived value with a completely different scale and meaning.
+//
+// Replaying a subscribeRepos sequence number as a Jetstream time_us cursor
+// (or vice versa) would silently request something nonsensical -- "the
+// beginning of time" or "a point far in the future" -- rather than what the
+// caller intended. See CursorStore, which tags every persisted cursor with
+// the Transport it was recorded under and refuses to hand it back to a
+// connection of a different transport.
+type Transport string
+
+const (
+	// TransportSubscribeRepos is this client's original, default
+	// transport: real AT Protocol com.atproto.sync.subscribeRepos CBOR
+	// frames (processCBORMessage). Unchanged by atchess-1c9.49.
+	TransportSubscribeRepos Transport = "subscribeRepos"
+	// TransportJetstream is the JSON transport added by atchess-1c9.49 for
+	// connecting to a public Jetstream instance as a client (NOT
+	// self-hosting one -- see that bead's notes on why the two are not the
+	// same feasibility question).
+	TransportJetstream Transport = "jetstream"
+)
+
+// DetectTransport infers which wire protocol rawURL speaks from its path:
+// a path ending in "/subscribe" (Jetstream's endpoint shape, e.g.
+// "wss://jetstream1.us-east.bsky.network/subscribe") is treated as
+// TransportJetstream; everything else -- notably a
+// com.atproto.sync.subscribeRepos XRPC path, this client's historical
+// default -- is treated as TransportSubscribeRepos. An unparseable URL
+// also defaults to TransportSubscribeRepos, preserving this client's
+// original behavior for every existing configuration. Callers that need to
+// force a specific transport regardless of URL shape should use
+// WithTransport instead (see also internal/config.FirehoseConfig.Transport
+// for the deployment-level override).
+func DetectTransport(rawURL string) Transport {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return TransportSubscribeRepos
+	}
+	p := strings.TrimSuffix(u.Path, "/")
+	if strings.HasSuffix(p, "/subscribe") {
+		return TransportJetstream
+	}
+	return TransportSubscribeRepos
+}
+
+// ParseTransportOverride maps a FirehoseConfig.Transport config/env string
+// to a Transport. Recognized values (case-insensitive): "subscribeRepos"
+// and "cbor" both map to TransportSubscribeRepos; "jetstream" maps to
+// TransportJetstream. Any other non-empty value is unrecognized (ok ==
+// false); callers should log that clearly and fall back to
+// DetectTransport rather than silently guessing.
+func ParseTransportOverride(value string) (t Transport, ok bool) {
+	switch strings.ToLower(strings.TrimSpace(value)) {
+	case "subscriberepos", "cbor":
+		return TransportSubscribeRepos, true
+	case "jetstream":
+		return TransportJetstream, true
+	default:
+		return "", false
+	}
+}
+
+// WantedCollections is the closed list of app.atchess.* NSIDs this
+// deployment actually writes (see internal/atproto/client.go -- every
+// "collection": "app.atchess.*" literal there), passed as Jetstream's
+// wantedCollections query parameter (one per NSID) so filtering happens
+// server-side and only chess events cross the wire at all. This is the
+// Jetstream-transport equivalent of isChessRecord's "app.atchess." prefix
+// check: subscribeRepos has no server-side filter, so that prefix check is
+// sufficient there, but Jetstream's wantedCollections requires each NSID
+// enumerated explicitly. Exported and centralized here (one list, not
+// hand-typed at each call site) specifically so that adding a new
+// app.atchess.* lexicon and forgetting to add it here is a single missed
+// edit rather than a silent gap repeated at every Jetstream call site.
+//
+// Deliberately does NOT include app.atchess.challengeAcceptance or
+// app.atchess.gameIndex: neither is currently written anywhere in
+// internal/atproto/client.go (an "accept" is instead expressed via the
+// app.atchess.game record's optional "challenge" strongRef field; gameIndex
+// is an unused lexicon), so subscribing to them would only ever receive
+// commits this deployment can never actually produce.
+var WantedCollections = []string{
+	"app.atchess.challenge",
+	"app.atchess.challengeResponse",
+	"app.atchess.drawOffer",
+	"app.atchess.drawResponse",
+	"app.atchess.game",
+	"app.atchess.move",
+	"app.atchess.resignation",
+	"app.atchess.timeViolation",
+}
 
 // EventType represents the type of chess event
 type EventType string
@@ -91,6 +202,17 @@ type Client struct {
 	// backfill-on-login is implemented -- a full historical resubscribe,
 	// not merely resuming live tail.
 	lastSequence int64
+	// transport is which wire protocol this client speaks -- and therefore
+	// what lastSequence MEANS (a subscribeRepos sequence number or a
+	// Jetstream time_us microsecond cursor; see the Transport type's doc
+	// comment). Set once, either explicitly via WithTransport or inferred
+	// from url via DetectTransport, before Start is ever called; never
+	// mutated afterward, so it is safe to read without c.mu.
+	transport Transport
+	// transportExplicit records whether WithTransport was passed, so
+	// NewClient knows whether to run DetectTransport(url) as a fallback
+	// (only when the caller did not explicitly choose a transport).
+	transportExplicit bool
 	// connCancel cancels connCtx, the context scoped to the lifetime of the
 	// current connection. It is canceled (and cleared) whenever the
 	// connection is replaced or torn down, so that goroutines bound to the
@@ -135,6 +257,19 @@ func WithInitialReconnectDelay(delay time.Duration) Option {
 	}
 }
 
+// WithTransport forces this client to speak t regardless of what its URL
+// looks like, overriding the automatic per-URL guess (DetectTransport).
+// Without this option, NewClient infers the transport from whatever URL is
+// in effect once every Option has run (so it also respects a WithURL
+// passed alongside it). See internal/config.FirehoseConfig.Transport for
+// the deployment-level config/env knob that maps onto this.
+func WithTransport(t Transport) Option {
+	return func(c *Client) {
+		c.transport = t
+		c.transportExplicit = true
+	}
+}
+
 // WithCursor requests that the FIRST connection this client makes start
 // replaying from cursor (inclusive of whatever the PDS has from that point
 // forward) rather than defaulting to the live tip. Passing 0 requests a full
@@ -172,7 +307,22 @@ func NewClient(handler EventHandler, opts ...Option) *Client {
 		opt(client)
 	}
 
+	// Transport selection happens after every Option has run, not before,
+	// so that DetectTransport sees whatever URL is actually in effect
+	// (e.g. WithURL) rather than always the default. WithTransport, if
+	// passed, always wins over the guess.
+	if !client.transportExplicit {
+		client.transport = DetectTransport(client.url)
+	}
+
 	return client
+}
+
+// Transport returns which wire protocol this client speaks. Fixed at
+// construction (see NewClient); safe for concurrent use without locking
+// since it is never mutated afterward.
+func (c *Client) Transport() Transport {
+	return c.transport
 }
 
 // Start begins listening to the firehose
@@ -270,16 +420,9 @@ func (c *Client) run() {
 // or Stop when the connection is torn down, allowing connection-scoped
 // goroutines (pingLoop) to exit promptly instead of outliving it.
 func (c *Client) connect() (context.Context, error) {
-	c.logger.Info().Str("url", c.url).Msg("Connecting to firehose")
+	c.logger.Info().Str("url", c.url).Str("transport", string(c.transport)).Msg("Connecting to firehose")
 
-	// Build URL with cursor if we have one established (-1 means "none
-	// yet" -- see lastSequence's field doc comment; 0 is a legitimate,
-	// distinct value meaning "replay from the very beginning", used for
-	// atchess-1c9.11's backfill-on-login via WithCursor(0)).
-	url := c.url
-	if lastSeq := c.LastSequence(); lastSeq >= 0 {
-		url = fmt.Sprintf("%s?cursor=%d", url, lastSeq)
-	}
+	dialURL := c.buildDialURL()
 
 	// Set up headers
 	headers := http.Header{}
@@ -289,7 +432,7 @@ func (c *Client) connect() (context.Context, error) {
 	ctx, cancel := context.WithTimeout(c.ctx, 30*time.Second)
 	defer cancel()
 
-	conn, _, err := c.dialer.DialContext(ctx, url, headers)
+	conn, _, err := c.dialer.DialContext(ctx, dialURL, headers)
 	if err != nil {
 		return nil, fmt.Errorf("websocket dial failed: %w", err)
 	}
@@ -312,6 +455,55 @@ func (c *Client) connect() (context.Context, error) {
 	})
 
 	return connCtx, nil
+}
+
+// buildDialURL constructs the URL passed to the websocket dialer.
+//
+// For TransportSubscribeRepos this is byte-for-byte the client's original
+// (pre-atchess-1c9.49) behavior: c.url with "?cursor=<lastSeq>" appended
+// when a cursor is established (-1 means "none yet" -- see lastSequence's
+// field doc comment; 0 is a legitimate, distinct value meaning "replay
+// from the very beginning", used for atchess-1c9.11's backfill-on-login
+// via WithCursor(0)). Deliberately unchanged so existing CBOR deployments
+// see no behavior difference from this bead.
+//
+// For TransportJetstream, the cursor (Jetstream's cursor query param is
+// also literally named "cursor", but its value is unix MICROSECONDS --
+// time_us -- not a subscribeRepos sequence number; see the Transport type)
+// is added the same way, and one wantedCollections query param per
+// WantedCollections entry is added so filtering happens server-side and
+// only chess events cross the wire at all -- the entire point of this
+// transport (atchess-1c9.49).
+func (c *Client) buildDialURL() string {
+	lastSeq := c.LastSequence()
+
+	if c.transport != TransportJetstream {
+		if lastSeq >= 0 {
+			return fmt.Sprintf("%s?cursor=%d", c.url, lastSeq)
+		}
+		return c.url
+	}
+
+	u, err := url.Parse(c.url)
+	if err != nil {
+		// Should not happen for a valid configured URL; fall back to the
+		// unmodified URL rather than crashing the connection attempt. This
+		// does mean wantedCollections would be missing (i.e. the full,
+		// unfiltered Jetstream stream) -- logged loudly so it's not a
+		// silent degradation.
+		c.logger.Error().Err(err).Str("url", c.url).Msg("failed to parse Jetstream URL to add cursor/wantedCollections; dialing it unmodified (this means NO server-side collection filtering will happen)")
+		return c.url
+	}
+
+	q := u.Query()
+	if lastSeq >= 0 {
+		q.Set("cursor", strconv.FormatInt(lastSeq, 10))
+	}
+	for _, coll := range WantedCollections {
+		q.Add("wantedCollections", coll)
+	}
+	u.RawQuery = q.Encode()
+	return u.String()
 }
 
 // listen reads messages from the current connection until it errors, is
@@ -342,7 +534,16 @@ func (c *Client) listen(connCtx context.Context) error {
 				return err
 			}
 
-			if messageType != websocket.BinaryMessage {
+			if c.transport == TransportJetstream {
+				// Jetstream sends JSON, which the gorilla/websocket
+				// library (and most peers) frame as TextMessage, but
+				// accept BinaryMessage too rather than assume a specific
+				// peer's framing choice -- either way it's still valid
+				// UTF-8 JSON to decode.
+				if messageType != websocket.TextMessage && messageType != websocket.BinaryMessage {
+					continue
+				}
+			} else if messageType != websocket.BinaryMessage {
 				continue
 			}
 
@@ -367,6 +568,10 @@ func (c *Client) listen(connCtx context.Context) error {
 }
 
 func (c *Client) processMessage(data []byte) error {
+	if c.transport == TransportJetstream {
+		return c.processJetstreamMessage(data)
+	}
+
 	// The AT Protocol firehose uses a specific message format
 	// We handle both test format and real AT Protocol CBOR format
 
@@ -382,6 +587,119 @@ func (c *Client) processMessage(data []byte) error {
 	// Parse as real AT Protocol CBOR format
 	// Each message contains two concatenated CBOR items: header + body
 	return c.processCBORMessage(data)
+}
+
+// jetstreamEvent mirrors the JSON shape a Jetstream instance's /subscribe
+// endpoint sends for every event on the stream:
+//
+//	{"did":"did:plc:...","time_us":1725911162329308,"kind":"commit","commit":{...}}
+//
+// kind is "commit", "identity", or "account". Only "commit" events carry a
+// non-nil Commit and correspond to an actual repo write; "identity" and
+// "account" events carry no Commit at all and are ignored by
+// processJetstreamMessage (they don't represent a chess record).
+type jetstreamEvent struct {
+	DID    string           `json:"did"`
+	TimeUS int64            `json:"time_us"`
+	Kind   string           `json:"kind"`
+	Commit *jetstreamCommit `json:"commit"`
+}
+
+// jetstreamCommit mirrors Jetstream's "commit" object: operation is
+// "create", "update", or "delete". Record is the raw record JSON (absent
+// for "delete") -- left as json.RawMessage and decoded lazily only for
+// chess-collection commits, mirroring processCBORMessage's CAR-block
+// extraction happening only for chess ops.
+type jetstreamCommit struct {
+	Rev        string          `json:"rev"`
+	Operation  string          `json:"operation"`
+	Collection string          `json:"collection"`
+	RKey       string          `json:"rkey"`
+	Record     json.RawMessage `json:"record"`
+	CID        string          `json:"cid"`
+}
+
+// processJetstreamMessage decodes one Jetstream JSON message and, for
+// commit events whose collection is one of WantedCollections'
+// app.atchess.* NSIDs, builds the same Event type processCBORMessage does
+// so downstream EventHandler/ChessEventProcessor code is transport-
+// agnostic.
+//
+// Malformed JSON is logged at Debug and swallowed (returns nil), mirroring
+// processCBORMessage's handling of malformed CBOR: a single bad frame from
+// a public, uncontrolled peer must never kill the listener. Non-"commit"
+// kinds (identity/account) and an unrecognized/absent collection are
+// silently ignored -- not errors, just "nothing to do here" -- for the
+// same reason: wantedCollections already does most of the filtering
+// server-side, but a defense-in-depth client-side check (isChessRecord)
+// costs nothing and guards against, e.g., a misconfigured/omitted
+// wantedCollections param handing back the whole firehose.
+func (c *Client) processJetstreamMessage(data []byte) error {
+	var evt jetstreamEvent
+	if err := json.Unmarshal(data, &evt); err != nil {
+		c.logger.Debug().Err(err).Int("len", len(data)).Msg("Failed to decode Jetstream JSON message")
+		return nil
+	}
+
+	// Jetstream cursors are unix MICROSECONDS (time_us), not subscribeRepos
+	// sequence numbers -- see the Transport type's doc comment and
+	// CursorStore's transport tagging. Advance on every event actually
+	// seen on the stream (not just "commit" ones): identity/account events
+	// carry a time_us too, and resuming from the latest one seen is still
+	// correct -- Jetstream's cursor semantics are "resume the stream from
+	// this point in time", not "resume from the last commit specifically".
+	if evt.TimeUS > 0 {
+		c.setLastSequence(evt.TimeUS)
+	}
+
+	if evt.Kind != "commit" || evt.Commit == nil {
+		return nil
+	}
+
+	// Same path shape processCBORMessage/getEventType/isChessRecord
+	// already expect: "<collection>/<rkey>", e.g.
+	// "app.atchess.challenge/3l...". An empty/unrecognized collection (or
+	// rkey) falls through isChessRecord's prefix check harmlessly rather
+	// than crashing.
+	path := evt.Commit.Collection + "/" + evt.Commit.RKey
+	if !isChessRecord(path) {
+		return nil
+	}
+
+	var record interface{}
+	if len(evt.Commit.Record) > 0 {
+		var m map[string]interface{}
+		if err := json.Unmarshal(evt.Commit.Record, &m); err == nil {
+			record = m
+		} else {
+			c.logger.Debug().Err(err).Str("path", path).Msg("Failed to decode Jetstream commit record JSON")
+		}
+	}
+	if record == nil {
+		// Matches processCBORMessage's fallback for a missing/unextractable
+		// record (e.g. a "delete" operation carries no record at all).
+		record = map[string]interface{}{}
+	}
+
+	ts := time.Now()
+	if evt.TimeUS > 0 {
+		ts = time.UnixMicro(evt.TimeUS)
+	}
+
+	event := Event{
+		Type:      getEventType(path),
+		Repo:      evt.DID,
+		Path:      path,
+		CID:       evt.Commit.CID,
+		Timestamp: ts,
+		Record:    record,
+	}
+
+	if err := c.handler(event); err != nil {
+		c.logger.Error().Err(err).Msg("Event handler error")
+	}
+
+	return nil
 }
 
 func (c *Client) processCBORMessage(data []byte) error {

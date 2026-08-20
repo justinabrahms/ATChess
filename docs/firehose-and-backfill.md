@@ -167,3 +167,101 @@ If you need that general case, it requires a separate indexing service
 (consuming the relevant firehose ahead of time and maintaining a
 `challenged DID -> challenge records` index) -- out of scope for this
 mechanism.
+
+## Jetstream transport (atchess-1c9.49): connecting to a public instance, and the live-verified numbers
+
+`internal/firehose` originally spoke only real AT Protocol
+`com.atproto.sync.subscribeRepos` CBOR frames. Pointed at the actual
+network-wide relay (`wss://bsky.network/xrpc/com.atproto.sync.subscribeRepos`,
+see above), that means decoding **every** commit on the entire Bluesky
+network -- every post, like, follow, etc. -- just to discard essentially all
+of it client-side. On the target deployment box (a DigitalOcean droplet,
+~2GB RAM / 1 vCPU), that is not viable: it would saturate the single core
+continuously decoding CBOR for events this service will never use.
+
+[Jetstream](https://github.com/bluesky-social/jetstream) is a public
+service (operated by Bluesky; instances include `jetstream1.us-east`,
+`jetstream2.us-east`, and `-west` equivalents, all under
+`*.bsky.network`) that consumes the relay itself and re-emits a filtered,
+JSON-encoded subset over its own `/subscribe` websocket endpoint, filtered
+server-side by the `wantedCollections` query parameter (repeated once per
+NSID). **This bead is about connecting to a public Jetstream instance as a
+client** -- it is not self-hosting one. atchess-1c9.11 evaluated (and
+correctly rejected as infeasible) self-hosting a Jetstream instance, which
+needs a crawlable relay upstream that this project's bare two-PDS test
+harness cannot provide; that conclusion does not apply here.
+
+`internal/firehose.Client` now supports both transports
+(`firehose.TransportSubscribeRepos`, the original default, and
+`firehose.TransportJetstream`), selected automatically from the configured
+URL's shape (`DetectTransport`: a path ending in `/subscribe` is
+Jetstream) or forced via `FIREHOSE_TRANSPORT` /
+`FirehoseConfig.Transport` (`"jetstream"`, or `"subscribeRepos"`/`"cbor"`
+to force the original transport regardless of URL). The Jetstream
+`wantedCollections` sent are the closed list in
+`firehose.WantedCollections` -- every `app.atchess.*` NSID this deployment
+actually writes (derived from `internal/atproto/client.go`), so a new
+lexicon can't be silently left unfiltered.
+
+**Cursor semantics differ by transport and are not interchangeable.**
+`subscribeRepos` cursors are small, host-local sequence numbers;
+Jetstream cursors are unix **microseconds** (`time_us`). `CursorStore`
+tags every persisted cursor with the transport it was recorded under and
+refuses to hand a `subscribeRepos` cursor back to a `Jetstream` connection
+(or vice versa) -- see `internal/firehose/cursorstore.go` and its tests.
+
+**zstd compression**: Jetstream optionally supports zstd-compressed
+frames. This bead does **not** implement that -- the client only speaks
+plain JSON frames. Given the observed near-zero `app.atchess.*` volume
+below, the bandwidth zstd would save is not worth the added complexity
+for this deployment; revisit if that changes.
+
+### Live-verified numbers (2026-08-20)
+
+Measured with a throwaway probe (not committed) connected to
+`wss://jetstream1.us-east.bsky.network/subscribe`, using the real,
+public instance -- not a mock.
+
+**Chess run** -- `wantedCollections` set to all 8 NSIDs in
+`firehose.WantedCollections` (`app.atchess.challenge`,
+`challengeResponse`, `drawOffer`, `drawResponse`, `game`, `move`,
+`resignation`, `timeViolation`), observed for 90.0s:
+
+- **0** `app.atchess.*` commit events received (expected -- this is a
+  brand-new, low-traffic app; this is the entire point of the filter).
+- **45** total websocket messages received in 90.0s (~0.5 msg/s) -- **all
+  45 were `kind:"identity"`/`kind:"account"` events, zero were
+  `kind:"commit"`** (confirmed by inspecting raw frames). This is an
+  important caveat to the "near-idle websocket" claim: **Jetstream's
+  `wantedCollections` filter does not apply to `identity`/`account`
+  events at all** -- those are only filterable via the separate
+  `wantedDids` parameter, which this deployment cannot practically set in
+  advance (an opponent's DID isn't known until they challenge). So even
+  with a tight `wantedCollections` filter, a Jetstream connection still
+  receives a network-wide trickle of identity/account churn (observed
+  here at roughly one message every ~2s). This is real but small relative
+  to raw commit-firehose volume (see the control below), and does not
+  change the core conclusion: server-side `wantedCollections` filtering
+  still eliminates the overwhelming majority of traffic a subscribeRepos
+  connection to a relay would otherwise have to decode and discard
+  client-side.
+
+**Control run** -- same instance, same client, `wantedCollections` set to
+`app.bsky.feed.post` (a high-traffic collection) instead, observed for
+30.0s, to prove the near-zero chess number above reflects the filter
+working rather than a broken/silently-failed client:
+
+- **1253** total messages in 30.0s, of which **1221** were
+  `app.bsky.feed.post` commit events -- **~41 events/sec**.
+- Confirms the same client, dialed the same way, against the same
+  instance, receives substantial traffic for a collection that actually
+  has it. The chess run's near-zero count is therefore attributable to
+  real (lack of) traffic on `app.atchess.*`, not a broken connection,
+  wrong query params, or a client that silently stopped reading.
+
+These are one-off, single-sample measurements from a development sandbox,
+not a long-running/statistically rigorous benchmark -- they are recorded
+here specifically to replace an *estimate* ("near-idle websocket") with an
+*observation*, per atchess-1c9.49's done-criteria. Re-verify against
+production traffic if these numbers become load-bearing for a capacity
+decision.

@@ -30,12 +30,31 @@ const cursorStoreFileName = "cursors.json"
 // challenge.Store.Add) events" if the file is lost or stale.
 //
 // CursorStore is safe for concurrent use.
+//
+// atchess-1c9.49: every stored cursor is tagged with the Transport it was
+// recorded under (cursorEntry.Transport). subscribeRepos cursors are
+// host-local sequence numbers; Jetstream cursors are unix microseconds
+// (time_us) -- two completely different scales and meanings (see the
+// Transport type's doc comment). Get refuses to hand back an entry whose
+// recorded transport does not match the transport being asked for,
+// falling back to "no cursor" (exactly like a first run) rather than let a
+// value recorded under one transport be silently replayed as the other's
+// cursor -- which would request either "the beginning of time" or "some
+// point far in the future", never what was intended.
 type CursorStore struct {
 	path   string
 	logger zerolog.Logger
 
 	mu      sync.Mutex
-	cursors map[string]int64
+	cursors map[string]cursorEntry
+}
+
+// cursorEntry is one host's persisted cursor plus the Transport it was
+// recorded under. json field names are deliberately short/stable since
+// this is the on-disk format (cursors.json).
+type cursorEntry struct {
+	Transport Transport `json:"transport"`
+	Seq       int64     `json:"seq"`
 }
 
 // NewCursorStore creates stateDir if it does not already exist and loads
@@ -61,7 +80,7 @@ func NewCursorStore(stateDir string, logger zerolog.Logger) (*CursorStore, error
 	s := &CursorStore{
 		path:    filepath.Join(stateDir, cursorStoreFileName),
 		logger:  logger,
-		cursors: make(map[string]int64),
+		cursors: make(map[string]cursorEntry),
 	}
 
 	data, err := os.ReadFile(s.path)
@@ -73,7 +92,20 @@ func NewCursorStore(stateDir string, logger zerolog.Logger) (*CursorStore, error
 		return nil, fmt.Errorf("reading firehose cursor state file %s: %w", s.path, err)
 	}
 
-	var loaded map[string]int64
+	// NOTE (atchess-1c9.49): the on-disk format changed from
+	// map[string]int64 to map[string]cursorEntry (transport-tagged) when
+	// the Jetstream transport was added. A pre-existing cursors.json
+	// written by the older, untagged format will fail this Unmarshal (a
+	// bare JSON number where a {"transport","seq"} object is expected) and
+	// fall into the same "corrupt/unparseable" handling below: preserved
+	// as .corrupt, store starts empty. That is a one-time, graceful
+	// degradation on upgrade -- equivalent to a first run, NOT a crash --
+	// consistent with this function's existing corrupt-file handling, and
+	// is why that handling was designed to be non-fatal in the first
+	// place. Losing a persisted cursor only means resubscribing from the
+	// live tip; it never causes duplicate/incorrect processing (see this
+	// type's doc comment and challenge.Store.Add's dedup).
+	var loaded map[string]cursorEntry
 	if err := json.Unmarshal(data, &loaded); err != nil {
 		corruptPath := s.path + ".corrupt"
 		logger.Warn().
@@ -93,19 +125,40 @@ func NewCursorStore(stateDir string, logger zerolog.Logger) (*CursorStore, error
 	return s, nil
 }
 
-// Get returns the stored cursor for host and whether one was found. A
-// missing entry (ok == false) means "no cursor known for this host" -- the
-// caller should NOT default that to 0 (a full-log replay); see
-// cmd/protocol/main.go's bounded-initial-backfill decision.
-func (s *CursorStore) Get(host string) (seq int64, ok bool) {
+// Get returns the stored cursor for host, for a connection speaking
+// transport, and whether one was found/usable. A missing entry (ok ==
+// false) means "no cursor known for this host" -- the caller should NOT
+// default that to 0 (a full-log replay); see cmd/protocol/main.go's
+// bounded-initial-backfill decision.
+//
+// If an entry exists for host but was recorded under a DIFFERENT
+// transport, Get also returns ok == false (logging a Warn explaining why)
+// rather than handing back a value whose meaning does not match what the
+// caller asked for -- see this type's doc comment. This is the structural
+// guard atchess-1c9.49 requires: a subscribeRepos sequence number must
+// never be replayed as a Jetstream time_us cursor, or vice versa.
+func (s *CursorStore) Get(host string, transport Transport) (seq int64, ok bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	seq, ok = s.cursors[host]
-	return
+
+	entry, found := s.cursors[host]
+	if !found {
+		return 0, false
+	}
+	if entry.Transport != transport {
+		s.logger.Warn().
+			Str("host", host).
+			Str("storedTransport", string(entry.Transport)).
+			Str("requestedTransport", string(transport)).
+			Int64("storedCursor", entry.Seq).
+			Msg("firehose cursor store: stored cursor's transport does not match this connection's transport; refusing to reuse it and falling back to no-cursor (live tip) rather than risk conflating a subscribeRepos sequence number with a Jetstream time_us cursor")
+		return 0, false
+	}
+	return entry.Seq, true
 }
 
-// Store records seq as the last-processed sequence for host and persists
-// the full cursor map to disk immediately.
+// Store records seq as the last-processed cursor for host under transport,
+// and persists the full cursor map to disk immediately.
 //
 // seq < 0 (see firehose.Client.LastSequence's doc comment: -1 means "no
 // cursor established/known") clears any previously stored entry for host
@@ -114,15 +167,16 @@ func (s *CursorStore) Get(host string) (seq int64, ok bool) {
 // propagates that rejection to disk: the next periodic Store call after
 // the client resets its in-memory cursor to -1 removes the stale value
 // here too, so a subsequent restart does not immediately retry the same
-// rejected cursor.
-func (s *CursorStore) Store(host string, seq int64) error {
+// rejected cursor. This also means storing seq < 0 clears the entry
+// regardless of what transport was previously recorded for host.
+func (s *CursorStore) Store(host string, transport Transport, seq int64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if seq < 0 {
 		delete(s.cursors, host)
 	} else {
-		s.cursors[host] = seq
+		s.cursors[host] = cursorEntry{Transport: transport, Seq: seq}
 	}
 
 	return s.saveLocked()
