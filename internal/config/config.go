@@ -200,13 +200,20 @@ func Load() (*Config, error) {
 	viper.SetDefault("challenge.db_path", "./data/challenges.db")
 	viper.SetDefault("challenge.prune_interval", "1h")
 
-	// Read config
+	// Read config. A missing config file is a supported deployment mode
+	// (see viper.SetDefault above and ATCHESS_*/unprefixed env var
+	// bindings above) -- only a malformed/unreadable file is an error.
+	// Either way, execution falls through to the same
+	// bind-env/unmarshal/validate pipeline below, so env vars and
+	// validate() are honoured identically whether or not a config file is
+	// present (see atchess-1c9.64: previously the not-found branch
+	// short-circuited to a hardcoded loadDefaults() that consulted no
+	// viper state, silently ignoring every env var and skipping
+	// validate()).
 	if err := viper.ReadInConfig(); err != nil {
-		if _, ok := err.(viper.ConfigFileNotFoundError); ok {
-			// Config file not found, use defaults
-			return loadDefaults(), nil
+		if _, ok := err.(viper.ConfigFileNotFoundError); !ok {
+			return nil, fmt.Errorf("failed to read config: %w", err)
 		}
-		return nil, fmt.Errorf("failed to read config: %w", err)
 	}
 
 	var cfg Config
@@ -244,31 +251,4 @@ func validate(cfg *Config) error {
 		)
 	}
 	return nil
-}
-
-func loadDefaults() *Config {
-	return &Config{
-		Server: ServerConfig{
-			Host: "localhost",
-			Port: 8080,
-		},
-		ATProto: ATProtoConfig{
-			PDSURL:          "http://localhost:3000",
-			PLCDirectoryURL: "https://plc.directory",
-		},
-		Development: DevelopmentConfig{
-			Debug:    false,
-			LogLevel: "info",
-		},
-		Firehose: FirehoseConfig{
-			Enabled:   false,
-			URL:       "wss://bsky.social/xrpc/com.atproto.sync.subscribeRepos",
-			StateDir:  "./data/firehose",
-			Transport: "",
-		},
-		Challenge: ChallengeConfig{
-			DBPath:        "./data/challenges.db",
-			PruneInterval: time.Hour,
-		},
-	}
 }
