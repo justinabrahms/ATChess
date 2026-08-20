@@ -605,3 +605,192 @@ func TestStore_ForPlayer_EmptyIsNotAnError(t *testing.T) {
 		t.Fatal("ForPlayer must never return sql.ErrNoRows for an empty result")
 	}
 }
+
+// rowStatus reads the raw status column for uri directly, bypassing
+// ForPlayer's status/expiry filtering, so tests can assert what
+// PruneExpired actually left behind in the table (not just what
+// ForPlayer would currently surface to a caller).
+func rowStatus(t *testing.T, s *Store, uri string) (status string, found bool) {
+	t.Helper()
+	err := s.db.QueryRow(`SELECT status FROM challenges WHERE uri = ?`, uri).Scan(&status)
+	if err == sql.ErrNoRows {
+		return "", false
+	}
+	if err != nil {
+		t.Fatalf("rowStatus(%s): %v", uri, err)
+	}
+	return status, true
+}
+
+// TestStore_PruneExpired_OnlyDeletesExpiredOpenRows is the atchess-1c9.47
+// part-1 control the bead calls for explicitly: a prune that deleted
+// EVERYTHING would still make TestStoreExpiration's "1 pruned" assertion
+// pass, since that test only ever adds one expired row. This test adds an
+// expired row and a non-expired row side by side and asserts BOTH
+// outcomes -- the expired one is gone, the non-expired one survives --
+// so a mutant that prunes unconditionally is caught here even if it
+// happens to slip past a narrower test.
+func TestStore_PruneExpired_OnlyDeletesExpiredOpenRows(t *testing.T) {
+	s, _ := newTestStore(t)
+
+	expired := &PendingChallenge{
+		ChallengeURI:  "at://did:plc:alice/app.atchess.challenge/expired-open",
+		ChallengerDID: "did:plc:alice",
+		ChallengedDID: "did:plc:bob",
+		CreatedAt:     time.Now().Add(-48 * time.Hour),
+		ExpiresAt:     time.Now().Add(-1 * time.Hour),
+	}
+	notExpired := &PendingChallenge{
+		ChallengeURI:  "at://did:plc:alice/app.atchess.challenge/still-open",
+		ChallengerDID: "did:plc:alice",
+		ChallengedDID: "did:plc:bob",
+		CreatedAt:     time.Now(),
+		ExpiresAt:     time.Now().Add(24 * time.Hour),
+	}
+	if _, err := s.Add(expired); err != nil {
+		t.Fatalf("Add(expired): %v", err)
+	}
+	if _, err := s.Add(notExpired); err != nil {
+		t.Fatalf("Add(notExpired): %v", err)
+	}
+
+	pruned, err := s.PruneExpired()
+	if err != nil {
+		t.Fatalf("PruneExpired: %v", err)
+	}
+	if pruned != 1 {
+		t.Fatalf("expected exactly 1 row pruned, got %d", pruned)
+	}
+
+	if _, found := rowStatus(t, s, expired.ChallengeURI); found {
+		t.Fatal("expected the expired open challenge's row to be gone after PruneExpired")
+	}
+	status, found := rowStatus(t, s, notExpired.ChallengeURI)
+	if !found {
+		t.Fatal("expected the NON-expired challenge's row to still exist after PruneExpired -- a prune that deletes everything would wrongly pass a test that only checks the expired row")
+	}
+	if status != statusOpen {
+		t.Fatalf("expected the non-expired row's status to remain %q, got %q", statusOpen, status)
+	}
+}
+
+// TestStore_PruneExpired_RetainsDeclinedTombstone covers the tombstone
+// retention policy documented on PruneExpired: an EXPIRED declined
+// challenge's row must survive a prune (never deleted, per policy), and
+// -- the actual property that matters -- a replay of the original create
+// after that prune run must still not resurrect it as open. This is the
+// atchess-1c9.47 resurrection scenario the bead calls out: pruning a
+// tombstone too early lets a firehose replay bring the challenge back.
+func TestStore_PruneExpired_RetainsDeclinedTombstone(t *testing.T) {
+	s, _ := newTestStore(t)
+
+	c := &PendingChallenge{
+		ChallengeURI:  "at://did:plc:alice/app.atchess.challenge/declined-expired",
+		ChallengerDID: "did:plc:alice",
+		ChallengedDID: "did:plc:bob",
+		CreatedAt:     time.Now().Add(-48 * time.Hour),
+		ExpiresAt:     time.Now().Add(-1 * time.Hour), // already expired
+	}
+	if _, err := s.Add(c); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	if err := s.Remove(c.ChallengeURI); err != nil {
+		t.Fatalf("Remove (decline): %v", err)
+	}
+
+	status, found := rowStatus(t, s, c.ChallengeURI)
+	if !found || status != statusDeclined {
+		t.Fatalf("expected row to be status %q before prune, got status=%q found=%v", statusDeclined, status, found)
+	}
+
+	pruned, err := s.PruneExpired()
+	if err != nil {
+		t.Fatalf("PruneExpired: %v", err)
+	}
+	if pruned != 0 {
+		t.Fatalf("expected PruneExpired to leave the declined tombstone alone (0 rows pruned), got %d", pruned)
+	}
+
+	status, found = rowStatus(t, s, c.ChallengeURI)
+	if !found {
+		t.Fatal("expected the declined tombstone row to still exist after PruneExpired")
+	}
+	if status != statusDeclined {
+		t.Fatalf("expected tombstone status to remain %q after PruneExpired, got %q", statusDeclined, status)
+	}
+
+	// The property that actually matters: a replay of the original
+	// create, arriving after the tombstone survived a prune, must still
+	// not resurrect the challenge.
+	added, err := s.Add(c)
+	if err != nil {
+		t.Fatalf("Add (replay after prune): %v", err)
+	}
+	if added {
+		t.Fatal("expected Add to report the URI as already present (tombstone retained), not newly added, after PruneExpired")
+	}
+	got, err := s.ForPlayer("did:plc:bob")
+	if err != nil {
+		t.Fatalf("ForPlayer after replay: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("expected declined challenge to stay suppressed after prune + replay, got %d", len(got))
+	}
+}
+
+// TestStore_PruneExpired_RetainsRemovedTombstoneInsertedBeforeCreate
+// exercises the specific MarkRemoved code path the PruneExpired doc
+// comment calls out as the reason expires_at cannot be reused as a
+// tombstone-pruning cutoff: a delete observed with no prior row inserts a
+// tombstone whose expires_at is the tombstoning time itself, which is
+// already in the past by the time any later PruneExpired call runs. If
+// PruneExpired pruned tombstones on that basis, this row would be deleted
+// on its very first opportunity and a later out-of-order create replay
+// would resurrect it.
+func TestStore_PruneExpired_RetainsRemovedTombstoneInsertedBeforeCreate(t *testing.T) {
+	s, _ := newTestStore(t)
+
+	uri := BuildChallengeURI("did:plc:alice", "before-create")
+	if err := s.MarkRemoved(uri, "did:plc:alice", "did:plc:bob"); err != nil {
+		t.Fatalf("MarkRemoved (before any create): %v", err)
+	}
+
+	status, found := rowStatus(t, s, uri)
+	if !found || status != statusRemoved {
+		t.Fatalf("expected tombstone row status %q, got status=%q found=%v", statusRemoved, status, found)
+	}
+
+	// This tombstone's expires_at is "now" at MarkRemoved time -- by the
+	// time PruneExpired runs, it is necessarily <= now.
+	pruned, err := s.PruneExpired()
+	if err != nil {
+		t.Fatalf("PruneExpired: %v", err)
+	}
+	if pruned != 0 {
+		t.Fatalf("expected PruneExpired to leave the pre-create removed tombstone alone, got %d pruned", pruned)
+	}
+
+	// A later out-of-order "create" replay for the same URI must still
+	// not resurrect it.
+	c := &PendingChallenge{
+		ChallengeURI:  uri,
+		ChallengerDID: "did:plc:alice",
+		ChallengedDID: "did:plc:bob",
+		CreatedAt:     time.Now(),
+		ExpiresAt:     time.Now().Add(24 * time.Hour),
+	}
+	added, err := s.Add(c)
+	if err != nil {
+		t.Fatalf("Add (late create replay): %v", err)
+	}
+	if added {
+		t.Fatal("expected Add to report the URI as already present after PruneExpired, not newly added")
+	}
+	got, err := s.ForPlayer("did:plc:bob")
+	if err != nil {
+		t.Fatalf("ForPlayer after late replay: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("expected removed challenge to stay suppressed after prune + late create replay, got %d", len(got))
+	}
+}

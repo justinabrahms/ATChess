@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/spf13/viper"
 )
@@ -112,6 +113,22 @@ type ChallengeConfig struct {
 	// the same box. The parent directory is created automatically if it
 	// does not exist. Must be writable by the process.
 	DBPath string `mapstructure:"db_path"`
+
+	// PruneInterval controls how often cmd/protocol/main.go's background
+	// loop calls Store.PruneExpired to delete expired OPEN challenge rows
+	// (atchess-1c9.47 part 1 -- see PruneExpired's doc comment for why
+	// only open rows, never declined/removed tombstones, are ever
+	// deleted by it). Accepts any time.ParseDuration-compatible string
+	// (e.g. "1h", "15m"); viper's default mapstructure decode hooks parse
+	// it automatically.
+	//
+	// Defaulted to 1h (see SetDefault below): chess challenges are rare
+	// and the default challenge expiry is 24h (see
+	// challenge.FromChallengeRecord), so there is no correctness pressure
+	// to prune often -- this only needs to run often enough to keep the
+	// table bounded on a small (~2GB/1vCPU) droplet without adding
+	// needless I/O for a table that is expected to stay tiny.
+	PruneInterval time.Duration `mapstructure:"prune_interval"`
 }
 
 // SplitFirehoseURLs parses raw (see FirehoseConfig.URL's doc comment) as a
@@ -166,6 +183,7 @@ func Load() (*Config, error) {
 	viper.BindEnv("firehose.state_dir", "FIREHOSE_STATE_DIR", "ATCHESS_FIREHOSE_STATE_DIR")
 	viper.BindEnv("firehose.transport", "FIREHOSE_TRANSPORT", "ATCHESS_FIREHOSE_TRANSPORT")
 	viper.BindEnv("challenge.db_path", "CHALLENGE_DB_PATH", "ATCHESS_CHALLENGE_DB_PATH")
+	viper.BindEnv("challenge.prune_interval", "CHALLENGE_PRUNE_INTERVAL", "ATCHESS_CHALLENGE_PRUNE_INTERVAL")
 
 	// Set defaults
 	viper.SetDefault("server.host", "localhost")
@@ -180,6 +198,7 @@ func Load() (*Config, error) {
 	viper.SetDefault("firehose.state_dir", "./data/firehose")
 	viper.SetDefault("firehose.transport", "")
 	viper.SetDefault("challenge.db_path", "./data/challenges.db")
+	viper.SetDefault("challenge.prune_interval", "1h")
 
 	// Read config
 	if err := viper.ReadInConfig(); err != nil {
@@ -219,7 +238,8 @@ func loadDefaults() *Config {
 			Transport: "",
 		},
 		Challenge: ChallengeConfig{
-			DBPath: "./data/challenges.db",
+			DBPath:        "./data/challenges.db",
+			PruneInterval: time.Hour,
 		},
 	}
 }

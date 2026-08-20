@@ -74,6 +74,19 @@ func main() {
 		}
 	}()
 
+	// Periodically prune expired OPEN challenges from the durable index
+	// (atchess-1c9.47 part 1): challenge.Store.PruneExpired previously had
+	// zero production callers, so rows -- now on disk rather than just in
+	// RAM, since atchess-1c9.50 made this store SQLite-backed -- would
+	// accumulate forever on a small (~2GB/1vCPU) production droplet.
+	// declined/removed tombstones are deliberately NEVER deleted by this
+	// loop; see PruneExpired's doc comment for why pruning a tombstone
+	// too early would let a firehose replay resurrect a challenge the
+	// user already dismissed.
+	stopChallengePrune := make(chan struct{})
+	challengePruneDone := make(chan struct{})
+	go pruneChallengesPeriodically(challengeStore, cfg.Challenge.PruneInterval, stopChallengePrune, challengePruneDone)
+
 	// Create service
 	service := web.NewService(client, cfg, challengeStore)
 
@@ -390,6 +403,17 @@ func main() {
 	<-quit
 	log.Info().Msg("Shutting down server...")
 
+	// Stop the periodic challenge-prune loop and wait (bounded) for it to
+	// actually exit, so a leaked goroutine past this point is something a
+	// test can catch rather than something merely assumed away by process
+	// exit shortly afterward.
+	close(stopChallengePrune)
+	select {
+	case <-challengePruneDone:
+	case <-time.After(5 * time.Second):
+		log.Warn().Msg("timed out waiting for challenge prune loop to stop")
+	}
+
 	// Stop the periodic cursor-persistence loop and do one final flush so
 	// the on-disk cursor is as fresh as possible at shutdown (bounding the
 	// replay-on-restart window to whatever happened in the last instant
@@ -448,6 +472,40 @@ func flushFirehoseCursors(store *firehose.CursorStore, clients []*firehose.Clien
 		seq := c.LastSequence()
 		if err := store.Store(urls[i], c.Transport(), seq); err != nil {
 			log.Error().Err(err).Str("url", urls[i]).Msg("failed to persist firehose cursor")
+		}
+	}
+}
+
+// pruneChallengesPeriodically calls store.PruneExpired every interval
+// until stop is closed, at which point it returns and closes done (so a
+// caller -- main()'s shutdown path, or a test -- can observe that the
+// loop actually exited rather than assuming it did). Mirrors
+// persistFirehoseCursorsPeriodically's stop-channel shutdown pattern
+// above, so this loop is bound to the process lifetime the exact same
+// way that one is: it cannot outlive shutdown (atchess-1c9.47 part 1 --
+// PruneExpired previously had no caller, periodic or otherwise, at all).
+//
+// A PruneExpired error is logged and the loop continues to its next
+// tick; a single failed prune (e.g. a transient disk issue) must not
+// take down the whole service, and there is always another tick to try
+// again.
+func pruneChallengesPeriodically(store *challenge.Store, interval time.Duration, stop <-chan struct{}, done chan<- struct{}) {
+	defer close(done)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			n, err := store.PruneExpired()
+			if err != nil {
+				log.Error().Err(err).Msg("failed to prune expired challenges")
+				continue
+			}
+			if n > 0 {
+				log.Info().Int("pruned", n).Msg("pruned expired challenges")
+			}
+		case <-stop:
+			return
 		}
 	}
 }

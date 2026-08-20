@@ -331,16 +331,54 @@ func (s *Store) MarkRemoved(challengeURI, challengerDID, challengedDID string) e
 	return nil
 }
 
-// PruneExpired permanently deletes every row (of any status) whose
-// expires_at is in the past, and returns how many rows were deleted. This
-// keeps the table bounded over time; unlike Remove/MarkRemoved, expired
-// rows are actually deleted rather than tombstoned, since an expired
-// challenge's URI is not expected to be replayed (its window for
-// discovery has passed) and there is no "stay declined" property to
-// preserve for something that is simply gone from view either way.
+// PruneExpired permanently deletes every OPEN challenge row (statusOpen
+// only) whose expires_at is in the past, and returns how many rows were
+// deleted. Called periodically by cmd/protocol/main.go's
+// pruneChallengesPeriodically loop so the table stays bounded over the
+// life of a long-running deployment: before that loop existed,
+// PruneExpired had zero production callers at all (atchess-1c9.47 part
+// 1), and once atchess-1c9.50 moved this store from an in-memory cache to
+// a SQLite file, "nobody calls this" stopped meaning "a restart clears
+// it" and started meaning "rows accumulate on disk forever".
+//
+// TOMBSTONE RETENTION POLICY -- read this before "simplifying" the query
+// below to `DELETE FROM challenges WHERE expires_at <= ?` with no status
+// filter. declined/removed rows (see the status constants' doc comments
+// above) are NEVER deleted by this method, no matter how long ago their
+// expires_at passed -- they are retained indefinitely. This is
+// deliberate:
+//
+//   - A tombstone's entire reason to exist is to survive a later
+//     out-of-order or replayed firehose "create" event, or a re-run login
+//     backfill, for the SAME uri: Add's ON CONFLICT(uri) DO NOTHING
+//     leaves any existing row -- of any status -- untouched, so a create
+//     seen again after a decline/removal is a no-op. If PruneExpired ever
+//     deleted that tombstone row, the next replay would go through Add's
+//     INSERT path fresh and reopen the challenge as statusOpen -- this is
+//     exactly the atchess-1c9.47 resurrection regression that
+//     atchess-1c9.50 fixed (see TestStore_DeclineSurvivesReplayAndRestart
+//     and TestStore_PruneExpired_RetainsTombstones in store_test.go).
+//   - expires_at is specifically NOT a safe cutoff for a tombstone's own
+//     lifetime, which is why "prune tombstones on the same schedule,
+//     just later" was rejected in favor of "never, here": MarkRemoved's
+//     no-prior-row path (a delete observed before any create was ever
+//     seen) inserts its tombstone with expires_at set to the time of
+//     tombstoning itself, not any real challenge expiry -- an
+//     expires_at-based prune of tombstones would therefore be eligible to
+//     delete that row on the very next run, almost immediately after it
+//     was created, reopening the identical resurrection window this
+//     policy exists to close.
+//   - Chess challenges -- and declines/removals of them -- are rare
+//     events (see the Store doc comment's sizing note); retaining only
+//     this tombstoned subset of rows forever is a small, deliberate,
+//     documented tradeoff against ever pruning one even slightly too
+//     early. If tombstone volume ever becomes material, the correct fix
+//     is a dedicated tombstoned_at column with its own (much longer)
+//     grace period -- never reusing expires_at for it -- filed and done
+//     separately rather than folded into this method.
 func (s *Store) PruneExpired() (int, error) {
 	now := time.Now().UTC().Format(timeFormat)
-	res, err := s.db.Exec(`DELETE FROM challenges WHERE expires_at <= ?`, now)
+	res, err := s.db.Exec(`DELETE FROM challenges WHERE status = ? AND expires_at <= ?`, statusOpen, now)
 	if err != nil {
 		return 0, fmt.Errorf("pruning expired challenges: %w", err)
 	}
