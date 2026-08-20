@@ -311,6 +311,20 @@ func (s *Service) MakeMoveHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Reject a move into a game that has already ended -- by checkmate,
+	// resignation, time violation, or an accepted draw -- however that
+	// termination was recorded and regardless of which repo's cached
+	// "status" field happens to reflect it. game.Status here is GetGame's
+	// derived status (see its doc comment), not a raw field, precisely so
+	// this check cannot be defeated by a stale cache in this repo (see
+	// atchess-1c9.48 review, which found this check entirely absent: the
+	// game's derived status was fetched and then simply discarded).
+	if game.Status != chess.StatusActive {
+		log.Warn().Str("did", authedDID).Str("gameID", gameID).Str("status", string(game.Status)).Msg("Rejected move into a game that has already ended")
+		http.Error(w, fmt.Sprintf("This game has already ended (status: %s)", game.Status), http.StatusConflict)
+		return
+	}
+
 	// Log for debugging
 	log.Info().Str("gameID", gameID).Str("from", req.From).Str("to", req.To).Str("serverFEN", serverFEN).Str("clientFEN", req.FEN).Str("path", r.URL.Path).Msg("MakeMoveHandler called")
 

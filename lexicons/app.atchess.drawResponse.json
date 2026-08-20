@@ -1,0 +1,42 @@
+{
+  "lexicon": 1,
+  "id": "app.atchess.drawResponse",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "A response (accept or decline) to a draw offer, written into the RESPONDING player's own repository. AT Protocol does not permit writing into another account's repository, so a response cannot be recorded by mutating the app.atchess.drawOffer record itself (which lives in the OFFERING player's repo) -- it always lives with its author, the responder, and references both the original offer and the game by strongRef so a reader can find it either way without a second lookup.",
+      "key": "tid",
+      "record": {
+        "type": "object",
+        "required": ["createdAt", "drawOffer", "game", "respondedBy", "response"],
+        "properties": {
+          "createdAt": {
+            "type": "string",
+            "format": "datetime",
+            "description": "When the response was recorded"
+          },
+          "drawOffer": {
+            "type": "ref",
+            "ref": "com.atproto.repo.strongRef",
+            "description": "Reference (uri + cid) to the original app.atchess.drawOffer record in the offering player's repo"
+          },
+          "game": {
+            "type": "ref",
+            "ref": "com.atproto.repo.strongRef",
+            "description": "Reference (uri + cid) to the app.atchess.game record this draw offer belongs to, duplicated here (rather than requiring a join through drawOffer) so a reader deriving game state can filter directly by game URI"
+          },
+          "respondedBy": {
+            "type": "string",
+            "format": "did",
+            "description": "DID of the player who responded"
+          },
+          "response": {
+            "type": "string",
+            "enum": ["accepted", "declined"],
+            "description": "The responder's decision"
+          }
+        }
+      }
+    }
+  }
+}

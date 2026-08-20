@@ -114,6 +114,15 @@ ATChess uses custom lexicons for storing chess data:
 - Time control proposals
 - Challenge status and expiration
 
+### `app.atchess.drawResponse` - Draw Offer Responses
+- Accept/decline decision, referencing the original `app.atchess.drawOffer`
+  and `app.atchess.game` by strongRef
+- Always written into the RESPONDING player's own repository (AT Protocol
+  never permits writing into another account's repo, so a response can't be
+  recorded by mutating the offer record itself, which lives with the
+  offering player) -- see `lexicons/app.atchess.drawResponse.json` for the
+  full schema
+
 ## Configuration
 
 ### Protocol Service

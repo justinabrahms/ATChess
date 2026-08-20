@@ -12,7 +12,10 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/rs/zerolog/log"
 
 	"github.com/justinabrahms/atchess/internal/auth"
 	"github.com/justinabrahms/atchess/internal/chess"
@@ -668,6 +671,52 @@ func (c *Client) getGameRecord(ctx context.Context, gameURI string) (string, map
 	return getResp.CID, getResp.Value, nil
 }
 
+// getRecordByURI fetches an arbitrary record given its full at:// URI
+// (parsing repo/collection/rkey out of it) and returns its CID and value.
+// Unlike getGameRecord it is not specific to app.atchess.game -- it exists
+// so a strongRef (uri+cid) embedded in one record can be verified to
+// actually point at a real record before being trusted, rather than taking
+// the embedding record's word for it. See getDrawAcceptOutcome, which uses
+// this to confirm a "drawResponse: accepted" record references a
+// drawOffer that genuinely exists in the other player's repo -- without
+// this, any player could fabricate an acceptance out of thin air.
+func (c *Client) getRecordByURI(ctx context.Context, atURI string) (string, map[string]interface{}, error) {
+	parts := strings.Split(atURI, "/")
+	if len(parts) < 5 || !strings.HasPrefix(atURI, "at://") {
+		return "", nil, fmt.Errorf("invalid AT Protocol URI format: %s", atURI)
+	}
+
+	repo := parts[2]
+	collection := parts[3]
+	rkey := parts[4]
+
+	base, ownRepo, err := c.resolveReadEndpoint(ctx, repo)
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to resolve repo for %s: %w", atURI, err)
+	}
+	params := url.Values{"repo": {repo}, "collection": {collection}, "rkey": {rkey}}
+	resp, err := c.getXRPC(ctx, base, ownRepo, "com.atproto.repo.getRecord", params)
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to get record %s: %w", atURI, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", nil, fmt.Errorf("failed to get record %s: HTTP %d - %s", atURI, resp.StatusCode, string(body))
+	}
+
+	var getResp struct {
+		CID   string                 `json:"cid"`
+		Value map[string]interface{} `json:"value"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&getResp); err != nil {
+		return "", nil, fmt.Errorf("failed to decode record %s: %w", atURI, err)
+	}
+
+	return getResp.CID, getResp.Value, nil
+}
+
 type moveRecord struct {
 	FEN       string
 	Checkmate bool
@@ -690,6 +739,17 @@ func recordKey(atURI string) string {
 		return atURI
 	}
 	return atURI[idx+1:]
+}
+
+// recordRepo extracts the repo DID from an at:// record URI, e.g.
+// "at://did:plc:x/app.atchess.move/3mthkghep7k2k" -> "did:plc:x". Returns
+// "" if atURI is not a well-formed at:// record URI.
+func recordRepo(atURI string) string {
+	parts := strings.Split(atURI, "/")
+	if len(parts) < 5 || !strings.HasPrefix(atURI, "at://") {
+		return ""
+	}
+	return parts[2]
 }
 
 // moveIsAfter reports whether the move record identified by (t, rkey)
@@ -850,6 +910,384 @@ func (c *Client) getLatestMoveForGame(ctx context.Context, gameURI string, white
 	return latest, nil
 }
 
+// terminalEvent is one candidate final outcome for a game, sourced from a
+// move (checkmate/draw), a resignation, a time-violation claim, or an
+// accepted draw-offer response. GetGame merges candidates from every
+// source -- each itself read across BOTH players' repos, since a terminal
+// event is always written into the triggering player's own repo, which may
+// not be the repo that owns the shared (and otherwise possibly stale)
+// app.atchess.game record -- and applies whichever is most recent. at/rkey
+// use the same (createdAt, TID) ordering as moveIsAfter for the same
+// reason moveRecord does: createdAt alone is only second-resolution.
+type terminalEvent struct {
+	status chess.GameStatus
+	at     time.Time
+	rkey   string
+}
+
+// latestTerminalEvent returns whichever of the given candidate terminal
+// events (any of which may be nil, meaning "that source found nothing") is
+// most recent, or nil if none were found. In a well-behaved client at most
+// one of these should ever be non-nil for a given game, but ties are
+// broken deterministically rather than left to map/slice iteration order.
+func latestTerminalEvent(events ...*terminalEvent) *terminalEvent {
+	var latest *terminalEvent
+	for _, e := range events {
+		if e == nil {
+			continue
+		}
+		if latest == nil || moveIsAfter(e.at, e.rkey, latest.at, latest.rkey) {
+			latest = e
+		}
+	}
+	return latest
+}
+
+// getResignationOutcome scans app.atchess.resignation records in BOTH
+// players' repos for gameURI and returns the most recent one as a
+// terminalEvent (the resigning player's opponent wins), or nil if none
+// exists. ResignGame (this file) always writes the resignation record into
+// the RESIGNING player's own repo, which is not necessarily the repo that
+// owns the shared app.atchess.game record, so it must be discoverable
+// regardless of who created that record -- the same reason
+// getLatestMoveForGame reads both repos for moves.
+//
+// Authorship is checked against the repo the record was actually read
+// from: a record found in playerDID's own repo may only assert that
+// playerDID resigned. Without this, black could write a resignation
+// record into black's OWN repo naming white as the resigningPlayer and
+// unilaterally declare a black_won outcome -- nobody's repo-write
+// permissions stop them writing arbitrary field values into their own
+// records, so the repo boundary is the only thing that can be trusted,
+// never a same-record field (atchess-1c9.48 review).
+func (c *Client) getResignationOutcome(ctx context.Context, gameURI, whiteDID, blackDID string) (*terminalEvent, error) {
+	var latest *terminalEvent
+
+	for _, playerDID := range []string{whiteDID, blackDID} {
+		if playerDID == "" {
+			continue
+		}
+		base, ownRepo, err := c.resolveReadEndpoint(ctx, playerDID)
+		if err != nil {
+			continue
+		}
+		params := url.Values{"repo": {playerDID}, "collection": {"app.atchess.resignation"}, "limit": {"100"}}
+		resp, err := c.getXRPC(ctx, base, ownRepo, "com.atproto.repo.listRecords", params)
+		if err != nil {
+			continue
+		}
+
+		func() {
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				return
+			}
+
+			var listResp struct {
+				Records []struct {
+					URI   string `json:"uri"`
+					Value struct {
+						Game struct {
+							URI string `json:"uri"`
+						} `json:"game"`
+						ResigningPlayer string `json:"resigningPlayer"`
+						CreatedAt       string `json:"createdAt"`
+					} `json:"value"`
+				} `json:"records"`
+			}
+			if err := json.NewDecoder(resp.Body).Decode(&listResp); err != nil {
+				return
+			}
+
+			for _, record := range listResp.Records {
+				if record.Value.Game.URI != gameURI {
+					continue
+				}
+				if record.Value.ResigningPlayer != playerDID {
+					log.Warn().Str("gameURI", gameURI).Str("repo", playerDID).
+						Str("claimedResigningPlayer", record.Value.ResigningPlayer).
+						Str("recordURI", record.URI).
+						Msg("ignoring forged resignation record: repo owner is not the player it names as resigning")
+					continue
+				}
+				t, err := time.Parse(time.RFC3339, record.Value.CreatedAt)
+				if err != nil {
+					continue
+				}
+				status := chess.StatusWhiteWon
+				if record.Value.ResigningPlayer == whiteDID {
+					status = chess.StatusBlackWon
+				}
+				candidate := &terminalEvent{status: status, at: t, rkey: recordKey(record.URI)}
+				if latest == nil || moveIsAfter(candidate.at, candidate.rkey, latest.at, latest.rkey) {
+					latest = candidate
+				}
+			}
+		}()
+	}
+
+	return latest, nil
+}
+
+// getTimeViolationOutcome scans app.atchess.timeViolation records in BOTH
+// players' repos for gameURI and returns the most recent one as a
+// terminalEvent (the violating player's opponent wins), or nil if none
+// exists. See getResignationOutcome's doc comment for why both repos must
+// be read.
+//
+// A timeViolation record is a one-sided claim -- "my opponent didn't move
+// in time" -- and nothing stops the claiming player from writing one the
+// instant after their own move, or with a fabricated violatingPlayer. So,
+// unlike a resignation (self-report, trivially checked against the repo it
+// came from) a timeViolation claim is only trusted here if it can be
+// checked against something the claimer does NOT control:
+//   - authorship: found in repo X, the record's claimingPlayer must be X
+//     (this mirrors ClaimTimeVictory, which always writes into its own
+//     caller's repo) and its violatingPlayer must be the OTHER player, not
+//     X itself;
+//   - timing: lastActivityAt (the real timestamp of the game's last move,
+//     or its creation if there is none yet -- supplied by the caller,
+//     which already has this from the move-record scan every GetGame call
+//     does anyway, so this costs no extra round trip) plus the game's
+//     actual daysPerMove time control must already have elapsed as of the
+//     claim's own createdAt. A claim made before its own deadline had
+//     passed is rejected outright.
+//
+// For any time control type other than "correspondence" this package has
+// no sound way to verify elapsed time server-side (see CheckTimeViolation's
+// own TODO -- rapid/blitz/bullet per-player clocks are not tracked at
+// all), so such a claim can never be verified here; rather than silently
+// trusting it, it is treated as advisory only and excluded from the
+// authoritative merge (logged, not applied).
+func (c *Client) getTimeViolationOutcome(ctx context.Context, gameURI, whiteDID, blackDID string, timeControlType string, daysPerMove int, lastActivityAt time.Time, lastActivityKnown bool) (*terminalEvent, error) {
+	var latest *terminalEvent
+
+	for _, playerDID := range []string{whiteDID, blackDID} {
+		if playerDID == "" {
+			continue
+		}
+		base, ownRepo, err := c.resolveReadEndpoint(ctx, playerDID)
+		if err != nil {
+			continue
+		}
+		params := url.Values{"repo": {playerDID}, "collection": {"app.atchess.timeViolation"}, "limit": {"100"}}
+		resp, err := c.getXRPC(ctx, base, ownRepo, "com.atproto.repo.listRecords", params)
+		if err != nil {
+			continue
+		}
+
+		func() {
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				return
+			}
+
+			var listResp struct {
+				Records []struct {
+					URI   string `json:"uri"`
+					Value struct {
+						Game struct {
+							URI string `json:"uri"`
+						} `json:"game"`
+						ClaimingPlayer  string `json:"claimingPlayer"`
+						ViolatingPlayer string `json:"violatingPlayer"`
+						CreatedAt       string `json:"createdAt"`
+					} `json:"value"`
+				} `json:"records"`
+			}
+			if err := json.NewDecoder(resp.Body).Decode(&listResp); err != nil {
+				return
+			}
+
+			for _, record := range listResp.Records {
+				if record.Value.Game.URI != gameURI {
+					continue
+				}
+
+				if record.Value.ClaimingPlayer != playerDID {
+					log.Warn().Str("gameURI", gameURI).Str("repo", playerDID).
+						Str("claimedClaimingPlayer", record.Value.ClaimingPlayer).
+						Str("recordURI", record.URI).
+						Msg("ignoring forged timeViolation record: repo owner is not the player it names as claiming")
+					continue
+				}
+				if record.Value.ViolatingPlayer != whiteDID && record.Value.ViolatingPlayer != blackDID {
+					continue
+				}
+				if record.Value.ViolatingPlayer == playerDID {
+					log.Warn().Str("gameURI", gameURI).Str("repo", playerDID).Str("recordURI", record.URI).
+						Msg("ignoring nonsensical timeViolation record: claimant named themselves as the violator")
+					continue
+				}
+
+				t, err := time.Parse(time.RFC3339, record.Value.CreatedAt)
+				if err != nil {
+					continue
+				}
+
+				if timeControlType != "correspondence" {
+					// Cannot be soundly verified -- advisory only, never
+					// authoritative. See doc comment above.
+					log.Warn().Str("gameURI", gameURI).Str("recordURI", record.URI).Str("timeControlType", timeControlType).
+						Msg("timeViolation record for a non-correspondence time control cannot be verified server-side; treating as advisory and excluding it from derived game status")
+					continue
+				}
+				if !lastActivityKnown {
+					log.Warn().Str("gameURI", gameURI).Str("recordURI", record.URI).
+						Msg("timeViolation record cannot be verified without a known last-activity timestamp; treating as advisory and excluding it from derived game status")
+					continue
+				}
+				timeLimit := time.Duration(daysPerMove) * 24 * time.Hour
+				if daysPerMove <= 0 || t.Sub(lastActivityAt) < timeLimit {
+					log.Warn().Str("gameURI", gameURI).Str("recordURI", record.URI).
+						Time("lastActivityAt", lastActivityAt).Time("claimedAt", t).Int("daysPerMove", daysPerMove).
+						Msg("ignoring premature/forged timeViolation record: claimed before its own deadline had actually elapsed")
+					continue
+				}
+
+				// Mirrors ClaimTimeVictory's own winner determination:
+				// the violating player loses.
+				status := chess.StatusWhiteWon
+				if record.Value.ViolatingPlayer == whiteDID {
+					status = chess.StatusBlackWon
+				}
+				candidate := &terminalEvent{status: status, at: t, rkey: recordKey(record.URI)}
+				if latest == nil || moveIsAfter(candidate.at, candidate.rkey, latest.at, latest.rkey) {
+					latest = candidate
+				}
+			}
+		}()
+	}
+
+	return latest, nil
+}
+
+// getDrawAcceptOutcome scans app.atchess.drawResponse records in BOTH
+// players' repos for gameURI and returns the most recent "accepted" one as
+// a terminalEvent (status=draw), or nil if none exists. RespondToDrawOffer
+// always writes the response into the RESPONDING player's own repo (never
+// the offering player's -- AT Protocol forbids that cross-repo write), so
+// it must be discoverable regardless of who created it or who owns the
+// game record.
+//
+// An "accepted" drawResponse is otherwise a completely unilateral claim: a
+// player could write one into their own repo with no corresponding offer
+// at all and, absent a check, derive a draw out of thin air. So a
+// candidate is only trusted here once its drawOffer strongRef is verified
+// to actually resolve, in the OTHER player's repo, to a real, matching
+// app.atchess.drawOffer for this same game -- "no offer, no draw"
+// (atchess-1c9.48 review). This costs one extra getRecord round trip, but
+// only for records that pass the cheap in-memory checks first (game URI,
+// response == "accepted", and respondedBy authorship), so it is paid at
+// most once per game, right when a draw is actually being accepted -- not
+// on the hot per-move path.
+func (c *Client) getDrawAcceptOutcome(ctx context.Context, gameURI, whiteDID, blackDID string) (*terminalEvent, error) {
+	var latest *terminalEvent
+
+	for _, playerDID := range []string{whiteDID, blackDID} {
+		if playerDID == "" {
+			continue
+		}
+		base, ownRepo, err := c.resolveReadEndpoint(ctx, playerDID)
+		if err != nil {
+			continue
+		}
+		params := url.Values{"repo": {playerDID}, "collection": {"app.atchess.drawResponse"}, "limit": {"100"}}
+		resp, err := c.getXRPC(ctx, base, ownRepo, "com.atproto.repo.listRecords", params)
+		if err != nil {
+			continue
+		}
+
+		func() {
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				return
+			}
+
+			var listResp struct {
+				Records []struct {
+					URI   string `json:"uri"`
+					Value struct {
+						Game struct {
+							URI string `json:"uri"`
+						} `json:"game"`
+						DrawOffer struct {
+							URI string `json:"uri"`
+							CID string `json:"cid"`
+						} `json:"drawOffer"`
+						RespondedBy string `json:"respondedBy"`
+						Response    string `json:"response"`
+						CreatedAt   string `json:"createdAt"`
+					} `json:"value"`
+				} `json:"records"`
+			}
+			if err := json.NewDecoder(resp.Body).Decode(&listResp); err != nil {
+				return
+			}
+
+			for _, record := range listResp.Records {
+				if record.Value.Game.URI != gameURI || record.Value.Response != "accepted" {
+					continue
+				}
+				if record.Value.RespondedBy != playerDID {
+					log.Warn().Str("gameURI", gameURI).Str("repo", playerDID).
+						Str("claimedRespondedBy", record.Value.RespondedBy).Str("recordURI", record.URI).
+						Msg("ignoring forged drawResponse record: repo owner is not the player it names as responding")
+					continue
+				}
+
+				offerURI := record.Value.DrawOffer.URI
+				offerRepo := recordRepo(offerURI)
+				if offerRepo == "" || offerRepo == playerDID {
+					log.Warn().Str("gameURI", gameURI).Str("repo", playerDID).Str("recordURI", record.URI).Str("offerURI", offerURI).
+						Msg("ignoring drawResponse record: its drawOffer strongRef does not point at the other player's repo")
+					continue
+				}
+				if offerRepo != whiteDID && offerRepo != blackDID {
+					continue
+				}
+
+				offerCID, offerValue, err := c.getRecordByURI(ctx, offerURI)
+				if err != nil {
+					log.Warn().Err(err).Str("gameURI", gameURI).Str("recordURI", record.URI).Str("offerURI", offerURI).
+						Msg("ignoring drawResponse record: its referenced drawOffer could not be read (no offer, no draw)")
+					continue
+				}
+				if offerCID != record.Value.DrawOffer.CID {
+					log.Warn().Str("gameURI", gameURI).Str("recordURI", record.URI).Str("offerURI", offerURI).
+						Str("wantCID", record.Value.DrawOffer.CID).Str("gotCID", offerCID).
+						Msg("ignoring drawResponse record: its drawOffer strongRef CID does not match the current offer record")
+					continue
+				}
+				offerGameRef, _ := offerValue["game"].(map[string]interface{})
+				offerGameURI, _ := offerGameRef["uri"].(string)
+				if offerGameURI != gameURI {
+					log.Warn().Str("gameURI", gameURI).Str("recordURI", record.URI).Str("offerGameURI", offerGameURI).
+						Msg("ignoring drawResponse record: its drawOffer belongs to a different game")
+					continue
+				}
+				offeredBy, _ := offerValue["offeredBy"].(string)
+				if offeredBy != offerRepo {
+					log.Warn().Str("gameURI", gameURI).Str("recordURI", record.URI).Str("offerURI", offerURI).
+						Msg("ignoring drawResponse record: its drawOffer's offeredBy does not match the repo it was found in")
+					continue
+				}
+
+				t, err := time.Parse(time.RFC3339, record.Value.CreatedAt)
+				if err != nil {
+					continue
+				}
+				candidate := &terminalEvent{status: chess.StatusDraw, at: t, rkey: recordKey(record.URI)}
+				if latest == nil || moveIsAfter(candidate.at, candidate.rkey, latest.at, latest.rkey) {
+					latest = candidate
+				}
+			}
+		}()
+	}
+
+	return latest, nil
+}
+
 func (c *Client) GetGame(ctx context.Context, gameURI string) (*chess.Game, error) {
 	// Parse the AT Protocol URI to extract repo and rkey
 	// Example URI: at://did:plc:example/app.atchess.game/3k2uv5...
@@ -923,22 +1361,93 @@ func (c *Client) GetGame(ctx context.Context, gameURI string) (*chess.Game, erro
 		CreatedAt:   getResp.Value.CreatedAt,
 	}
 
-	// Reconstruct current state from move records across both players' repos.
-	// The game record is a denormalized cache that may be stale (e.g. when the
-	// opponent made the last move and couldn't update this repo's record).
-	latestMove, err := c.getLatestMoveForGame(ctx, gameURI, game.White, game.Black)
-	if err == nil && latestMove != nil {
+	// Reconstruct current state from records across BOTH players' repos.
+	// The game record is a denormalized cache that may be stale -- not just
+	// for ordinary moves (e.g. when the opponent made the last move and
+	// couldn't update this repo's record) but for every terminal event
+	// (checkmate, resignation, time violation, accepted draw offer): each
+	// is written by whichever player triggered it, into THEIR OWN repo,
+	// which may not be the repo that owns this app.atchess.game record. So
+	// status is derived by merging candidate terminal events from every
+	// source, each read across both repos, and taking whichever is most
+	// recent (see terminalEvent/latestTerminalEvent). FEN always comes from
+	// the latest move, since none of the other event types change the
+	// board position.
+	//
+	// This is real network cost -- up to 4 sources x 2 repos = 8 XRPC calls
+	// on top of the game record fetch above, half of them typically to a
+	// remote PDS. It is deliberately paid on every call (including from the
+	// move-submission path -- MakeMoveHandler must reject a move into an
+	// already-terminal game, see atchess-1c9.48) rather than trusted from
+	// this repo's own possibly-stale/forgeable "status" cache field. To
+	// keep the wall-clock cost sane despite the round-trip count being
+	// unavoidable for correctness, the three sources that don't depend on
+	// each other's results (moves, resignation, accepted draws) run
+	// concurrently; getTimeViolationOutcome needs the real last-move
+	// timestamp from the move scan to verify a claim (see its doc comment),
+	// so it runs once that finishes rather than being a fourth independent
+	// branch.
+	var latestMove *moveRecord
+	var moveErr error
+	var resignationEvent, drawAcceptEvent *terminalEvent
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		latestMove, moveErr = c.getLatestMoveForGame(ctx, gameURI, game.White, game.Black)
+	}()
+	go func() {
+		defer wg.Done()
+		resignationEvent, _ = c.getResignationOutcome(ctx, gameURI, game.White, game.Black)
+	}()
+	drawAcceptDone := make(chan struct{})
+	go func() {
+		defer close(drawAcceptDone)
+		drawAcceptEvent, _ = c.getDrawAcceptOutcome(ctx, gameURI, game.White, game.Black)
+	}()
+	wg.Wait()
+
+	var moveEvent *terminalEvent
+	if moveErr == nil && latestMove != nil {
 		game.FEN = latestMove.FEN
 		if latestMove.Checkmate {
 			fenParts := strings.Split(latestMove.FEN, " ")
+			status := chess.StatusWhiteWon
 			if len(fenParts) > 1 && fenParts[1] == "w" {
-				game.Status = chess.StatusBlackWon
-			} else {
-				game.Status = chess.StatusWhiteWon
+				status = chess.StatusBlackWon
 			}
+			moveEvent = &terminalEvent{status: status, at: latestMove.CreatedAt, rkey: latestMove.rkey}
 		} else if latestMove.Draw {
-			game.Status = chess.StatusDraw
+			moveEvent = &terminalEvent{status: chess.StatusDraw, at: latestMove.CreatedAt, rkey: latestMove.rkey}
 		}
+	}
+
+	// The real timestamp a timeViolation claim must be checked against:
+	// the last actual move, or (if there have been none) the game's own
+	// creation time.
+	var lastActivityAt time.Time
+	lastActivityKnown := false
+	if latestMove != nil {
+		lastActivityAt = latestMove.CreatedAt
+		lastActivityKnown = true
+	} else if t, err := time.Parse(time.RFC3339, getResp.Value.CreatedAt); err == nil {
+		lastActivityAt = t
+		lastActivityKnown = true
+	}
+
+	timeControlType := ""
+	daysPerMove := 0
+	if timeControl != nil {
+		timeControlType = timeControl.Type
+		daysPerMove = timeControl.DaysPerMove
+	}
+	timeViolationEvent, _ := c.getTimeViolationOutcome(ctx, gameURI, game.White, game.Black, timeControlType, daysPerMove, lastActivityAt, lastActivityKnown)
+
+	<-drawAcceptDone
+
+	if final := latestTerminalEvent(moveEvent, resignationEvent, timeViolationEvent, drawAcceptEvent); final != nil {
+		game.Status = final.status
 	}
 
 	return game, nil
@@ -1092,16 +1601,34 @@ func (c *Client) resolveHandleSamePDS(ctx context.Context, handle string) (strin
 	return result.DID, nil
 }
 
+// currentGameStatus returns gameURI's authoritative, derived status (see
+// GetGame's doc comment) -- never the raw, possibly-stale-or-forged
+// "status" field cached on the app.atchess.game record itself. Best-effort:
+// on error it returns ("", err) and callers should treat that the same way
+// they always have when the cached field was simply absent -- i.e. not
+// block the action -- rather than hard-failing a write because a read
+// elsewhere is temporarily unavailable.
+func (c *Client) currentGameStatus(ctx context.Context, gameURI string) (chess.GameStatus, error) {
+	g, err := c.GetGame(ctx, gameURI)
+	if err != nil {
+		return "", err
+	}
+	return g.Status, nil
+}
+
 // OfferDraw creates a draw offer record for a game
 func (c *Client) OfferDraw(ctx context.Context, gameID string, message string) (*DrawOffer, error) {
 	// First, fetch the game record to get its CID
-	gameCID, gameValue, err := c.getGameRecord(ctx, gameID)
+	gameCID, _, err := c.getGameRecord(ctx, gameID)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get game record: %w", err)
 	}
 
-	// Verify the game is active
-	if status, ok := gameValue["status"].(string); ok && status != "active" {
+	// Verify the game is active. Uses the derived status (GetGame), not the
+	// raw cached gameValue["status"] field, so this is consistent with
+	// terminal events the game's own repo owner may not know about yet
+	// (atchess-1c9.48 review).
+	if status, err := c.currentGameStatus(ctx, gameID); err == nil && status != chess.StatusActive {
 		return nil, fmt.Errorf("cannot offer draw in a game with status: %s", status)
 	}
 
@@ -1214,71 +1741,107 @@ func (c *Client) RespondToDrawOffer(ctx context.Context, drawOfferURI string, ac
 	if !ok {
 		return fmt.Errorf("missing game URI in draw offer")
 	}
+	// Fallback game CID already embedded in the offer's own strongRef --
+	// possibly stale by the time of this response (more moves may have
+	// happened since), but good enough for a decline (see below).
+	offerGameCID, _ := gameRef["cid"].(string)
 
-	// Update the draw offer record
-	getResp.Value["status"] = "accepted"
+	// Record the response. AT Protocol never permits writing into another
+	// account's repository, and the draw offer record (drawOfferURI) lives
+	// in the OFFERING player's repo -- which, for the ordinary case of the
+	// OTHER player responding, is not c.did. Mutating it via putRecord (as
+	// this used to do) always failed in real federation with HTTP 403
+	// AccountNotFound, exactly like the retired cross-repo challenge
+	// notification write (atchess-1c9.11). Instead, write an
+	// app.atchess.drawResponse record into the CALLER's OWN repo,
+	// referencing both the offer and the game by strongRef. GetGame
+	// derives "draw" status by reading these across both players' repos
+	// (getDrawAcceptOutcome), the same pattern already used for moves.
+	response := "accepted"
 	if !accept {
-		getResp.Value["status"] = "declined"
-	}
-	getResp.Value["respondedAt"] = time.Now().Format(time.RFC3339)
-	getResp.Value["respondedBy"] = c.did
-
-	// Update the draw offer record
-	putReq := map[string]interface{}{
-		"repo":       repo,
-		"collection": "app.atchess.drawOffer",
-		"rkey":       rkey,
-		"record":     getResp.Value,
-		"swapCid":    getResp.CID,
+		response = "declined"
 	}
 
-	putReqBody, _ := json.Marshal(putReq)
-	putResp, err := c.makeRequest("POST", xrpcURL(c.pdsURL, "com.atproto.repo.putRecord", nil), putReqBody)
-	if err != nil {
-		return fmt.Errorf("failed to update draw offer record: %w", err)
-	}
-	defer putResp.Body.Close()
-
-	if putResp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(putResp.Body)
-		return fmt.Errorf("failed to update draw offer record: HTTP %d - %s", putResp.StatusCode, string(body))
-	}
-
-	// If the draw was accepted, update the game status
+	// An accept is a meaningful state transition, so fetch the freshest
+	// possible game CID and fail loudly if that's not possible. A decline
+	// is comparatively low-stakes -- it never updates the game record
+	// (below) -- so it must not hard-fail just because the game record
+	// happens to be momentarily unreadable; fall back to the CID already
+	// recorded on the offer itself instead (atchess-1c9.48 review: this
+	// getGameRecord call used to be accept-only, and unconditionally
+	// requiring it here regressed declines to hard-fail on the same
+	// condition an accept does).
+	var gameCID string
 	if accept {
-		// Get the game record
-		gameCID, gameValue, err := c.getGameRecord(ctx, gameURI)
+		gameCID, _, err = c.getGameRecord(ctx, gameURI)
 		if err != nil {
-			return fmt.Errorf("failed to get game record for status update: %w", err)
+			return fmt.Errorf("failed to get game record for draw response: %w", err)
 		}
+	} else if fresh, _, err := c.getGameRecord(ctx, gameURI); err == nil {
+		gameCID = fresh
+	} else {
+		gameCID = offerGameCID
+	}
 
-		// Parse the game URI to check if we own the game record
+	drawResponseRecord := map[string]interface{}{
+		"$type":     "app.atchess.drawResponse",
+		"createdAt": time.Now().Format(time.RFC3339),
+		"drawOffer": map[string]interface{}{
+			"uri": getResp.URI,
+			"cid": getResp.CID,
+		},
+		"game": map[string]interface{}{
+			"uri": gameURI,
+			"cid": gameCID,
+		},
+		"respondedBy": c.did,
+		"response":    response,
+	}
+
+	createReq := map[string]interface{}{
+		"repo":       c.did,
+		"collection": "app.atchess.drawResponse",
+		"record":     drawResponseRecord,
+	}
+
+	createReqBody, _ := json.Marshal(createReq)
+	createResp, err := c.makeRequest("POST", xrpcURL(c.pdsURL, "com.atproto.repo.createRecord", nil), createReqBody)
+	if err != nil {
+		return fmt.Errorf("failed to create draw response record: %w", err)
+	}
+	defer createResp.Body.Close()
+
+	if createResp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(createResp.Body)
+		return fmt.Errorf("failed to create draw response record: HTTP %d - %s", createResp.StatusCode, string(body))
+	}
+
+	// Best-effort cache refresh: if this caller happens to also own the
+	// shared app.atchess.game record (repo == c.did), update its status
+	// field too. This is never required for correctness -- GetGame always
+	// derives the authoritative status from drawResponse records across
+	// both repos regardless of who owns the game record -- but keeps the
+	// cached record from looking obviously stale to any reader that
+	// doesn't go through derivation.
+	if accept {
 		gameParts := strings.Split(gameURI, "/")
 		if len(gameParts) >= 5 && gameParts[2] == c.did {
-			// Update the game status to draw
-			gameValue["status"] = "draw"
-			gameValue["updatedAt"] = time.Now().Format(time.RFC3339)
-
-			// Update the game record
-			gameRkey := gameParts[4]
-			updateGameReq := map[string]interface{}{
-				"repo":       c.did,
-				"collection": "app.atchess.game",
-				"rkey":       gameRkey,
-				"record":     gameValue,
-				"swapCid":    gameCID,
-			}
-
-			updateGameReqBody, _ := json.Marshal(updateGameReq)
-			updateGameResp, err := c.makeRequest("POST", xrpcURL(c.pdsURL, "com.atproto.repo.putRecord", nil), updateGameReqBody)
-			if err != nil {
-				return fmt.Errorf("failed to update game record: %w", err)
-			}
-			defer updateGameResp.Body.Close()
-
-			if updateGameResp.StatusCode != http.StatusOK {
-				body, _ := io.ReadAll(updateGameResp.Body)
-				return fmt.Errorf("failed to update game record: HTTP %d - %s", updateGameResp.StatusCode, string(body))
+			gCID, gameValue, err := c.getGameRecord(ctx, gameURI)
+			if err == nil {
+				gameValue["status"] = "draw"
+				gameValue["updatedAt"] = time.Now().Format(time.RFC3339)
+				gameRkey := gameParts[4]
+				updateGameReq := map[string]interface{}{
+					"repo":       c.did,
+					"collection": "app.atchess.game",
+					"rkey":       gameRkey,
+					"record":     gameValue,
+					"swapCid":    gCID,
+				}
+				updateGameReqBody, _ := json.Marshal(updateGameReq)
+				if updateGameResp, err := c.makeRequest("POST", xrpcURL(c.pdsURL, "com.atproto.repo.putRecord", nil), updateGameReqBody); err == nil {
+					updateGameResp.Body.Close()
+				}
 			}
 		}
 	}
@@ -1294,8 +1857,10 @@ func (c *Client) ResignGame(ctx context.Context, gameID string, reason string) e
 		return fmt.Errorf("failed to get game record: %w", err)
 	}
 
-	// Verify the game is active
-	if status, ok := gameValue["status"].(string); ok && status != "active" {
+	// Verify the game is active. Uses the derived status (GetGame), not the
+	// raw cached gameValue["status"] field -- see OfferDraw's comment
+	// (atchess-1c9.48 review).
+	if status, err := c.currentGameStatus(ctx, gameID); err == nil && status != chess.StatusActive {
 		return fmt.Errorf("cannot resign from a game with status: %s", status)
 	}
 
@@ -1481,8 +2046,10 @@ func (c *Client) CheckTimeViolation(ctx context.Context, gameID string) (bool, *
 		return false, nil, fmt.Errorf("failed to get game record: %w", err)
 	}
 
-	// Check if game is still active
-	if status, ok := gameValue["status"].(string); ok && status != "active" {
+	// Check if game is still active. Uses the derived status (GetGame), not
+	// the raw cached gameValue["status"] field -- see OfferDraw's comment
+	// (atchess-1c9.48 review).
+	if status, err := c.currentGameStatus(ctx, gameID); err == nil && status != chess.StatusActive {
 		return false, nil, nil // Game is not active, no time violation possible
 	}
 
