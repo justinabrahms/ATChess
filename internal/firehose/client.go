@@ -22,12 +22,12 @@ import (
 const (
 	// Default firehose endpoint
 	DefaultFirehoseURL = "wss://bsky.social/xrpc/com.atproto.sync.subscribeRepos"
-	
+
 	// Reconnection parameters
-	initialReconnectDelay = 1 * time.Second
-	maxReconnectDelay     = 5 * time.Minute
+	initialReconnectDelay  = 1 * time.Second
+	maxReconnectDelay      = 5 * time.Minute
 	reconnectBackoffFactor = 2
-	
+
 	// WebSocket parameters
 	pingInterval = 30 * time.Second
 	pongTimeout  = 10 * time.Second
@@ -38,21 +38,21 @@ const (
 type EventType string
 
 const (
-	EventTypeMove       EventType = "move"
-	EventTypeDrawOffer  EventType = "drawOffer"
-	EventTypeResignation EventType = "resignation"
-	EventTypeGame       EventType = "game"
-	EventTypeChallenge  EventType = "challenge"
-	EventTypeChallengeAcceptance EventType = "challengeAcceptance"
+	EventTypeMove                  EventType = "move"
+	EventTypeDrawOffer             EventType = "drawOffer"
+	EventTypeResignation           EventType = "resignation"
+	EventTypeGame                  EventType = "game"
+	EventTypeChallenge             EventType = "challenge"
+	EventTypeChallengeAcceptance   EventType = "challengeAcceptance"
 	EventTypeChallengeNotification EventType = "challengeNotification"
 )
 
 // Event represents a chess-related event from the firehose
 type Event struct {
 	Type      EventType
-	Repo      string    // DID of the repository
-	Path      string    // Record path
-	CID       string    // Content ID
+	Repo      string // DID of the repository
+	Path      string // Record path
+	CID       string // Content ID
 	Timestamp time.Time
 	Record    interface{} // Decoded record data
 }
@@ -62,18 +62,24 @@ type EventHandler func(event Event) error
 
 // Client connects to the AT Protocol firehose and filters chess events
 type Client struct {
-	url           string
-	conn          *websocket.Conn
-	handler       EventHandler
-	logger        zerolog.Logger
-	ctx           context.Context
-	cancel        context.CancelFunc
+	url            string
+	conn           *websocket.Conn
+	handler        EventHandler
+	logger         zerolog.Logger
+	ctx            context.Context
+	cancel         context.CancelFunc
 	reconnectDelay time.Duration
-	mu            sync.RWMutex
-	wg            sync.WaitGroup
-	connected     bool
-	lastSequence  int64
-	
+	mu             sync.RWMutex
+	wg             sync.WaitGroup
+	connected      bool
+	lastSequence   int64
+	// connCancel cancels connCtx, the context scoped to the lifetime of the
+	// current connection. It is canceled (and cleared) whenever the
+	// connection is replaced or torn down, so that goroutines bound to the
+	// old connection (e.g. pingLoop) know to exit rather than pick up
+	// whatever connection happens to be current later.
+	connCancel context.CancelFunc
+
 	// For testing
 	dialer        *websocket.Dialer
 	mockWebSocket bool
@@ -114,7 +120,7 @@ func WithInitialReconnectDelay(delay time.Duration) Option {
 // NewClient creates a new firehose client
 func NewClient(handler EventHandler, opts ...Option) *Client {
 	ctx, cancel := context.WithCancel(context.Background())
-	
+
 	client := &Client{
 		url:            DefaultFirehoseURL,
 		handler:        handler,
@@ -124,11 +130,11 @@ func NewClient(handler EventHandler, opts ...Option) *Client {
 		reconnectDelay: initialReconnectDelay,
 		dialer:         websocket.DefaultDialer,
 	}
-	
+
 	for _, opt := range opts {
 		opt(client)
 	}
-	
+
 	return client
 }
 
@@ -155,6 +161,10 @@ func (c *Client) Stop() error {
 		err = c.conn.Close()
 		c.conn = nil
 		c.connected = false
+	}
+	if c.connCancel != nil {
+		c.connCancel()
+		c.connCancel = nil
 	}
 	c.mu.Unlock()
 
@@ -186,19 +196,29 @@ func (c *Client) setLastSequence(seq int64) {
 	c.mu.Unlock()
 }
 
+// getConn returns the current websocket connection, if any. Safe for
+// concurrent use. The result may be nil (e.g. briefly while reconnecting
+// or after Stop); callers must check.
+func (c *Client) getConn() *websocket.Conn {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.conn
+}
+
 func (c *Client) run() {
 	for {
 		select {
 		case <-c.ctx.Done():
 			return
 		default:
-			if err := c.connect(); err != nil {
+			connCtx, err := c.connect()
+			if err != nil {
 				c.logger.Error().Err(err).Msg("Failed to connect to firehose")
 				c.handleReconnect()
 				continue
 			}
-			
-			if err := c.listen(); err != nil {
+
+			if err := c.listen(connCtx); err != nil {
 				c.logger.Error().Err(err).Msg("Error listening to firehose")
 				c.handleReconnect()
 				continue
@@ -207,67 +227,84 @@ func (c *Client) run() {
 	}
 }
 
-func (c *Client) connect() error {
+// connect dials the firehose and returns a context scoped to the lifetime
+// of the resulting connection. That context is canceled by handleReconnect
+// or Stop when the connection is torn down, allowing connection-scoped
+// goroutines (pingLoop) to exit promptly instead of outliving it.
+func (c *Client) connect() (context.Context, error) {
 	c.logger.Info().Str("url", c.url).Msg("Connecting to firehose")
-	
+
 	// Build URL with cursor if we have a sequence
 	url := c.url
 	if lastSeq := c.LastSequence(); lastSeq > 0 {
 		url = fmt.Sprintf("%s?cursor=%d", url, lastSeq)
 	}
-	
+
 	// Set up headers
 	headers := http.Header{}
 	headers.Set("User-Agent", "ATChess/1.0")
-	
+
 	// Connect with timeout
 	ctx, cancel := context.WithTimeout(c.ctx, 30*time.Second)
 	defer cancel()
-	
+
 	conn, _, err := c.dialer.DialContext(ctx, url, headers)
 	if err != nil {
-		return fmt.Errorf("websocket dial failed: %w", err)
+		return nil, fmt.Errorf("websocket dial failed: %w", err)
 	}
-	
+
+	connCtx, connCancel := context.WithCancel(c.ctx)
+
 	c.mu.Lock()
 	c.conn = conn
+	c.connCancel = connCancel
 	c.connected = true
 	c.reconnectDelay = initialReconnectDelay
 	c.mu.Unlock()
-	
+
 	c.logger.Info().Msg("Connected to firehose")
-	
+
 	// Set up ping/pong handlers
 	conn.SetPongHandler(func(string) error {
 		conn.SetReadDeadline(time.Now().Add(pongTimeout))
 		return nil
 	})
-	
-	return nil
+
+	return connCtx, nil
 }
 
-func (c *Client) listen() error {
-	// Start ping routine
+// listen reads messages from the current connection until it errors, is
+// closed, or the client's context is canceled. connCtx is the
+// connection-scoped context returned by connect for this specific
+// connection; it is passed to pingLoop so the ping loop is tied to this
+// connection's lifetime rather than whatever c.conn happens to be later.
+func (c *Client) listen(connCtx context.Context) error {
+	// Start ping routine, scoped to this connection.
+	conn := c.getConn()
 	c.wg.Add(1)
-	go c.pingLoop()
-	
+	go c.pingLoop(connCtx, conn)
+
 	for {
 		select {
 		case <-c.ctx.Done():
 			return nil
 		default:
-			messageType, data, err := c.conn.ReadMessage()
+			conn := c.getConn()
+			if conn == nil {
+				return fmt.Errorf("connection is nil")
+			}
+			messageType, data, err := conn.ReadMessage()
 			if err != nil {
 				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
 					return fmt.Errorf("websocket read error: %w", err)
 				}
 				return err
 			}
-			
+
 			if messageType != websocket.BinaryMessage {
 				continue
 			}
-			
+
 			if err := c.processMessage(data); err != nil {
 				c.logger.Error().Err(err).Msg("Error processing message")
 				// Continue processing other messages
@@ -463,9 +500,9 @@ func (c *Client) processTestMessage(data []byte) error {
 	if len(data) < 4+headerLen {
 		return fmt.Errorf("invalid header length")
 	}
-	
+
 	headerData := data[4 : 4+headerLen]
-	
+
 	var message struct {
 		Op   int    `json:"op"`
 		T    string `json:"t"`
@@ -478,27 +515,27 @@ func (c *Client) processTestMessage(data []byte) error {
 			CID    string `json:"cid"`
 		} `json:"ops"`
 	}
-	
+
 	if err := json.Unmarshal(headerData, &message); err != nil {
 		return fmt.Errorf("failed to parse header: %w", err)
 	}
-	
+
 	// Update sequence for resumption
 	if message.Seq > 0 {
 		c.setLastSequence(message.Seq)
 	}
-	
+
 	// We're only interested in commit events
 	if message.Op != 1 || message.T != "#commit" {
 		return nil
 	}
-	
+
 	// Check if any operations are chess-related
 	for _, op := range message.Ops {
 		if !isChessRecord(op.Path) {
 			continue
 		}
-		
+
 		// For test messages, we don't have real CAR data
 		// Just create a simple event
 		event := Event{
@@ -509,12 +546,12 @@ func (c *Client) processTestMessage(data []byte) error {
 			Timestamp: time.Now(),
 			Record:    map[string]interface{}{}, // Empty record for tests
 		}
-		
+
 		if err := c.handler(event); err != nil {
 			c.logger.Error().Err(err).Msg("Event handler error")
 		}
 	}
-	
+
 	return nil
 }
 
@@ -524,7 +561,7 @@ func (c *Client) extractRecord(carData []byte, targetCID string) (interface{}, e
 	if err != nil {
 		return nil, fmt.Errorf("failed to create CAR reader: %w", err)
 	}
-	
+
 	// Iterate through blocks to find our target
 	for {
 		block, err := reader.Next()
@@ -534,7 +571,7 @@ func (c *Client) extractRecord(carData []byte, targetCID string) (interface{}, e
 		if err != nil {
 			return nil, fmt.Errorf("failed to read block: %w", err)
 		}
-		
+
 		// Check if this is our target block
 		if block.Cid().String() == targetCID {
 			// Decode CBOR data
@@ -544,12 +581,12 @@ func (c *Client) extractRecord(carData []byte, targetCID string) (interface{}, e
 				return nil, fmt.Errorf("failed to decode CBOR: %w", err)
 			}
 			node := nb.Build()
-			
+
 			// Convert to Go map
 			return nodeToGo(node)
 		}
 	}
-	
+
 	return nil, fmt.Errorf("target CID not found in CAR file")
 }
 
@@ -574,7 +611,7 @@ func nodeToGo(node ipld.Node) (interface{}, error) {
 			m[keyStr] = val
 		}
 		return m, nil
-		
+
 	case ipld.Kind_List:
 		var list []interface{}
 		iter := node.ListIterator()
@@ -590,45 +627,50 @@ func nodeToGo(node ipld.Node) (interface{}, error) {
 			list = append(list, val)
 		}
 		return list, nil
-		
+
 	case ipld.Kind_String:
 		return node.AsString()
-		
+
 	case ipld.Kind_Int:
 		return node.AsInt()
-		
+
 	case ipld.Kind_Float:
 		return node.AsFloat()
-		
+
 	case ipld.Kind_Bool:
 		return node.AsBool()
-		
+
 	case ipld.Kind_Null:
 		return nil, nil
-		
+
 	default:
 		return nil, fmt.Errorf("unsupported node kind: %v", node.Kind())
 	}
 }
 
-func (c *Client) pingLoop() {
+// pingLoop sends periodic pings on conn until it errors, connCtx is
+// canceled (this connection was replaced or torn down by handleReconnect
+// or Stop), or the client's ctx is canceled. It intentionally does not
+// re-read c.conn: doing so would let a stale ping loop silently adopt a
+// later connection instead of exiting, accumulating one extra goroutine
+// (and duplicate pings) per reconnect.
+func (c *Client) pingLoop(connCtx context.Context, conn *websocket.Conn) {
 	defer c.wg.Done()
+
+	if conn == nil {
+		return
+	}
+
 	ticker := time.NewTicker(pingInterval)
 	defer ticker.Stop()
-	
+
 	for {
 		select {
 		case <-c.ctx.Done():
 			return
+		case <-connCtx.Done():
+			return
 		case <-ticker.C:
-			c.mu.RLock()
-			conn := c.conn
-			c.mu.RUnlock()
-			
-			if conn == nil {
-				return
-			}
-			
 			if err := conn.WriteControl(websocket.PingMessage, []byte{}, time.Now().Add(writeTimeout)); err != nil {
 				c.logger.Error().Err(err).Msg("Ping failed")
 				return
@@ -644,19 +686,23 @@ func (c *Client) handleReconnect() {
 		c.conn.Close()
 		c.conn = nil
 	}
-	
+	if c.connCancel != nil {
+		c.connCancel()
+		c.connCancel = nil
+	}
+
 	// Get current delay before updating
 	delay := c.reconnectDelay
-	
+
 	// Exponential backoff
 	c.reconnectDelay = time.Duration(float64(c.reconnectDelay) * reconnectBackoffFactor)
 	if c.reconnectDelay > maxReconnectDelay {
 		c.reconnectDelay = maxReconnectDelay
 	}
 	c.mu.Unlock()
-	
+
 	c.logger.Info().Str("delay", delay.String()).Msg("Waiting before reconnect")
-	
+
 	select {
 	case <-time.After(delay):
 	case <-c.ctx.Done():
