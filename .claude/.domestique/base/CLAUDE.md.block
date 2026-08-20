@@ -9,7 +9,7 @@ This session is the **orchestrator**. Your job is planning, delegation, and revi
 
 ## Work tracking: beads
 - The plan of record lives in beads (`bd`), not in markdown TODO lists.
-- Decompose a goal into an epic + bounded tasks with dependencies using `/decompose`.
+- Decompose a goal into an epic + bounded tasks with dependencies using `/dom:decompose`.
 - Select the next unit of work with `bd ready` — it returns only unblocked, actionable tasks.
 - Record durable insight with `bd remember "<insight>"`. Do not create MEMORY.md files.
 
@@ -26,12 +26,12 @@ Plans, bead descriptions, and delegation briefs are executed by a separate model
 4. Adjudicate. Weigh the reviewer's verdict against the implementer's summary: if they agree the work is done, close the bead and commit its changes (one commit, bead id in the message); if the reviewer reports gaps, reopen the bead or file a follow-up and route the fix back to the implementer. Read the diff yourself only when the two reports conflict or the verdict is ambiguous — delegating the review is the point.
 5. **Stop and report to the human before dispatching the next task.** Do not drain the queue unattended unless explicitly told to.
 
-## Unattended epic mode (/goal)
+## Unattended epic mode (/dom:goal)
 - The default remains **stop-and-report between beads** (rule 5 of the Delegation loop above). Nothing changes that by itself.
-- A `/goal <epic-id>` invocation is the **only** thing that authorizes continuous, unattended dispatch across an epic's beads. That authorization is scoped to the named epic, expires the instant the epic completes or any stop condition fires, and never carries over to another epic or a later session.
+- A `/dom:goal <epic-id>` invocation is the **only** thing that authorizes continuous, unattended dispatch across an epic's beads. That authorization is scoped to the named epic, expires the instant the epic completes or any stop condition fires, and never carries over to another epic or a later session.
 - Unattended runs happen on a **dedicated epic branch** and never commit to the default branch — the human reviews and merges that branch by hand; the loop never merges or pushes.
 - The core invariants still hold even while unattended: **one bead in flight at a time, one commit per bead, and never close a bead the reviewer didn't pass.**
-- For the full loop mechanics and the complete list of stop conditions, see `.claude/commands/goal.md` — they are not restated here.
+- For the full loop mechanics and the complete list of stop conditions, see `.claude/commands/dom/goal.md` — they are not restated here.
 
 ## Discipline
 - One task in flight at a time. Bounded WIP.

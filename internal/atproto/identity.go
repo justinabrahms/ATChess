@@ -210,6 +210,14 @@ func (r *identityResolver) fetchJSON(ctx context.Context, u string) (*DIDDocumen
 // staying attached to the host segment), and when there is no explicit path
 // the document lives at /.well-known/did.json; otherwise it lives at
 // <path>/did.json.
+//
+// The host segment (segments[0], after decoding) is validated by
+// validateDIDWebHost -- see that function's doc comment for exactly what it
+// rejects and why this must run AFTER url.PathUnescape (atchess-1c9.70).
+// This is the single choke point every did:web caller shares (both
+// fetchDIDDocument call sites below go through here), mirroring
+// normalizeAndValidateHandle's single-choke-point approach for handles
+// (atchess-1c9.69).
 func didWebDocumentURL(did string) (string, error) {
 	id := strings.TrimPrefix(did, "did:web:")
 	if id == "" {
@@ -227,10 +235,63 @@ func didWebDocumentURL(did string) (string, error) {
 		segments[i] = decoded
 	}
 	host := segments[0]
+	if err := validateDIDWebHost(host); err != nil {
+		return "", fmt.Errorf("invalid did:web identifier %q: %w", did, err)
+	}
 	if len(segments) == 1 {
 		return "https://" + host + "/.well-known/did.json", nil
 	}
 	return "https://" + host + "/" + strings.Join(segments[1:], "/") + "/did.json", nil
+}
+
+// validateDIDWebHost validates host -- the FIRST colon-separated segment of
+// a did:web identifier, already percent-DECODED by didWebDocumentURL above
+// -- before it is used to build the https:// URL a DID document is fetched
+// from (atchess-1c9.70, found during review of atchess-1c9.69).
+//
+// This MUST run on the already-decoded value, not the raw segment:
+// url.PathUnescape is exactly what lets a caller smuggle the ':' and '/'
+// characters that would otherwise be structurally impossible in a bare
+// colon-separated segment. For example "127.0.0.1%3A8080" decodes to
+// "127.0.0.1:8080" (an IP literal with an attacker-chosen port) and
+// "evil.example%2F.." decodes to "evil.example/.." (a path segment injected
+// into what should be a bare hostname) -- both would otherwise sail through
+// unvalidated straight into "https://" + host + ...
+//
+// Rejects a host that:
+//   - is an IP literal in ANY spelling (dotted-quad, hex, octal,
+//     short-form, or IPv6) -- via the same rejectIPLiteralSpelling logic
+//     normalizeAndValidateHandle uses for handles, so this SSRF-relevant
+//     analysis is written once rather than drifting between two copies;
+//   - carries userinfo ("@");
+//   - specifies a port (":") -- this also catches every IPv6 literal
+//     spelling, since IPv6 addresses always contain ':';
+//   - contains a path separator ("/"), including one smuggled in via a
+//     percent-encoded form that only becomes '/' after decoding.
+//
+// Deliberately NOT validated here: did:web's remaining (non-host) path
+// segments. A hostile %2F in one of those can only inject an extra path
+// component on the same, already-host-validated origin -- a narrower issue
+// than steering the request to a different host entirely, and out of this
+// bead's scope (grammar/structure validation of the HOST component only;
+// see atchess-1c9.70's done-criteria).
+func validateDIDWebHost(host string) error {
+	if host == "" {
+		return fmt.Errorf("did:web host is empty")
+	}
+	if strings.ContainsRune(host, '@') {
+		return fmt.Errorf("did:web host %q must not contain userinfo (\"@\")", host)
+	}
+	if strings.ContainsRune(host, ':') {
+		return fmt.Errorf("did:web host %q must not specify a port (and must not be an IPv6 literal)", host)
+	}
+	if strings.ContainsRune(host, '/') {
+		return fmt.Errorf("did:web host %q must not contain a path separator", host)
+	}
+	if err := rejectIPLiteralSpelling(host); err != nil {
+		return fmt.Errorf("did:web host %q is not a valid hostname: %w", host, err)
+	}
+	return nil
 }
 
 // --- Handle resolution -----------------------------------------------------
@@ -331,33 +392,59 @@ func normalizeAndValidateHandle(handle string) (string, error) {
 	}
 
 	// Per the AT Protocol spec, the FINAL label must not start with an
-	// ASCII digit. See the doc comment above for why this matters well
-	// beyond spec conformance: it is what makes hex/octal/short-form IP
-	// address spellings (e.g. "169.254.169.0xfe", "0xa9.0xfe.0xa9.0xfe",
-	// "127.1", "0x7f.0.0.1", "010.010.010.010" -- all of which some
-	// resolvers, including glibc's, parse as numeric addresses) structurally
-	// unrepresentable as a valid handle, closing off a bypass class the
-	// dotted-quad-only net.ParseIP check just below cannot catch on its
-	// own. Do not remove this thinking net.ParseIP alone is sufficient.
-	finalLabel := labels[len(labels)-1]
-	if finalLabel[0] >= '0' && finalLabel[0] <= '9' {
-		return "", fmt.Errorf("invalid handle %q: final label %q must not start with a digit", handle, finalLabel)
-	}
-
-	// A handle that is syntactically a bare IP literal (e.g. "127.0.0.1" or
-	// an IPv6 literal) would otherwise satisfy the label grammar above --
-	// digits are valid label characters -- while still being exactly the
-	// SSRF-relevant shape this validation exists to close off: it would
-	// steer a server-side fetch straight at an attacker-chosen IP address
-	// instead of resolving through real handle infrastructure at all. This
-	// is a belt-and-braces guard for plain dotted-quad/IPv6 literals; the
-	// final-label-digit rule above is what actually closes off the wider
-	// class of alternate numeric-address spellings.
-	if net.ParseIP(normalized) != nil {
-		return "", fmt.Errorf("invalid handle %q: bare IP literals are not valid handles", handle)
+	// ASCII digit -- and a handle that is syntactically a bare IP literal
+	// would otherwise satisfy the label grammar above (digits are valid
+	// label characters) while being exactly the SSRF-relevant shape this
+	// validation exists to close off. See rejectIPLiteralSpelling's doc
+	// comment for the full rationale and the glibc numeric-address examples
+	// this closes off. Do not remove this thinking net.ParseIP alone is
+	// sufficient.
+	if err := rejectIPLiteralSpelling(normalized); err != nil {
+		return "", fmt.Errorf("invalid handle %q: %w", handle, err)
 	}
 
 	return normalized, nil
+}
+
+// rejectIPLiteralSpelling returns a non-nil error if s could be interpreted
+// by some resolver as a numeric IP address, in ANY spelling a real-world
+// resolver might accept -- not just what net.ParseIP itself recognizes.
+// Shared by normalizeAndValidateHandle (handles, atchess-1c9.69) and
+// validateDIDWebHost (did:web hosts, atchess-1c9.70) so this SSRF-relevant
+// analysis is written once instead of two copies that can silently drift
+// apart.
+//
+// The final-label-must-not-start-with-a-digit check below
+// (https://atproto.com/specs/handle: "the final domain label must not
+// start with a digit") is not cosmetic: it is what makes a bare IP literal
+// -- in ANY of the forms a resolver's address parser might accept, not
+// just dotted-quad -- structurally unable to satisfy the handle grammar at
+// all, closing off a whole class of bypass that a dotted-quad-only
+// net.ParseIP check (below) cannot catch. glibc's resolver (which cgo's
+// name resolution uses, selected automatically by Go on many nsswitch
+// configs) accepts numeric-address forms far looser than dotted-quad,
+// e.g.: "169.254.169.0xfe" and "0xa9.0xfe.0xa9.0xfe" both resolve to
+// 169.254.169.254 (the cloud metadata address), "127.1" and "0x7f.0.0.1"
+// both resolve to 127.0.0.1, and "010.010.010.010" resolves to 8.8.8.8 (its
+// octets are octal). Every one of those has a final label beginning with a
+// digit, so this rule rejects all of them even though net.ParseIP does
+// not recognize any of those forms as an IP and would let them through.
+//
+// net.ParseIP is still checked too, as a belt-and-braces guard for plain
+// dotted-quad/IPv6 literals that (for a handle) would already be caught by
+// the label-character regexp or the final-label rule above in every case
+// this project has identified -- kept as defense in depth in case that
+// ever stops being true for some caller of this shared helper.
+func rejectIPLiteralSpelling(s string) error {
+	labels := strings.Split(s, ".")
+	finalLabel := labels[len(labels)-1]
+	if finalLabel != "" && finalLabel[0] >= '0' && finalLabel[0] <= '9' {
+		return fmt.Errorf("final label %q must not start with a digit (a numeric-address spelling in some resolvers)", finalLabel)
+	}
+	if net.ParseIP(s) != nil {
+		return fmt.Errorf("%q is a bare IP literal", s)
+	}
+	return nil
 }
 
 // resolveHandleViaDNS looks up the "_atproto.<handle>" TXT record per the AT

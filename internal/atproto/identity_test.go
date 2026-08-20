@@ -2,8 +2,10 @@ package atproto
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -60,6 +62,19 @@ func TestResolvePDS_DIDPLC(t *testing.T) {
 // https://<host>/.well-known/did.json, exercised against a real (self-
 // signed) TLS listener since didWebDocumentURL always builds an https://
 // URL -- a plain httptest.Server (http) cannot stand in for it.
+//
+// This is also the REQUIRED control for
+// TestFetchDIDDocument_RejectsHostileDIDWebHostsBeforeAnyRequest
+// (atchess-1c9.70): it proves validateDIDWebHost is not simply rejecting
+// everything, by confirming an ordinary, portless, non-IP-literal did:web
+// host still resolves successfully end to end. The did:web identifier
+// itself ("did:web:example.com") deliberately carries NO port -- since
+// atchess-1c9.70, validateDIDWebHost unconditionally rejects any ':' in a
+// did:web host -- so this test cannot simply point at the test server's own
+// ephemeral port the way it used to. Instead it uses a redirecting
+// transport (dialRedirectClient) that dials the real ephemeral-port TLS
+// listener regardless of what host the request nominally targets, so the
+// did:web string under test stays a realistic, portless production shape.
 func TestResolvePDS_DIDWeb(t *testing.T) {
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/.well-known/did.json" {
@@ -77,13 +92,10 @@ func TestResolvePDS_DIDWeb(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	// srv.Listener.Addr() is host:port on 127.0.0.1; did:web encodes the
-	// literal ':' before a port as %3A per the did:web spec.
-	hostPort := srv.Listener.Addr().String()
-	did := "did:web:" + strings.ReplaceAll(hostPort, ":", "%3A")
+	const did = "did:web:example.com" // ordinary, portless, non-IP-literal host
 
 	r := newTestResolver(DefaultPLCDirectoryURL) // irrelevant for did:web
-	r.httpClient = srv.Client()                  // trusts the test server's self-signed cert
+	r.httpClient = dialRedirectClient(srv.Listener.Addr().String())
 
 	got, err := r.resolvePDS(context.Background(), did)
 	if err != nil {
@@ -91,6 +103,83 @@ func TestResolvePDS_DIDWeb(t *testing.T) {
 	}
 	if want := "https://pds-b.example"; got != want {
 		t.Errorf("resolvePDS = %q, want %q", got, want)
+	}
+}
+
+// dialRedirectClient returns an *http.Client whose every TLS connection is
+// actually dialed to target, regardless of the request's nominal host --
+// used to let a test exercise a realistic, portless did:web identifier
+// (e.g. "did:web:example.com") while the request is really served by a
+// local httptest.NewTLSServer listening on an unrelated ephemeral port.
+// TLS certificate verification is skipped (this is test-only plumbing
+// against a self-signed cert, never production code).
+func dialRedirectClient(target string) *http.Client {
+	dialer := &tls.Dialer{Config: &tls.Config{InsecureSkipVerify: true}} //nolint:gosec // test-only, self-signed cert
+	return &http.Client{
+		Transport: &http.Transport{
+			DialTLSContext: func(ctx context.Context, network, _ string) (net.Conn, error) {
+				return dialer.DialContext(ctx, network, target)
+			},
+		},
+	}
+}
+
+// countingRoundTripper counts every outbound RoundTrip attempt and never
+// lets one actually reach the network -- used to prove a hostile did:web
+// identifier is rejected BEFORE fetchDIDDocument ever constructs/dispatches
+// a request (atchess-1c9.70), the same "zero outbound requests" standard
+// atchess-1c9.69 established for hostile handles.
+type countingRoundTripper struct{ n int }
+
+func (c *countingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	c.n++
+	return nil, fmt.Errorf("countingRoundTripper: unexpected outbound request to %s", req.URL)
+}
+
+// TestFetchDIDDocument_RejectsHostileDIDWebHostsBeforeAnyRequest is the
+// core regression test for atchess-1c9.70 (found during review of
+// atchess-1c9.69): ResolveHandle's "if strings.HasPrefix(handle, \"did:\")"
+// short-circuit returns a did:web identifier unvalidated, and
+// didWebDocumentURL used to build "https://" + host + ... with no
+// validation of host at all -- after url.PathUnescape-ing each
+// colon-separated segment, which is exactly what lets a caller smuggle the
+// ':' and '/' characters a bare segment could otherwise never contain.
+//
+// This proves each hostile host shape is rejected by fetchDIDDocument with
+// ZERO outbound requests -- not merely that an error comes back -- via
+// countingRoundTripper, which would be hit by any request that actually got
+// dispatched.
+func TestFetchDIDDocument_RejectsHostileDIDWebHostsBeforeAnyRequest(t *testing.T) {
+	hostile := []struct {
+		name string
+		did  string
+	}{
+		{"bare IPv4 literal (direct SSRF target, e.g. cloud metadata IP shape)", "did:web:169.254.169.254"},
+		// Not a plain dotted-quad, so net.ParseIP alone would miss it --
+		// caught only by rejectIPLiteralSpelling's final-label-must-not-
+		// start-with-a-digit rule (shared with normalizeAndValidateHandle,
+		// atchess-1c9.69). glibc's inet_aton (the cgo resolver) resolves
+		// this exact string to 169.254.169.254, the cloud metadata address.
+		{"hex-last-octet IPv4 spelling of the cloud metadata address (bypasses a dotted-quad-only net.ParseIP check)", "did:web:169.254.169.0xfe"},
+		{"percent-encoded port (%3A) on a loopback IP literal -- decodes to 127.0.0.1:8080", "did:web:127.0.0.1%3A8080"},
+		{"percent-encoded port (%3A) on an otherwise ordinary host -- decodes to evil.example:8080", "did:web:evil.example%3A8080"},
+		{"percent-encoded path separator (%2F) injects a path segment into the host -- decodes to evil.example/..", "did:web:evil.example%2F.."},
+		{"literal userinfo (@) in the host", "did:web:attacker@evil.example"},
+	}
+
+	for _, tc := range hostile {
+		t.Run(tc.name, func(t *testing.T) {
+			rt := &countingRoundTripper{}
+			r := newTestResolver(DefaultPLCDirectoryURL)
+			r.httpClient = &http.Client{Transport: rt}
+
+			if _, err := r.fetchDIDDocument(context.Background(), tc.did); err == nil {
+				t.Fatalf("fetchDIDDocument(%q) unexpectedly succeeded, want a validation error", tc.did)
+			}
+			if rt.n != 0 {
+				t.Errorf("fetchDIDDocument(%q) made %d outbound request(s) beyond validation, want 0 (validation must reject it before any request is dispatched)", tc.did, rt.n)
+			}
+		})
 	}
 }
 
@@ -110,9 +199,16 @@ func TestDIDWebDocumentURL(t *testing.T) {
 			want: "https://example.com/.well-known/did.json",
 		},
 		{
-			name: "host with %3A-encoded port -> /.well-known/did.json",
-			did:  "did:web:localhost%3A2583",
-			want: "https://localhost:2583/.well-known/did.json",
+			// A did:web host specifying a port is rejected outright
+			// (atchess-1c9.70): validateDIDWebHost bans any ':' in the
+			// decoded host segment, which also covers IPv6 literals (always
+			// ':'-bearing). This is a deliberate, unconditional restriction --
+			// not merely "no port on an IP literal" -- see
+			// validateDIDWebHost's doc comment for the full rejection list
+			// and rationale.
+			name:    "host with %3A-encoded port is rejected (atchess-1c9.70: no port on a did:web host)",
+			did:     "did:web:localhost%3A2583",
+			wantErr: true,
 		},
 		{
 			name: "host with path segments -> <path>/did.json",
