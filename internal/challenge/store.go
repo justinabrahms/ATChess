@@ -48,11 +48,12 @@ type PendingChallenge struct {
 // it), even though both currently have the same observable effect on
 // ForPlayer (excluded).
 //
-// statusAccepted is reserved for a future accept-flow that explicitly
-// marks a challenge consumed (see PendingChallenge's ProposedGameID /
-// atproto.Client.CreateGameFromChallenge) -- no caller sets it yet, but
-// the schema models it now so adding that call site later does not
-// require a migration.
+// statusAccepted is set by MarkAccepted once a challenge has been
+// accepted (atchess-1c9.29: internal/web.Service.AcceptChallengeHandler,
+// after atproto.Client.AcceptChallenge succeeds) -- the same treatment as
+// statusDeclined/statusRemoved: a tombstone that survives a restart and
+// can never be resurrected by a later out-of-order replay of the original
+// "create" (Add's ON CONFLICT DO NOTHING).
 const (
 	statusOpen     = "open"
 	statusDeclined = "declined"
@@ -282,6 +283,25 @@ func (s *Store) ForPlayer(challengedDID string) ([]*PendingChallenge, error) {
 func (s *Store) Remove(challengeURI string) error {
 	if _, err := s.db.Exec(`UPDATE challenges SET status = ? WHERE uri = ?`, statusDeclined, challengeURI); err != nil {
 		return fmt.Errorf("declining challenge %s: %w", challengeURI, err)
+	}
+	return nil
+}
+
+// MarkAccepted marks a challenge as accepted (see
+// internal/web.Service.AcceptChallengeHandler, which calls this after
+// atproto.Client.AcceptChallenge succeeds). Like Remove, the row is NOT
+// deleted -- its status is updated to statusAccepted so it stops
+// appearing in ForPlayer while remaining durably distinguishable, across a
+// restart, from a challenge that was simply never indexed, declined, or
+// removed (see the status constants' doc comments). A URI with no
+// matching row is not an error (mirrors Remove's same no-op-if-unknown
+// behavior): the local index is a latency optimization
+// (CreateChallengeHandler's doc comment), not the source of truth, so its
+// absence here must never block or fail the accept it is merely trying to
+// reflect.
+func (s *Store) MarkAccepted(challengeURI string) error {
+	if _, err := s.db.Exec(`UPDATE challenges SET status = ? WHERE uri = ?`, statusAccepted, challengeURI); err != nil {
+		return fmt.Errorf("marking challenge %s accepted: %w", challengeURI, err)
 	}
 	return nil
 }

@@ -577,6 +577,23 @@ func TestLexiconConformance(t *testing.T) {
 		capture("CreateGame", pds, before)
 	})
 
+	// atchess-1c9.29: CreateGameFromChallenge is the only writer that ever
+	// sets app.atchess.game's optional "challenge" object (a
+	// com.atproto.repo.strongRef of uri+cid) -- CreateGame above never
+	// does. Before atchess-1c9.29 gave it a production caller
+	// (AcceptChallenge), this suite's coverage of app.atchess.game never
+	// actually exercised that field, so a lexicon/writer drift there could
+	// have gone unnoticed (see this file's top-of-file doc comment for the
+	// general shape of that class of bug). This fixture closes that gap.
+	t.Run("setup/CreateGameFromChallenge", func(t *testing.T) {
+		client, pds := newTestClient(t)
+		before := len(pds.captured)
+		if _, err := client.CreateGameFromChallenge(ctx, fakeDID, "white", "fromchallengerkey", "at://did:plc:opponent/app.atchess.challenge/chal001", "challenge-cid-1"); err != nil {
+			t.Fatalf("CreateGameFromChallenge failed: %v", err)
+		}
+		capture("CreateGameFromChallenge", pds, before)
+	})
+
 	t.Run("setup/CreateChallenge", func(t *testing.T) {
 		client, pds := newTestClient(t)
 		before := len(pds.captured)

@@ -299,6 +299,7 @@ func main() {
 	authed.HandleFunc("/challenges", service.CreateChallengeHandler).Methods("POST")
 	authed.HandleFunc("/challenge-notifications", service.GetChallengeNotificationsHandler).Methods("GET")
 	authed.HandleFunc("/challenge-notifications/{key}", service.DeclineChallengeHandler).Methods("DELETE")
+	authed.HandleFunc("/challenge-notifications/{key}/accept", service.AcceptChallengeHandler).Methods("POST")
 	authed.HandleFunc("/draw-offers", service.OfferDrawHandler).Methods("POST")
 	authed.HandleFunc("/draw-offers/respond", service.RespondToDrawHandler).Methods("POST")
 	authed.HandleFunc("/resign", service.ResignGameHandler).Methods("POST")
@@ -337,6 +338,9 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 	}).Methods("OPTIONS")
 	api.HandleFunc("/challenge-notifications/{key}", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}).Methods("OPTIONS")
+	api.HandleFunc("/challenge-notifications/{key}/accept", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}).Methods("OPTIONS")
 	api.HandleFunc("/draw-offers", func(w http.ResponseWriter, r *http.Request) {

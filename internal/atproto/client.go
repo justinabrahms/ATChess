@@ -41,6 +41,81 @@ import (
 // atchess-1c9.51.
 var ErrIncompleteDerivation = errors.New("game status derivation incomplete: one or more repos could not be read")
 
+// ErrRecordNotFound indicates a requested AT Protocol record genuinely
+// does not exist, inferred from the PDS response body's structured
+// "error" field being "RecordNotFound" -- NOT from the HTTP status code
+// alone, because real AT Protocol PDS implementations disagree on which
+// status they use for it (this codebase's own two in-memory PDS test
+// doubles disagree too: internal/atproto/lexicon_test.go's fakePDS uses
+// HTTP 400, internal/atproto/derive_status_test.go's deriveTestPDS uses
+// HTTP 404), so the status code by itself is not a reliable signal. See
+// isRecordNotFoundBody, and AcceptChallenge for the caller that most
+// depends on this distinction (a record genuinely not existing yet is a
+// normal, expected state there -- some other read failure is not).
+var ErrRecordNotFound = errors.New("record not found")
+
+// ErrRecordUnavailable indicates a record read failed for a reason OTHER
+// than the record genuinely not existing: a network error, an
+// unreachable PDS, a DID-resolution failure, or a non-RecordNotFound
+// error response from the PDS. Callers that need to tell "this doesn't
+// exist" apart from "could not tell" -- see AcceptChallenge -- must
+// treat this case very differently (a transient dependency failure, not
+// a verdict about what exists).
+var ErrRecordUnavailable = errors.New("record temporarily unavailable")
+
+// ErrNotChallengeParticipant indicates the authenticated caller is
+// neither the challenger nor the challenged party named in a challenge
+// record -- see AcceptChallenge.
+var ErrNotChallengeParticipant = errors.New("caller is not a participant in this challenge")
+
+// ErrOnlyChallengedMayAccept indicates the caller is a challenge's
+// challenger rather than its challenged party. Only the challenged party
+// may ever call AcceptChallenge successfully -- this is checked BEFORE
+// AcceptChallenge ever looks for an existing game record, precisely so a
+// challenger can never reach the idempotent read-back path either (see
+// AcceptChallenge's doc comment; this was a real, reviewer-found gap in
+// an earlier version of this method, fixed as part of atchess-1c9.29).
+var ErrOnlyChallengedMayAccept = errors.New("only the challenged player may accept this challenge")
+
+// ErrChallengeConflict indicates a record already exists at the
+// challenge-derived game URI that does NOT genuinely belong to this
+// accept: either its own "challenge" back-reference does not name this
+// exact challengeURI (a forged/crafted proposedGameId colliding with an
+// unrelated, pre-existing game -- see AcceptChallenge's doc comment), or
+// the caller is not one of that record's two players. This is a genuine
+// conflict, never treated as idempotent success: the caller must not be
+// handed someone else's game, and the challenge must not be silently
+// treated as consumed by MarkAccepted (internal/web's
+// AcceptChallengeHandler must not call MarkAccepted when this error is
+// returned).
+var ErrChallengeConflict = errors.New("challenge conflicts with an existing, unrelated game record")
+
+// ErrChallengeNotAcceptable indicates the challenge record itself is not
+// in an acceptable state: its own "status" field is "declined" or
+// "accepted", or its "expiresAt" is in the past. See AcceptChallenge's
+// doc comment for this check's known limitation (it cannot see a decline
+// recorded as a SEPARATE app.atchess.challengeResponse record in the
+// decliner's own repo -- that requires a cross-repo read this method does
+// not perform; tracked as separate follow-up work, out of scope here).
+var ErrChallengeNotAcceptable = errors.New("challenge is not in an acceptable state")
+
+// isRecordNotFoundBody reports whether an AT Protocol error response body
+// carries the structured "RecordNotFound" error code. Used instead of the
+// HTTP status code alone -- see ErrRecordNotFound's doc comment for why.
+// A body that isn't valid JSON, or has no matching "error" field, is not
+// treated as RecordNotFound (fail closed: an unparseable/unexpected body
+// is exactly the "could not tell" case ErrRecordUnavailable exists for,
+// not "confirmed absent").
+func isRecordNotFoundBody(body []byte) bool {
+	var e struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(body, &e); err != nil {
+		return false
+	}
+	return e.Error == "RecordNotFound"
+}
+
 type Client struct {
 	pdsURL      string
 	accessJWT   string
@@ -506,6 +581,221 @@ func (c *Client) createGame(ctx context.Context, opponentDID, color string, rkey
 	}, nil
 }
 
+// gameFromRecordValue builds a *chess.Game from a raw app.atchess.game
+// record's decoded fields (as returned by getGameRecord) plus the
+// record's own at:// URI. Used by AcceptChallenge's idempotent path to
+// return an EXISTING game record in exactly the shape createGame already
+// returns for a freshly-created one.
+func gameFromRecordValue(uri string, value map[string]interface{}) *chess.Game {
+	white, _ := value["white"].(string)
+	black, _ := value["black"].(string)
+	status, _ := value["status"].(string)
+	fen, _ := value["fen"].(string)
+	pgn, _ := value["pgn"].(string)
+	createdAt, _ := value["createdAt"].(string)
+	return &chess.Game{
+		ID:        uri,
+		White:     white,
+		Black:     black,
+		Status:    chess.GameStatus(status),
+		FEN:       fen,
+		PGN:       pgn,
+		CreatedAt: createdAt,
+	}
+}
+
+// gameRecordReferencesChallenge reports whether a raw app.atchess.game
+// record's "challenge" strongRef names challengeURI exactly. Used by
+// AcceptChallenge to verify a record found at a challenge-derived game URI
+// genuinely traces back to THIS challenge, rather than being an unrelated
+// pre-existing (or crafted-collision) record that merely happens to share
+// the same rkey -- see AcceptChallenge's doc comment for the exploit this
+// closes (atchess-1c9.29 review fix).
+func gameRecordReferencesChallenge(value map[string]interface{}, challengeURI string) bool {
+	ref, ok := value["challenge"].(map[string]interface{})
+	if !ok {
+		return false
+	}
+	uri, _ := ref["uri"].(string)
+	return uri == challengeURI
+}
+
+// AcceptChallenge implements the accept side of a challenge exchange for
+// the caller identified by c.did (an *atproto.Client built from the
+// accepting request's own AT Protocol session -- see
+// internal/web.Service.AcceptChallengeHandler, the only production
+// caller). challengeURI is the challenge's own at:// URI
+// (at://<challenger-did>/app.atchess.challenge/<rkey>).
+//
+// AUTHORISATION is checked against the challenge record ITSELF -- read
+// directly from the challenger's repo via challengeURI -- never trusted
+// from caller-supplied input. Only the challenged party may EVER
+// successfully call this method: a non-participant gets
+// ErrNotChallengeParticipant, and the challenger themselves (a real
+// participant, but the wrong one) gets ErrOnlyChallengedMayAccept. That
+// check runs BEFORE this method ever looks for an existing game record --
+// see the TOCTOU note below for why an earlier version of this ordering
+// was a real, reviewer-found vulnerability.
+//
+// The challenge record's OWN "status" and "expiresAt" fields are also
+// checked: "declined" or "accepted" status, or a past expiresAt, are
+// rejected with ErrChallengeNotAcceptable rather than silently accepted.
+// KNOWN LIMITATION: a decline is actually recorded as a SEPARATE
+// app.atchess.challengeResponse record in the DECLINING player's own
+// repo (see RespondToChallenge), not as a status flip on the challenge
+// record itself -- this method does not perform that cross-repo read, so
+// it cannot durably detect every decline this way. That gap is tracked as
+// separate follow-up work (out of scope for atchess-1c9.29); this check
+// only catches a challenge record whose own status/expiresAt fields make
+// the answer obvious without a second read.
+//
+// IDEMPOTENCY: the resulting game's rkey is the challenge's own
+// proposedGameId -- deterministic, not random -- and the game always
+// lives in the CHALLENGED player's own repo (createGame/
+// CreateGameFromChallenge always write to the CALLING client's own repo,
+// and only the challenged player is ever authorized to make that call --
+// see above, and note this means the challenger can never reach the
+// idempotent read-back path at all, only the challenged player can). So,
+// for the challenged player only, AcceptChallenge checks whether that
+// exact record already exists BEFORE attempting to create it. A record
+// existing there is trusted ONLY if BOTH: (1) its own "challenge"
+// strongRef names this exact challengeURI (gameRecordReferencesChallenge)
+// -- otherwise a forged challenge whose proposedGameId was crafted to
+// collide with an unrelated pre-existing game's rkey would silently hand
+// back that unrelated game (and, worse, let the caller's
+// AcceptChallengeHandler treat the crafted challenge as durably consumed
+// -- see ErrChallengeConflict); and (2) the caller is one of that
+// record's own white/black players -- otherwise the SAME crafted-rkey
+// technique could hand a challenger a genuine but unrelated game's data
+// merely because it happens to occupy the derived URI. Either failing
+// returns ErrChallengeConflict, a genuine conflict, NEVER treated as
+// idempotent success. Only once both hold is the record returned as-is,
+// and no second game record is ever created for the same challenge. This
+// makes a duplicate accept (e.g. a double-click, or a client retrying
+// after a dropped response) by the challenged player safe to repeat --
+// see atchess-1c9.29's orchestrator notes for why idempotent, rather than
+// an error, is the right choice for THAT case. A narrow TOCTOU is still
+// possible between the existence check and the create call (e.g. two
+// near-simultaneous accepts from the same challenged-player session);
+// CreateGameFromChallenge failing in that case is handled the same way,
+// by re-reading once (and re-verifying both of the same two conditions)
+// before giving up, rather than surfaced as an error.
+//
+// FAILURE TO READ THE CHALLENGE ITSELF is deliberately NOT treated as "it
+// doesn't exist, so create the game anyway" -- that would risk creating a
+// game whose challenge back-reference nobody can ever re-verify, exactly
+// the dangling-reference outcome atchess-1c9.29 warns against. A
+// genuinely missing challenge record (the PDS reports RecordNotFound)
+// returns an error wrapping ErrRecordNotFound (callers should treat this
+// as 404 -- the challenge really doesn't exist). Any OTHER read failure
+// (network error, unreachable PDS, DID-resolution failure, a
+// non-RecordNotFound PDS error) returns an error wrapping
+// ErrRecordUnavailable (callers should treat this as 502 -- a transient
+// upstream problem, not a verdict about whether the challenge exists).
+func (c *Client) AcceptChallenge(ctx context.Context, challengeURI string) (*chess.Game, error) {
+	cid, record, err := c.getRecordByURI(ctx, challengeURI)
+	if err != nil {
+		if errors.Is(err, ErrRecordNotFound) {
+			return nil, fmt.Errorf("challenge %s: %w", challengeURI, ErrRecordNotFound)
+		}
+		return nil, fmt.Errorf("challenge %s: %w: %v", challengeURI, ErrRecordUnavailable, err)
+	}
+
+	if typ, _ := record["$type"].(string); typ != "app.atchess.challenge" {
+		return nil, fmt.Errorf("challenge %s: record is not an app.atchess.challenge (got %q)", challengeURI, typ)
+	}
+
+	challengerDID, _ := record["challenger"].(string)
+	challengedDID, _ := record["challenged"].(string)
+	challengerColor, _ := record["color"].(string)
+	proposedGameID, _ := record["proposedGameId"].(string)
+	status, _ := record["status"].(string)
+	expiresAtStr, _ := record["expiresAt"].(string)
+
+	if challengerDID == "" || challengedDID == "" {
+		return nil, fmt.Errorf("challenge %s: record is missing challenger/challenged", challengeURI)
+	}
+	if proposedGameID == "" {
+		return nil, fmt.Errorf("challenge %s: record has no proposedGameId to derive a game rkey from", challengeURI)
+	}
+
+	if c.did != challengerDID && c.did != challengedDID {
+		return nil, fmt.Errorf("%w: %s is neither challenger (%s) nor challenged (%s) for %s", ErrNotChallengeParticipant, c.did, challengerDID, challengedDID, challengeURI)
+	}
+
+	// Reject a challenge whose OWN record already says it is not
+	// acceptable -- see the doc comment above for this check's known
+	// limitation (it cannot see a decline recorded in a separate
+	// app.atchess.challengeResponse record).
+	if status == "declined" || status == "accepted" {
+		return nil, fmt.Errorf("%w: challenge %s has status %q", ErrChallengeNotAcceptable, challengeURI, status)
+	}
+	if expiresAtStr != "" {
+		if expiresAt, perr := time.Parse(time.RFC3339, expiresAtStr); perr == nil && time.Now().After(expiresAt) {
+			return nil, fmt.Errorf("%w: challenge %s expired at %s", ErrChallengeNotAcceptable, challengeURI, expiresAtStr)
+		}
+	}
+
+	// Only the challenged party may ever proceed past this point -- this
+	// MUST run before the existence check below. An earlier version of
+	// this method checked existence first, which let the CHALLENGER reach
+	// the idempotent read-back path too; combined with a
+	// proposedGameId crafted (or merely coincidentally colliding) with an
+	// unrelated pre-existing game's rkey, that let a challenger read
+	// another game's data despite never being one of its players. Gating
+	// on role FIRST means a challenger is rejected outright and never
+	// even performs the lookup that could leak that data.
+	if c.did != challengedDID {
+		return nil, fmt.Errorf("%w: %s", ErrOnlyChallengedMayAccept, c.did)
+	}
+
+	gameURI := fmt.Sprintf("at://%s/app.atchess.game/%s", challengedDID, proposedGameID)
+
+	if _, existingValue, gerr := c.getGameRecord(ctx, gameURI); gerr == nil {
+		if !gameRecordReferencesChallenge(existingValue, challengeURI) {
+			return nil, fmt.Errorf("%w: an existing game at the challenge-derived rkey for %s does not reference this challenge", ErrChallengeConflict, challengeURI)
+		}
+		white, _ := existingValue["white"].(string)
+		black, _ := existingValue["black"].(string)
+		if c.did != white && c.did != black {
+			return nil, fmt.Errorf("%w: %s is not a player of the existing game for %s", ErrChallengeConflict, c.did, challengeURI)
+		}
+		return gameFromRecordValue(gameURI, existingValue), nil
+	} else if !errors.Is(gerr, ErrRecordNotFound) {
+		return nil, fmt.Errorf("checking for an existing game for challenge %s: %w: %v", challengeURI, ErrRecordUnavailable, gerr)
+	}
+
+	// The CALLER's own color: the mirror image of what the challenger
+	// requested for themselves (challengerColor). Matches the frontend's
+	// prior client-side computation in acceptChallenge()
+	// (web/static/index.html) exactly, including its fallback: any value
+	// other than "white" (including "black", "random", or empty) leaves
+	// ourColor at its default "white".
+	ourColor := "white"
+	if challengerColor == "white" {
+		ourColor = "black"
+	}
+
+	game, err := c.CreateGameFromChallenge(ctx, challengerDID, ourColor, proposedGameID, challengeURI, cid)
+	if err != nil {
+		// A concurrent accept (double-click / retried request) may have
+		// created the record between the existence check above and this
+		// call. Re-read once before surfacing a failure: if a game now
+		// exists that genuinely traces back to this same challenge (same
+		// two conditions as the primary path above), treat it as the
+		// idempotent success case rather than an error.
+		if _, raceValue, rerr := c.getGameRecord(ctx, gameURI); rerr == nil && gameRecordReferencesChallenge(raceValue, challengeURI) {
+			white, _ := raceValue["white"].(string)
+			black, _ := raceValue["black"].(string)
+			if c.did == white || c.did == black {
+				return gameFromRecordValue(gameURI, raceValue), nil
+			}
+		}
+		return nil, fmt.Errorf("creating game for challenge %s: %w", challengeURI, err)
+	}
+	return game, nil
+}
+
 func (c *Client) RecordMove(ctx context.Context, gameURI string, move *chess.MoveResult) error {
 	// Fetch the game record to get its CID and current value
 	gameCID, gameValue, err := c.getGameRecord(ctx, gameURI)
@@ -761,6 +1051,9 @@ func (c *Client) getGameRecord(ctx context.Context, gameURI string) (string, map
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
+		if isRecordNotFoundBody(body) {
+			return "", nil, fmt.Errorf("game record %s: %w", gameURI, ErrRecordNotFound)
+		}
 		return "", nil, fmt.Errorf("failed to get game record: HTTP %d - %s", resp.StatusCode, string(body))
 	}
 
@@ -809,6 +1102,9 @@ func (c *Client) getRecordByURI(ctx context.Context, atURI string) (string, map[
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
+		if isRecordNotFoundBody(body) {
+			return "", nil, fmt.Errorf("record %s: %w", atURI, ErrRecordNotFound)
+		}
 		return "", nil, fmt.Errorf("failed to get record %s: HTTP %d - %s", atURI, resp.StatusCode, string(body))
 	}
 

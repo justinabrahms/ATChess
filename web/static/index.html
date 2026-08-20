@@ -1140,57 +1140,50 @@
             return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_');
         }
 
-        // Accept challenge
+        // Accept challenge. challengerDid/theirColor are no longer sent
+        // anywhere -- AcceptChallengeHandler (atchess-1c9.29) derives both
+        // the challenger and the accepting player's color itself, from the
+        // challenge record it reads directly off the wire (never from
+        // caller-supplied input; see atproto.Client.AcceptChallenge's doc
+        // comment). They remain as parameters only because
+        // displayChallenges' onclick handler still passes them positionally
+        // -- notificationUri (the challenge's own at:// URI) is the only
+        // one actually used below.
         async function acceptChallenge(notificationUri, challengerDid, theirColor) {
             try {
-                // Determine our color
-                let ourColor;
-                if (theirColor === 'white') {
-                    ourColor = 'black';
-                } else if (theirColor === 'black') {
-                    ourColor = 'white';
-                } else {
-                    ourColor = 'white';
-                }
-                
-                // Create game
-                const response = await fetch(`${API_BASE}/games`, {
+                const key = encodeChallengeKey(notificationUri);
+
+                // POST /api/challenge-notifications/{key}/accept
+                // (AcceptChallengeHandler) both creates the game AND, on
+                // success, marks the challenge accepted in this instance's
+                // local index server-side -- so, unlike the old
+                // POST /api/games path this replaces, there is no separate
+                // DELETE /api/challenge-notifications/{key} call to make
+                // here: that route means DECLINE (atchess-1c9.11), which
+                // would be wrong to send for a challenge that was just
+                // accepted, and the accept endpoint's own server-side
+                // cleanup (challenge.Store.MarkAccepted) makes a
+                // client-side DELETE unnecessary regardless.
+                const response = await fetch(`${API_BASE}/challenge-notifications/${key}/accept`, {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
                     },
-                    body: JSON.stringify({
-                        opponent_did: challengerDid,
-                        color: ourColor
-                    })
                 });
-                
-                if (!response.ok) {
-                    throw new Error('Failed to create game');
-                }
-                
-                const game = await response.json();
 
-                // NOTE: intentionally NOT calling
-                // DELETE /api/challenge-notifications/{key} here. That route
-                // now has real semantics (atchess-1c9.11): it records a
-                // DECLINE (an app.atchess.challengeResponse in the caller's
-                // own repo), which would be actively wrong to write for a
-                // challenge that was just ACCEPTED. There is no dedicated
-                // accept-link endpoint yet (POST /api/games does not
-                // reference the originating challenge at all, a separate,
-                // pre-existing gap -- see test/e2e/federation_test.go's
-                // ADAPTATION NOTE), so the accepted challenge may still
-                // reappear in the pending list until it expires; that is a
-                // known, distinct limitation, not something to paper over by
-                // mislabeling it as declined.
+                if (!response.ok) {
+                    const error = await response.text();
+                    throw new Error(error || 'Failed to accept challenge');
+                }
+
+                const game = await response.json();
 
                 // Load the game
                 loadGame(btoa(game.id).replace(/[+/]/g, c => ({'+': '-', '/': '_'})[c]));
-                
+
                 // Refresh challenges
                 loadChallenges();
-                
+
             } catch (error) {
                 alert('Error accepting challenge: ' + error.message);
             }

@@ -646,6 +646,129 @@ func (s *Service) DeclineChallengeHandler(w http.ResponseWriter, r *http.Request
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// AcceptChallengeHandler ("accept"; POST
+// /api/challenge-notifications/{key}/accept) is atchess-1c9.29's
+// accept-and-link endpoint: unlike the plain POST /api/games path it
+// replaces in the web UI (see web/static/index.html's acceptChallenge,
+// updated alongside this handler), the game record this produces carries
+// the originating challenge's uri+cid
+// (atproto.Client.CreateGameFromChallenge) and its rkey is derived from
+// the challenge rather than random (atproto.Client.AcceptChallenge).
+//
+// {key} is the challenge's full at:// URI, URL-safe-base64 encoded --
+// same encoding, same reason, as DeclineChallengeHandler's {key} (see its
+// doc comment): the challenge record lives in the CHALLENGER's repo, an
+// arbitrary DID this instance cannot reconstruct a full URI for from a
+// bare record key alone.
+//
+// AUTHORISATION is delegated entirely to atproto.Client.AcceptChallenge,
+// which verifies the caller against the challenge record ITSELF (read
+// directly from the challenger's repo), never against this instance's
+// local challenge.Store cache and never against any caller-supplied
+// field -- see that method's doc comment for the full
+// ownership/idempotency contract this handler is a thin HTTP wrapper
+// around. In particular: a duplicate accept by either of the challenge's
+// two participants returns the same existing game (200), and a caller who
+// is neither gets 403 -- this handler only translates that method's
+// sentinel errors into the matching HTTP status, it does not implement
+// the policy itself.
+func (s *Service) AcceptChallengeHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	encodedKey := vars["key"]
+	if encodedKey == "" {
+		http.Error(w, "Missing challenge key", http.StatusBadRequest)
+		return
+	}
+
+	challengeURI, err := s.decodeGameID(encodedKey)
+	if err != nil {
+		log.Error().Err(err).Str("encodedKey", encodedKey).Msg("Failed to decode challenge key")
+		http.Error(w, "Invalid challenge key", http.StatusBadRequest)
+		return
+	}
+
+	client, ok := s.requireClient(w, r)
+	if !ok {
+		return
+	}
+
+	game, err := client.AcceptChallenge(context.Background(), challengeURI)
+	if err != nil {
+		switch {
+		case errors.Is(err, atproto.ErrRecordNotFound):
+			// The challenge record itself genuinely does not exist (the
+			// PDS reported RecordNotFound) -- not the same thing as a
+			// transient read failure (atproto.ErrRecordUnavailable,
+			// handled below): see AcceptChallenge's doc comment for why
+			// these two are deliberately never conflated. A dangling
+			// challenge reference is never written in either case.
+			log.Warn().Err(err).Str("challengeURI", challengeURI).Msg("Accept: challenge record not found")
+			http.Error(w, "Challenge not found", http.StatusNotFound)
+		case errors.Is(err, atproto.ErrNotChallengeParticipant), errors.Is(err, atproto.ErrOnlyChallengedMayAccept):
+			// Either the caller is not one of this challenge's two
+			// parties at all, or they are its challenger trying to
+			// originate an accept that only the challenged party may
+			// perform. Both are ownership failures against the challenge
+			// record itself, not the caller's say-so -- 403, and
+			// specifically NOT the game record (see AcceptChallenge's doc
+			// comment on why leaking that would be an information leak).
+			log.Warn().Err(err).Str("challengeURI", challengeURI).Str("did", AuthenticatedDID(r)).Msg("Accept: caller not authorized")
+			http.Error(w, "Not authorized to accept this challenge", http.StatusForbidden)
+		case errors.Is(err, atproto.ErrChallengeConflict):
+			// A record already exists at the challenge-derived game URI
+			// that does NOT genuinely belong to this accept (its
+			// "challenge" back-reference names a different challenge --
+			// e.g. a proposedGameId crafted/colliding with an unrelated
+			// existing game -- or the caller is not one of that record's
+			// players). This is a genuine conflict, not idempotent
+			// success: the caller must not be handed someone else's game,
+			// and -- critically -- execution never reaches the
+			// MarkAccepted call below, so the challenge is NOT silently
+			// treated as consumed (atchess-1c9.29 review fix: this used
+			// to return 200 with an unrelated game and permanently burn
+			// the challenge).
+			log.Warn().Err(err).Str("challengeURI", challengeURI).Str("did", AuthenticatedDID(r)).Msg("Accept: existing record at derived game URI does not belong to this challenge")
+			http.Error(w, "Challenge conflicts with an existing game", http.StatusConflict)
+		case errors.Is(err, atproto.ErrChallengeNotAcceptable):
+			// The challenge record's own status ("declined"/"accepted")
+			// or expiresAt rules it out. See AcceptChallenge's doc
+			// comment for this check's known limitation (a decline
+			// recorded as a separate app.atchess.challengeResponse record
+			// is not detected here).
+			log.Warn().Err(err).Str("challengeURI", challengeURI).Msg("Accept: challenge is not in an acceptable state")
+			http.Error(w, "Challenge is no longer acceptable", http.StatusConflict)
+		case errors.Is(err, atproto.ErrRecordUnavailable):
+			// A transient upstream read failure (network, unreachable
+			// PDS, DID resolution) while checking the challenge or an
+			// existing game -- not a verdict that either does not exist.
+			// Fails closed rather than falling through to create a game
+			// with a possibly-dangling or duplicate reference.
+			log.Error().Err(err).Str("challengeURI", challengeURI).Msg("Accept: upstream record temporarily unavailable")
+			http.Error(w, "Challenge temporarily unavailable, try again", http.StatusBadGateway)
+		default:
+			log.Error().Err(err).Str("challengeURI", challengeURI).Msg("Failed to accept challenge")
+			http.Error(w, "Failed to accept challenge", http.StatusInternalServerError)
+		}
+		return
+	}
+
+	// Best-effort cleanup so the accepted challenge stops appearing in the
+	// challenged player's own pending list, using the statusAccepted
+	// status challenge.Store reserves for exactly this
+	// (internal/challenge/store.go). Logged, not fatal: the accept above
+	// already succeeded and is durable in AT Protocol; a failure here only
+	// leaves this instance's local cache stale until the challenge's
+	// expiresAt passes, not the accept itself in doubt.
+	if s.challengeStore != nil {
+		if err := s.challengeStore.MarkAccepted(challengeURI); err != nil {
+			log.Error().Err(err).Str("challengeURI", challengeURI).Msg("Failed to mark challenge accepted in local index")
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(game)
+}
+
 func (s *Service) OfferDrawHandler(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		GameID  string `json:"gameId"`
