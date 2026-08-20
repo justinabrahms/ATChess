@@ -1,7 +1,10 @@
 package firehose
 
 import (
+	"context"
+	"fmt"
 	"math/rand"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"runtime"
@@ -242,5 +245,130 @@ func TestClient_StopPromptDuringReconnectBackoff(t *testing.T) {
 
 	if elapsed > 2*time.Second {
 		t.Errorf("Stop() took %v during reconnect backoff, expected it to return promptly", elapsed)
+	}
+}
+
+// TestClient_StopPromptDuringMidDial verifies Stop() returns quickly even
+// while connect() is mid-dial to a host that accepts the TCP connection but
+// never responds -- the scenario defect A covers. On the pre-fix code this
+// blocks for the full ~30s dial timeout because gorilla/websocket's
+// DialContext only consults the context for the initial TCP dial; for the
+// subsequent HTTP upgrade write/read (where a wedged host actually hangs) it
+// converts ctx.Deadline() into a single absolute net.Conn.SetDeadline call
+// made once up front, and never notices ctx.Done() firing early. A raw TCP
+// listener (not an httptest/websocket server) is used deliberately so the
+// server never completes -- or even attempts -- the HTTP handshake.
+func TestClient_StopPromptDuringMidDial(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer ln.Close()
+
+	accepted := make(chan struct{})
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		close(accepted)
+		// Accept the connection but never write anything back and never
+		// close it -- the client's dial goroutine is left blocked reading
+		// an HTTP response that will never arrive.
+		<-time.After(time.Minute)
+		conn.Close()
+	}()
+
+	url := fmt.Sprintf("ws://%s/", ln.Addr().String())
+	handler := func(event Event) error { return nil }
+
+	client := NewClient(handler, WithURL(url))
+	if err := client.Start(); err != nil {
+		t.Fatalf("Start failed: %v", err)
+	}
+
+	// Synchronize on the listener having actually accepted the connection,
+	// so the test genuinely reaches the mid-dial state rather than racing
+	// Stop() ahead of the dial even starting.
+	select {
+	case <-accepted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("listener never accepted a connection; test did not reach mid-dial state")
+	}
+	// Give the client a brief grace period to be inside the blocked
+	// handshake read (accept happening is necessary but not by itself
+	// sufficient to guarantee the client has moved past writing its
+	// request).
+	time.Sleep(50 * time.Millisecond)
+
+	start := time.Now()
+	if err := client.Stop(); err != nil {
+		t.Fatalf("Stop failed: %v", err)
+	}
+	elapsed := time.Since(start)
+
+	if elapsed > 2*time.Second {
+		t.Errorf("Stop() took %v while mid-dial to a wedged (accept-but-never-respond) listener, expected it to return promptly", elapsed)
+	}
+}
+
+// TestClient_StopBetweenDialAndStore_ClosesLeakedSocket verifies defect B:
+// if Stop() lands between a successful dial and connect() taking c.mu to
+// store the resulting connection, the freshly dialed socket must be closed
+// and NOT stored/marked connected -- otherwise the client believes it holds
+// a live connection that is actually leaked and unowned.
+//
+// The window between DialContext returning and c.mu.Lock() in the real
+// connect() path is too narrow to hit reliably by timing alone, so this
+// drives the exact sequence deterministically by calling the client's own
+// dial and storeConn steps directly (both already exist as production code,
+// not test-only additions) in the order that reproduces the race: dial
+// succeeds, THEN Stop (c.cancel()) happens, THEN storeConn runs.
+func TestClient_StopBetweenDialAndStore_ClosesLeakedSocket(t *testing.T) {
+	upgrader := websocket.Upgrader{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		for {
+			if _, _, err := conn.ReadMessage(); err != nil {
+				return
+			}
+		}
+	}))
+	defer server.Close()
+
+	url := "ws" + strings.TrimPrefix(server.URL, "http")
+	handler := func(event Event) error { return nil }
+
+	client := NewClient(handler, WithURL(url))
+
+	conn, _, err := client.dialer.DialContext(context.Background(), url, nil)
+	if err != nil {
+		t.Fatalf("dial failed: %v", err)
+	}
+
+	// Simulate Stop() having already happened between the successful dial
+	// above and connect() taking c.mu to store it.
+	client.cancel()
+
+	connCtx, err := client.storeConn(conn)
+	if err == nil {
+		t.Fatalf("expected storeConn to report an error after Stop, got nil (connCtx=%v)", connCtx)
+	}
+	if client.IsConnected() {
+		t.Error("client reports connected after a post-Stop dial landed; socket leaked as live")
+	}
+	if client.getConn() != nil {
+		t.Error("client stored a connection dialed after Stop")
+	}
+
+	// Confirm the dialed socket was actually closed by storeConn, not
+	// merely forgotten about: a write to it should now fail.
+	conn.SetWriteDeadline(time.Now().Add(time.Second))
+	if err := conn.WriteMessage(websocket.PingMessage, nil); err == nil {
+		t.Error("expected write to the socket to fail after storeConn closed it post-Stop, but it succeeded")
 	}
 }

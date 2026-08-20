@@ -440,18 +440,84 @@ func (c *Client) connect() (context.Context, error) {
 	headers := http.Header{}
 	headers.Set("User-Agent", "ATChess/1.0")
 
-	// Connect with timeout
+	// Connect with timeout, derived from c.ctx (Stop's cancel()) so that
+	// cancellation and the 30s bound race: whichever happens first wins.
+	//
+	// This alone is NOT sufficient to make Stop preemptive, though.
+	// gorilla/websocket's DialContext only consults ctx for the initial TCP
+	// dial;
+	// for the subsequent HTTP upgrade write/read (which is where a host
+	// that accepts TCP but never responds actually wedges) it converts
+	// ctx.Deadline() into a single absolute net.Conn.SetDeadline call made
+	// once, up front, and never re-checks ctx.Done() again. So a plain
+	// `c.dialer.DialContext(ctx, ...)` call here would still block for the
+	// full remaining 30s even though ctx got cancelled early -- the
+	// deadline, not the cancellation, is what it actually honors past the
+	// TCP handshake. To make Stop() itself return promptly we run the dial
+	// in its own goroutine and race it against c.ctx.Done() here instead of
+	// relying on the dialer to notice cancellation.
 	ctx, cancel := context.WithTimeout(c.ctx, 30*time.Second)
 	defer cancel()
 
-	conn, _, err := c.dialer.DialContext(ctx, dialURL, headers)
-	if err != nil {
-		return nil, fmt.Errorf("websocket dial failed: %w", err)
+	type dialResult struct {
+		conn *websocket.Conn
+		err  error
+	}
+	resultCh := make(chan dialResult, 1)
+	go func() {
+		conn, _, err := c.dialer.DialContext(ctx, dialURL, headers)
+		resultCh <- dialResult{conn: conn, err: err}
+	}()
+
+	var conn *websocket.Conn
+	select {
+	case <-c.ctx.Done():
+		// Stop happened before the dial finished (or errored/timed out on
+		// its own). Return promptly rather than waiting out the dial: the
+		// goroutine above is still in flight, so drain its eventual result
+		// in the background and close any connection it does land, rather
+		// than leaking the socket (this is the same "don't store a
+		// post-Stop connection" concern storeConn below handles for the
+		// window between a successful dial and taking c.mu).
+		go func() {
+			res := <-resultCh
+			if res.err == nil && res.conn != nil {
+				res.conn.Close()
+			}
+		}()
+		return nil, c.ctx.Err()
+	case res := <-resultCh:
+		if res.err != nil {
+			return nil, fmt.Errorf("websocket dial failed: %w", res.err)
+		}
+		conn = res.conn
 	}
 
+	return c.storeConn(conn)
+}
+
+// storeConn installs a freshly dialed connection as the client's current
+// connection, unless the client has already been stopped in the window
+// between DialContext succeeding and this function taking c.mu -- in which
+// case conn is closed and NOT stored, so Stop() never leaves a live-looking
+// socket (connected == true, c.conn set) that nothing will ever read from or
+// close again. c.ctx.Err() (set by c.cancel(), which Stop calls BEFORE it
+// takes c.mu -- that ordering is what makes this guard sound: if we observe
+// Err() == nil here we still hold c.mu, so Stop's later lock acquisition is
+// guaranteed to see the connection we just stored and close it) is the same
+// "has Stop happened" signal the rest of the client
+// already uses (see run()'s and handleReconnect's c.ctx.Done() checks); this
+// reuses it rather than introducing a second "stopped" flag.
+func (c *Client) storeConn(conn *websocket.Conn) (context.Context, error) {
 	connCtx, connCancel := context.WithCancel(c.ctx)
 
 	c.mu.Lock()
+	if c.ctx.Err() != nil {
+		c.mu.Unlock()
+		connCancel()
+		conn.Close()
+		return nil, c.ctx.Err()
+	}
 	c.conn = conn
 	c.connCancel = connCancel
 	c.connected = true
