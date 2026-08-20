@@ -487,7 +487,18 @@ func (s *Service) CreateChallengeHandler(w http.ResponseWriter, r *http.Request)
 	// latency optimization: the firehose subscription (or the challenged
 	// player's own backfill-on-login) is the actual source of cross-process
 	// delivery, and Store.Add dedupes by URI, so redelivery here is
-	// harmless.
+	// harmless -- PROVIDED this row is complete. Store.Add is
+	// ON CONFLICT(uri) DO NOTHING, so whichever insert lands first for
+	// this URI wins PERMANENTLY: a later, fuller insert (e.g. the
+	// firehose-delivered one, carrying ChallengeCID) can never overwrite
+	// an earlier incomplete one. This handler's own insert happens
+	// synchronously in the challenger's request, essentially always
+	// before any firehose delivery completes, so it must carry
+	// ChallengeCID itself (atchess-5fs: this insert used to omit it,
+	// which meant a real deployment where challenger and challenged share
+	// one protocol-service instance -- the normal case for a centrally
+	// hosted atchess -- permanently indexed an empty ChallengeCID for
+	// every challenge, breaking decline's strongRef).
 	if s.challengeStore != nil {
 		createdAt, _ := time.Parse(time.RFC3339, ch.CreatedAt)
 		expiresAt, _ := time.Parse(time.RFC3339, ch.ExpiresAt)
@@ -498,6 +509,7 @@ func (s *Service) CreateChallengeHandler(w http.ResponseWriter, r *http.Request)
 		// fails.
 		if _, err := s.challengeStore.Add(&challenge.PendingChallenge{
 			ChallengeURI:     ch.ID,
+			ChallengeCID:     ch.CID,
 			ChallengerDID:    ch.Challenger,
 			ChallengerHandle: client.GetHandle(),
 			ChallengedDID:    ch.Challenged,

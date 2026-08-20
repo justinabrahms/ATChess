@@ -589,6 +589,7 @@ func (c *Client) CreateChallenge(ctx context.Context, opponentDID, color, messag
 
 	return &chess.Challenge{
 		ID:             createResp.URI,
+		CID:            createResp.CID,
 		Challenger:     c.did,
 		Challenged:     opponentDID,
 		Status:         "pending",

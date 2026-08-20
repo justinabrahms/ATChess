@@ -173,12 +173,32 @@ func pollForChallenge(t *testing.T, player *harness.Player, wantURI string, dead
 	}
 }
 
+// cursorFileEntry mirrors the on-disk shape of one host's entry in
+// cursors.json -- internal/firehose.CursorStore's UNEXPORTED cursorEntry
+// (atchess-1c9.49: {"transport":"...","seq":N}, tagged with the Transport
+// it was recorded under, added when Jetstream support landed). Declared
+// here, not imported, because cursorEntry itself is unexported.
+type cursorFileEntry struct {
+	Transport string `json:"transport"`
+	Seq       int64  `json:"seq"`
+}
+
 // pollForNonEmptyCursorFile polls path (a protocol-service instance's own
 // FIREHOSE_STATE_DIR/cursors.json) until it exists, parses as a non-empty
-// JSON object, and returns the decoded map. cmd/protocol/main.go flushes
-// cursors every firehoseCursorPersistInterval (5s) rather than on every
-// processed event, so this must tolerate that delay rather than checking
-// once; deadline should comfortably exceed 5s.
+// JSON object, and returns a map of host -> persisted sequence number.
+// cmd/protocol/main.go flushes cursors every firehoseCursorPersistInterval
+// (5s) rather than on every processed event, so this must tolerate that
+// delay rather than checking once; deadline should comfortably exceed 5s.
+//
+// atchess-5fs: this used to decode straight into map[string]int64, which
+// can NEVER successfully unmarshal cursors.json's actual on-disk shape --
+// each value is a {"transport","seq"} OBJECT, not a bare number (see
+// cursorFileEntry above) -- so json.Unmarshal always returned a non-nil
+// error ("cannot unmarshal object into Go value of type int64") and this
+// poll ran out its FULL deadline on every single call, every run,
+// regardless of how long that deadline was: not a race, not a slow flush,
+// a decode-type bug introduced when atchess-1c9.49 changed the persisted
+// format and this helper was never updated to match.
 func pollForNonEmptyCursorFile(t *testing.T, path string, deadline time.Duration) map[string]int64 {
 	t.Helper()
 	start := time.Now()
@@ -186,8 +206,12 @@ func pollForNonEmptyCursorFile(t *testing.T, path string, deadline time.Duration
 	for {
 		data, err := os.ReadFile(path)
 		if err == nil {
-			var cursors map[string]int64
-			if jsonErr := json.Unmarshal(data, &cursors); jsonErr == nil && len(cursors) > 0 {
+			var raw map[string]cursorFileEntry
+			if jsonErr := json.Unmarshal(data, &raw); jsonErr == nil && len(raw) > 0 {
+				cursors := make(map[string]int64, len(raw))
+				for host, entry := range raw {
+					cursors[host] = entry.Seq
+				}
 				return cursors
 			}
 		}

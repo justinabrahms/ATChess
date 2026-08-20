@@ -55,16 +55,25 @@ type TimeControl struct {
 }
 
 type Challenge struct {
-	ID              string
-	Challenger      string // DID
-	Challenged      string // DID
-	Status          string
-	Color           string
-	ProposedGameId  string
-	TimeControl     *TimeControl
-	Message         string
-	CreatedAt       string
-	ExpiresAt       string
+	ID         string
+	Challenger string // DID
+	Challenged string // DID
+	Status     string
+	Color      string
+	// CID is the content ID the PDS assigned to this challenge record on
+	// creation (com.atproto.repo.createRecord's response "cid"). It is the
+	// same CID a firehose-delivered copy of this same record carries (see
+	// internal/firehose.EventProcessor.processChallengeEvent /
+	// challenge.FromChallengeRecord), and is required to build the
+	// strongRef a decline references (atproto.Client.RespondToChallenge).
+	// Populated by CreateChallenge; empty for a Challenge value built any
+	// other way.
+	CID            string
+	ProposedGameId string
+	TimeControl    *TimeControl
+	Message        string
+	CreatedAt      string
+	ExpiresAt      string
 }
 
 // MaterialCount represents the material count for both sides
