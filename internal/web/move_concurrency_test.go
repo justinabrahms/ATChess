@@ -1,0 +1,497 @@
+package web
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/justinabrahms/atchess/internal/atproto"
+	"github.com/justinabrahms/atchess/internal/config"
+	"github.com/justinabrahms/atchess/internal/oauth"
+)
+
+// --- synchronization primitives -------------------------------------------
+//
+// Both concurrency tests below need two goroutines to observe an IDENTICAL
+// pre-move game snapshot, deterministically, on every run -- not "usually",
+// which a sleep-based approach would only give probabilistically (and the
+// brief for atchess-1c9.74 explicitly calls out that a test that races and
+// usually passes is worse than no test at all). callGate/roundGate force
+// this by holding back matching requests at the mock PDS itself until the
+// expected number of concurrent callers have all arrived.
+
+// gate is implemented by callGate and roundGate.
+type gate interface{ arrive() }
+
+// callGate blocks each arrive() caller until n total callers have arrived,
+// then releases all of them together. Because the release channel is never
+// re-armed, any arrival after the first n also passes straight through.
+type callGate struct {
+	t     *testing.T
+	mu    sync.Mutex
+	n     int
+	count int
+	ready chan struct{}
+}
+
+func newCallGate(t *testing.T, n int) *callGate {
+	return &callGate{t: t, n: n, ready: make(chan struct{})}
+}
+
+// gateTimeout bounds how long arrive() will wait for its partners. Without
+// it, a future change that makes one racer return BEFORE reaching the gated
+// call (an added early rejection, say) leaves the other blocked forever, and
+// the test does not fail with a message -- it hangs until `go test`'s global
+// timeout and dumps goroutines, minutes later, in CI. Failing loudly here
+// costs nothing and names the actual problem.
+const gateTimeout = 30 * time.Second
+
+func (g *callGate) arrive() {
+	g.mu.Lock()
+	g.count++
+	if g.count >= g.n {
+		select {
+		case <-g.ready:
+		default:
+			close(g.ready)
+		}
+	}
+	g.mu.Unlock()
+	select {
+	case <-g.ready:
+	case <-time.After(gateTimeout):
+		// t.Errorf, not t.Fatalf: arrive() runs on the mock server's
+		// handler goroutine, and FailNow may only be called from the
+		// test goroutine. Returning also unblocks the caller so the
+		// test finishes and reports rather than wedging.
+		g.t.Errorf("gate deadlock: only %d of %d callers reached the gate within %s -- "+
+			"a racer probably returned before making its gated call", g.count, g.n, gateTimeout)
+	}
+}
+
+// roundGate is like callGate, but re-arms every n arrivals instead of
+// staying open forever after the first n: arrivals 1..n (round 0) are
+// released together, arrivals n+1..2n (round 1) are released together
+// independently of round 0, and so on. This is needed where each of the
+// two racing goroutines makes more than one call matching the gated
+// XRPC/collection pair, and every one of those calls -- not just the
+// first -- must be forced to observe an identical, simultaneously-read
+// snapshot (see TestMakeMoveHandler_ConcurrentMove_SamePlayerTwice below
+// for why a single round is not enough there).
+type roundGate struct {
+	t      *testing.T
+	mu     sync.Mutex
+	n      int
+	count  int
+	rounds map[int]*callGate
+}
+
+func newRoundGate(t *testing.T, n int) *roundGate {
+	return &roundGate{t: t, n: n, rounds: map[int]*callGate{}}
+}
+
+func (g *roundGate) arrive() {
+	g.mu.Lock()
+	round := g.count / g.n
+	g.count++
+	rg, ok := g.rounds[round]
+	if !ok {
+		rg = newCallGate(g.t, g.n)
+		g.rounds[round] = rg
+	}
+	g.mu.Unlock()
+	rg.arrive()
+}
+
+// --- mock PDS with real optimistic-concurrency (swapCid) enforcement -----
+
+type raceRecord struct {
+	cid   string
+	value map[string]interface{}
+}
+
+// raceMockPDS is a single-process stand-in for the did:plc directory and a
+// player's PDS, purpose-built for the two concurrent-move tests below
+// (atchess-1c9.74 items 2 and 3). Unlike mockFederatedPDS
+// (move_and_draw_ownership_test.go), which hands out a fixed,
+// content-independent cid per rkey, this mock gives every record a cid
+// that changes on every write and enforces com.atproto.repo.putRecord's
+// "swapCid" optimistic-concurrency parameter for real: a putRecord whose
+// swapCid does not match the record's current cid is rejected with a
+// non-200 response, exactly as a real PDS would -- see
+// internal/atproto/client.go's RecordMove, which relies on this to make
+// "two concurrent writers to the same game record, only one wins" true.
+//
+// It also supports an optional gate: every com.atproto.repo.getRecord call
+// whose collection matches gateCollection is forced through the gate
+// before being served.
+type raceMockPDS struct {
+	t    *testing.T
+	mu   sync.Mutex
+	base string
+
+	records map[string]map[string]map[string]*raceRecord // repo -> collection -> rkey -> record
+	rkeyN   int
+	verN    int
+
+	gate           gate
+	gateCollection string
+
+	writeCalls []string
+}
+
+func newRaceMockPDS(t *testing.T) *raceMockPDS {
+	return &raceMockPDS{t: t, records: map[string]map[string]map[string]*raceRecord{}}
+}
+
+func (m *raceMockPDS) server() *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(m.handle))
+}
+
+func (m *raceMockPDS) setBaseURL(u string) { m.mu.Lock(); m.base = u; m.mu.Unlock() }
+func (m *raceMockPDS) baseURL() string     { m.mu.Lock(); defer m.mu.Unlock(); return m.base }
+
+func (m *raceMockPDS) seed(repo, collection, rkey string, value map[string]interface{}) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.records[repo] == nil {
+		m.records[repo] = map[string]map[string]*raceRecord{}
+	}
+	if m.records[repo][collection] == nil {
+		m.records[repo][collection] = map[string]*raceRecord{}
+	}
+	m.verN++
+	m.records[repo][collection][rkey] = &raceRecord{cid: fmt.Sprintf("cid-%s-v%d", rkey, m.verN), value: value}
+}
+
+func (m *raceMockPDS) newRkey() string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.rkeyN++
+	return fmt.Sprintf("rkey%d", m.rkeyN)
+}
+
+func (m *raceMockPDS) handle(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	if strings.HasPrefix(r.URL.Path, "/did:plc:") {
+		did := strings.TrimPrefix(r.URL.Path, "/")
+		_ = json.NewEncoder(w).Encode(atproto.DIDDocument{
+			ID: did,
+			Service: []atproto.DIDService{
+				{ID: "#atproto_pds", Type: "AtprotoPersonalDataServer", ServiceEndpoint: m.baseURL()},
+			},
+		})
+		return
+	}
+
+	switch r.URL.Path {
+	case "/xrpc/com.atproto.repo.getRecord":
+		q := r.URL.Query()
+		repo, collection, rkey := q.Get("repo"), q.Get("collection"), q.Get("rkey")
+		if m.gate != nil && collection == m.gateCollection {
+			m.gate.arrive()
+		}
+		m.mu.Lock()
+		rec := m.records[repo][collection][rkey]
+		m.mu.Unlock()
+		if rec == nil {
+			w.WriteHeader(http.StatusNotFound)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "RecordNotFound"})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"uri":   fmt.Sprintf("at://%s/%s/%s", repo, collection, rkey),
+			"cid":   rec.cid,
+			"value": rec.value,
+		})
+		return
+
+	case "/xrpc/com.atproto.repo.listRecords":
+		q := r.URL.Query()
+		repo, collection := q.Get("repo"), q.Get("collection")
+		m.mu.Lock()
+		coll := m.records[repo][collection]
+		type rec struct {
+			URI   string      `json:"uri"`
+			CID   string      `json:"cid"`
+			Value interface{} `json:"value"`
+		}
+		var recs []rec
+		for rkey, rr := range coll {
+			recs = append(recs, rec{URI: fmt.Sprintf("at://%s/%s/%s", repo, collection, rkey), CID: rr.cid, Value: rr.value})
+		}
+		m.mu.Unlock()
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"records": recs})
+		return
+
+	case "/xrpc/com.atproto.repo.createRecord":
+		var req map[string]interface{}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		repo, _ := req["repo"].(string)
+		collection, _ := req["collection"].(string)
+		record, _ := req["record"].(map[string]interface{})
+		rkey := m.newRkey()
+		m.mu.Lock()
+		if m.records[repo] == nil {
+			m.records[repo] = map[string]map[string]*raceRecord{}
+		}
+		if m.records[repo][collection] == nil {
+			m.records[repo][collection] = map[string]*raceRecord{}
+		}
+		m.verN++
+		cid := fmt.Sprintf("cid-%s-v%d", rkey, m.verN)
+		m.records[repo][collection][rkey] = &raceRecord{cid: cid, value: record}
+		m.writeCalls = append(m.writeCalls, fmt.Sprintf("createRecord repo=%s collection=%s rkey=%s", repo, collection, rkey))
+		m.mu.Unlock()
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"uri": fmt.Sprintf("at://%s/%s/%s", repo, collection, rkey),
+			"cid": cid,
+		})
+		return
+
+	case "/xrpc/com.atproto.repo.putRecord":
+		var req map[string]interface{}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		repo, _ := req["repo"].(string)
+		collection, _ := req["collection"].(string)
+		rkey, _ := req["rkey"].(string)
+		record, _ := req["record"].(map[string]interface{})
+		swapCid, hasSwap := req["swapCid"].(string)
+
+		m.mu.Lock()
+		defer m.mu.Unlock()
+
+		var cur *raceRecord
+		if m.records[repo] != nil {
+			cur = m.records[repo][collection][rkey]
+		}
+		if hasSwap && (cur == nil || cur.cid != swapCid) {
+			m.writeCalls = append(m.writeCalls, fmt.Sprintf("putRecord REJECTED(swapCid mismatch) repo=%s collection=%s rkey=%s", repo, collection, rkey))
+			w.WriteHeader(http.StatusBadRequest)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "InvalidSwapError", "message": "record was concurrently updated"})
+			return
+		}
+
+		m.verN++
+		newCid := fmt.Sprintf("cid-%s-v%d", rkey, m.verN)
+		if m.records[repo] == nil {
+			m.records[repo] = map[string]map[string]*raceRecord{}
+		}
+		if m.records[repo][collection] == nil {
+			m.records[repo][collection] = map[string]*raceRecord{}
+		}
+		m.records[repo][collection][rkey] = &raceRecord{cid: newCid, value: record}
+		m.writeCalls = append(m.writeCalls, fmt.Sprintf("putRecord OK repo=%s collection=%s rkey=%s", repo, collection, rkey))
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"uri": fmt.Sprintf("at://%s/%s/%s", repo, collection, rkey),
+			"cid": newCid,
+		})
+		return
+
+	default:
+		w.WriteHeader(http.StatusNotFound)
+	}
+}
+
+func newRaceSession(did, handle, pdsURL string) *oauth.Session {
+	return &oauth.Session{
+		DID:                  did,
+		Handle:               handle,
+		PDSURL:               pdsURL,
+		AccessToken:          "test-jwt",
+		RefreshToken:         "test-refresh",
+		ExpiresAt:            time.Now().Add(time.Hour),
+		AccessTokenExpiresAt: time.Now().Add(time.Hour),
+	}
+}
+
+func doMakeMove(svc *Service, session *oauth.Session, gameURI, from, to string) (int, string) {
+	body, _ := json.Marshal(map[string]string{"game_id": gameURI, "from": from, "to": to})
+	req := httptest.NewRequest("POST", "/api/moves", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	ctx := context.WithValue(req.Context(), contextKeySession, session)
+	ctx = context.WithValue(ctx, contextKeyDID, session.DID)
+	req = req.WithContext(ctx)
+
+	w := httptest.NewRecorder()
+	svc.MakeMoveHandler(w, req)
+	return w.Code, w.Body.String()
+}
+
+// TestMakeMoveHandler_ConcurrentMove_TwoPlayers_ExactlyOneSucceeds is a
+// regression test for atchess-1c9.74 item 2: when white and black submit
+// moves to the SAME game simultaneously, only whoever's turn it actually
+// is may succeed; the other must be rejected, and only one move record
+// may be written. Both players submit the identical from/to ("e2"->"e4")
+// deliberately: it is a legal move for white, so if the "is it your
+// turn" gate were ever bypassed, black's identical request would also
+// succeed (the notnil/chess engine has no notion of which HTTP caller is
+// asking) -- making the guard's absence unambiguous rather than merely
+// producing a different error class.
+//
+// A callGate forces both goroutines' initial game-record reads (inside
+// MakeMoveHandler's client.GetGame call) to happen simultaneously, so
+// this is deterministic on every run: neither goroutine can ever observe
+// the other's already-applied move before making its own turn decision.
+func TestMakeMoveHandler_ConcurrentMove_TwoPlayers_ExactlyOneSucceeds(t *testing.T) {
+	const whiteDID = "did:plc:white"
+	const blackDID = "did:plc:black"
+
+	mock := newRaceMockPDS(t)
+	srv := mock.server()
+	defer srv.Close()
+	mock.setBaseURL(srv.URL)
+	mock.gate = newCallGate(t, 2)
+	mock.gateCollection = "app.atchess.game"
+
+	const gameRkey = "game1"
+	mock.seed(whiteDID, "app.atchess.game", gameRkey, map[string]interface{}{
+		"$type":     "app.atchess.game",
+		"createdAt": time.Now().Format(time.RFC3339),
+		"white":     whiteDID,
+		"black":     blackDID,
+		"status":    "active",
+		"fen":       "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+		"pgn":       "",
+	})
+	gameURI := fmt.Sprintf("at://%s/app.atchess.game/%s", whiteDID, gameRkey)
+
+	svc := &Service{
+		config:         &config.Config{ATProto: config.ATProtoConfig{PLCDirectoryURL: srv.URL}},
+		challengeStore: newTestChallengeStore(t),
+	}
+
+	whiteSession := newRaceSession(whiteDID, "white.test", srv.URL)
+	blackSession := newRaceSession(blackDID, "black.test", srv.URL)
+
+	var wg sync.WaitGroup
+	codes := make([]int, 2)
+	bodies := make([]string, 2)
+	wg.Add(2)
+	go func() { defer wg.Done(); codes[0], bodies[0] = doMakeMove(svc, whiteSession, gameURI, "e2", "e4") }()
+	go func() { defer wg.Done(); codes[1], bodies[1] = doMakeMove(svc, blackSession, gameURI, "e2", "e4") }()
+	wg.Wait()
+
+	// It is genuinely white's turn: this is deterministic, not merely "one
+	// of the two ends up succeeding".
+	if codes[0] != http.StatusOK {
+		t.Errorf("expected white's move to succeed with HTTP 200, got %d: %s", codes[0], bodies[0])
+	}
+	if codes[1] != http.StatusForbidden {
+		t.Errorf("expected black's move to be rejected with HTTP 403, got %d: %s", codes[1], bodies[1])
+	} else if !strings.Contains(bodies[1], "It is not your turn") {
+		t.Errorf("expected black's rejection body to say 'It is not your turn', got: %s", bodies[1])
+	}
+
+	mock.mu.Lock()
+	var moveCreates int
+	for _, c := range mock.writeCalls {
+		if strings.HasPrefix(c, "createRecord") && strings.Contains(c, "collection=app.atchess.move") {
+			moveCreates++
+			if !strings.Contains(c, "repo="+whiteDID) {
+				t.Errorf("expected the sole move record to be in white's repo, got: %s", c)
+			}
+		}
+	}
+	writeCalls := append([]string(nil), mock.writeCalls...)
+	mock.mu.Unlock()
+	if moveCreates != 1 {
+		t.Errorf("expected exactly 1 move record created, got %d (writeCalls=%v)", moveCreates, writeCalls)
+	}
+}
+
+// TestMakeMoveHandler_ConcurrentMove_SamePlayerTwice_ExactlyOneSucceeds is
+// a regression test for atchess-1c9.74 item 3: the SAME player submitting
+// two different moves for their own single turn simultaneously must have
+// exactly one of them succeed; the game must never end up with two move
+// records for one turn.
+//
+// Both goroutines pass the "is it your turn" check identically (same
+// player, same simultaneously-read snapshot), so the guard that actually
+// makes "exactly one succeeds" true here is downstream, in
+// internal/atproto/client.go's RecordMove: its optimistic-concurrency
+// (swapCid) game-record update. A roundGate forces BOTH the initial
+// client.GetGame read AND the second read RecordMove itself performs
+// (getGameRecord, to fetch the cid to swap against) to be simultaneous
+// for both goroutines on every run -- without gating that second read too,
+// one goroutine's entire read-then-write could occasionally finish before
+// the other's second read even started, letting that second read observe
+// the first goroutine's already-applied update and "legitimately" swap
+// against it, which would let both writes land and make the test flaky.
+func TestMakeMoveHandler_ConcurrentMove_SamePlayerTwice_ExactlyOneSucceeds(t *testing.T) {
+	const playerDID = "did:plc:player"
+	const opponentDID = "did:plc:opponent"
+
+	mock := newRaceMockPDS(t)
+	srv := mock.server()
+	defer srv.Close()
+	mock.setBaseURL(srv.URL)
+	mock.gate = newRoundGate(t, 2)
+	mock.gateCollection = "app.atchess.game"
+
+	const gameRkey = "game1"
+	mock.seed(playerDID, "app.atchess.game", gameRkey, map[string]interface{}{
+		"$type":     "app.atchess.game",
+		"createdAt": time.Now().Format(time.RFC3339),
+		"white":     playerDID,
+		"black":     opponentDID,
+		"status":    "active",
+		"fen":       "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+		"pgn":       "",
+	})
+	gameURI := fmt.Sprintf("at://%s/app.atchess.game/%s", playerDID, gameRkey)
+
+	svc := &Service{
+		config:         &config.Config{ATProto: config.ATProtoConfig{PLCDirectoryURL: srv.URL}},
+		challengeStore: newTestChallengeStore(t),
+	}
+
+	session := newRaceSession(playerDID, "player.test", srv.URL)
+
+	var wg sync.WaitGroup
+	codes := make([]int, 2)
+	bodies := make([]string, 2)
+	wg.Add(2)
+	go func() { defer wg.Done(); codes[0], bodies[0] = doMakeMove(svc, session, gameURI, "e2", "e4") }()
+	go func() { defer wg.Done(); codes[1], bodies[1] = doMakeMove(svc, session, gameURI, "d2", "d4") }()
+	wg.Wait()
+
+	var successes, failures int
+	for i, c := range codes {
+		switch c {
+		case http.StatusOK:
+			successes++
+		case http.StatusInternalServerError:
+			failures++
+			if !strings.Contains(bodies[i], "Failed to record move") {
+				t.Errorf("expected failure body to say 'Failed to record move', got: %s", bodies[i])
+			}
+		default:
+			t.Errorf("unexpected status %d: %s", c, bodies[i])
+		}
+	}
+	if successes != 1 || failures != 1 {
+		t.Fatalf("expected exactly 1 success and 1 failure (CAS conflict), got codes=%v bodies=%v", codes, bodies)
+	}
+
+	mock.mu.Lock()
+	var moveCreates int
+	for _, c := range mock.writeCalls {
+		if strings.HasPrefix(c, "createRecord") && strings.Contains(c, "collection=app.atchess.move") {
+			moveCreates++
+		}
+	}
+	writeCalls := append([]string(nil), mock.writeCalls...)
+	mock.mu.Unlock()
+	if moveCreates != 1 {
+		t.Errorf("expected exactly 1 move record created despite both submissions reaching RecordMove, got %d (writeCalls=%v)", moveCreates, writeCalls)
+	}
+}
