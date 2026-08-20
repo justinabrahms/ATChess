@@ -42,8 +42,18 @@ type DevelopmentConfig struct {
 }
 
 type FirehoseConfig struct {
-	Enabled bool   `mapstructure:"enabled"`
-	URL     string `mapstructure:"url"`
+	Enabled bool `mapstructure:"enabled"`
+	// URL is one or more (comma-separated, see cmd/protocol/main.go's
+	// splitFirehoseURLs) com.atproto.sync.subscribeRepos websocket
+	// endpoints to subscribe to. Challenge delivery (atchess-1c9.11)
+	// depends on watching every PDS that might host a challenger, since a
+	// challenge record only ever lives in its author's own repo; in a real
+	// production deployment this should ultimately point at a
+	// network-wide relay/Jetstream aggregator instead of an explicit list
+	// of individual PDSes, but no such relay exists in this project's local
+	// test harness (see test/harness/services.go), which instead lists the
+	// harness's own known PDSes directly.
+	URL string `mapstructure:"url"`
 }
 
 func Load() (*Config, error) {

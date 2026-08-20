@@ -191,6 +191,23 @@ func resolvePLCDirectoryURL(t *testing.T) string {
 	return candidate
 }
 
+// pdsSubscribeReposURL converts a PDS's HTTP(S) base URL into its
+// com.atproto.sync.subscribeRepos websocket URL (https -> wss, http -> ws;
+// every AT Protocol PDS -- not just a relay -- serves this endpoint
+// directly for its own repos). Used to build FIREHOSE_URL for
+// startProtocolService: see StartServices' doc comment for why the harness
+// points every instance at BOTH PDSes directly instead of a relay.
+func pdsSubscribeReposURL(pdsURL string) string {
+	ws := pdsURL
+	switch {
+	case strings.HasPrefix(ws, "https://"):
+		ws = "wss://" + strings.TrimPrefix(ws, "https://")
+	case strings.HasPrefix(ws, "http://"):
+		ws = "ws://" + strings.TrimPrefix(ws, "http://")
+	}
+	return strings.TrimRight(ws, "/") + "/xrpc/com.atproto.sync.subscribeRepos"
+}
+
 // startProtocolService launches one protocol-service instance configured
 // for account, listening on port, and blocks until it reports healthy via
 // GET /api/health (bounded by healthTimeout) or fails.
@@ -202,7 +219,12 @@ func resolvePLCDirectoryURL(t *testing.T) string {
 // see resolvePLCDirectoryURL -- ATPROTO_PLC_DIRECTORY_URL) -- this is what
 // makes it possible to run two instances, one per PDS, from the same
 // binary.
-func startProtocolService(t *testing.T, binPath string, account Account, port int, label string, plcDirectoryURL string) *serviceInstance {
+//
+// firehoseURLs is a comma-separated list of com.atproto.sync.subscribeRepos
+// endpoints this instance should subscribe to for challenge delivery
+// (atchess-1c9.11) -- see StartServices for why it always names BOTH
+// players' PDSes, not just this instance's own.
+func startProtocolService(t *testing.T, binPath string, account Account, port int, label string, plcDirectoryURL string, firehoseURLs string) *serviceInstance {
 	t.Helper()
 
 	url := fmt.Sprintf("http://127.0.0.1:%d", port)
@@ -217,7 +239,8 @@ func startProtocolService(t *testing.T, binPath string, account Account, port in
 		"ATPROTO_HANDLE="+account.Handle,
 		"ATPROTO_PASSWORD="+account.Password,
 		"ATPROTO_USE_DPOP=false",
-		"FIREHOSE_ENABLED=false",
+		"FIREHOSE_ENABLED=true",
+		"FIREHOSE_URL="+firehoseURLs,
 	)
 	if plcDirectoryURL != "" {
 		cmd.Env = append(cmd.Env, "ATPROTO_PLC_DIRECTORY_URL="+plcDirectoryURL)
@@ -320,20 +343,76 @@ func waitForHealthy(t *testing.T, inst *serviceInstance, timeout time.Duration) 
 // listening on its own dynamically-allocated port. Both instances are
 // health-gated (GET /api/health) before StartServices returns, and are
 // killed and reaped via t.Cleanup at test end.
+//
+// Both instances are also given FIREHOSE_URL naming BOTH alice's and bob's
+// PDS com.atproto.sync.subscribeRepos endpoints (atchess-1c9.11): a
+// challenge record only ever lives in its CHALLENGER's own repo, so the
+// challenged player's instance can only discover it by watching whichever
+// PDS the challenger happens to be on -- and in this two-player harness
+// either player might challenge the other. There is no relay/Jetstream
+// aggregator in this harness to watch instead (see the package doc comment
+// on internal/firehose and atchess-1c9.11's own notes for why); a real
+// deployment would watch a network-wide aggregator rather than an explicit,
+// closed list of known PDSes.
 func StartServices(t *testing.T, accounts *Accounts) *Services {
 	t.Helper()
 
 	binPath := buildProtocolBinary(t)
 	plcDirectoryURL := resolvePLCDirectoryURL(t)
+	firehoseURLs := AllPDSFirehoseURLs(accounts)
 
-	alicePort := freePort(t)
-	bobPort := freePort(t)
-
-	aliceInst := startProtocolService(t, binPath, accounts.Alice, alicePort, "alice", plcDirectoryURL)
-	bobInst := startProtocolService(t, binPath, accounts.Bob, bobPort, "bob", plcDirectoryURL)
+	aliceURL := StartPlayerService(t, binPath, accounts.Alice, "alice", plcDirectoryURL, firehoseURLs)
+	bobURL := StartPlayerService(t, binPath, accounts.Bob, "bob", plcDirectoryURL, firehoseURLs)
 
 	return &Services{
-		AliceURL: aliceInst.url,
-		BobURL:   bobInst.url,
+		AliceURL: aliceURL,
+		BobURL:   bobURL,
 	}
+}
+
+// AllPDSFirehoseURLs returns the comma-separated FIREHOSE_URL value naming
+// every account's PDS com.atproto.sync.subscribeRepos endpoint (see
+// StartServices' doc comment for why every instance needs to watch every
+// known PDS in this relay-less harness).
+func AllPDSFirehoseURLs(accounts *Accounts) string {
+	return strings.Join([]string{
+		pdsSubscribeReposURL(accounts.Alice.PDSURL),
+		pdsSubscribeReposURL(accounts.Bob.PDSURL),
+	}, ",")
+}
+
+// BuildProtocolBinary compiles cmd/protocol once and returns the resulting
+// binary path, for callers (e.g. an offline-backfill test that needs to
+// start one player's instance well after the other's, rather than both
+// together via StartServices) that need to start protocol-service instances
+// individually and staggered in time. Safe to call multiple times per test;
+// each call performs its own build into a fresh t.TempDir().
+func BuildProtocolBinary(t *testing.T) string {
+	t.Helper()
+	return buildProtocolBinary(t)
+}
+
+// ResolvePLCDirectoryURL exposes resolvePLCDirectoryURL for callers that
+// need to start protocol-service instances individually via
+// StartPlayerService rather than together via StartServices.
+func ResolvePLCDirectoryURL(t *testing.T) string {
+	t.Helper()
+	return resolvePLCDirectoryURL(t)
+}
+
+// StartPlayerService starts a single protocol-service instance for account
+// (using binPath, built by BuildProtocolBinary/buildProtocolBinary),
+// listening on a freshly allocated port, configured to watch
+// firehoseURLs (see AllPDSFirehoseURLs) for challenge delivery. It blocks
+// until the instance reports healthy and returns its base URL. Exported
+// (unlike the underlying startProtocolService) so tests that need to start
+// one player's instance independently of the other -- notably an
+// offline-backfill test, where one player's instance must NOT be running
+// yet when the other player issues a challenge -- can do so directly,
+// rather than only via StartServices' both-at-once topology.
+func StartPlayerService(t *testing.T, binPath string, account Account, label string, plcDirectoryURL string, firehoseURLs string) string {
+	t.Helper()
+	port := freePort(t)
+	inst := startProtocolService(t, binPath, account, port, label, plcDirectoryURL, firehoseURLs)
+	return inst.url
 }

@@ -38,13 +38,19 @@ const (
 type EventType string
 
 const (
-	EventTypeMove                  EventType = "move"
-	EventTypeDrawOffer             EventType = "drawOffer"
-	EventTypeResignation           EventType = "resignation"
-	EventTypeGame                  EventType = "game"
-	EventTypeChallenge             EventType = "challenge"
-	EventTypeChallengeAcceptance   EventType = "challengeAcceptance"
-	EventTypeChallengeNotification EventType = "challengeNotification"
+	EventTypeMove                EventType = "move"
+	EventTypeDrawOffer           EventType = "drawOffer"
+	EventTypeResignation         EventType = "resignation"
+	EventTypeGame                EventType = "game"
+	EventTypeChallenge           EventType = "challenge"
+	EventTypeChallengeAcceptance EventType = "challengeAcceptance"
+	// EventTypeChallengeResponse corresponds to app.atchess.challengeResponse
+	// (atchess-1c9.11): a decline, written into the RESPONDING player's own
+	// repo. Not currently consumed by EventProcessor (only the challenger's
+	// own instance would care, and it is out of this bead's scope), but
+	// classified here so isChessRecord/getEventType don't misroute it into
+	// the generic EventTypeChallenge bucket.
+	EventTypeChallengeResponse EventType = "challengeResponse"
 )
 
 // Event represents a chess-related event from the firehose
@@ -72,7 +78,18 @@ type Client struct {
 	mu             sync.RWMutex
 	wg             sync.WaitGroup
 	connected      bool
-	lastSequence   int64
+	// lastSequence is the last processed firehose sequence number, used to
+	// resume a dropped connection exactly where it left off (see connect).
+	// -1 means "no cursor established yet" (a brand new client that has not
+	// been given an explicit starting cursor via WithCursor and has not yet
+	// processed any message) -- connect omits the cursor query param
+	// entirely in that case, which every AT Protocol PDS interprets as
+	// "start at the live tip". 0 is a legitimate, DISTINCT value from -1:
+	// it explicitly requests replay from the very beginning of the PDS's
+	// commit log (see WithCursor), which is how atchess-1c9.11's
+	// backfill-on-login is implemented -- a full historical resubscribe,
+	// not merely resuming live tail.
+	lastSequence int64
 	// connCancel cancels connCtx, the context scoped to the lifetime of the
 	// current connection. It is canceled (and cleared) whenever the
 	// connection is replaced or torn down, so that goroutines bound to the
@@ -117,6 +134,24 @@ func WithInitialReconnectDelay(delay time.Duration) Option {
 	}
 }
 
+// WithCursor requests that the FIRST connection this client makes start
+// replaying from cursor (inclusive of whatever the PDS has from that point
+// forward) rather than defaulting to the live tip. Passing 0 requests a full
+// historical replay of the watched PDS's commit log -- this is how
+// atchess-1c9.11's backfill-on-login is implemented: cmd/protocol/main.go
+// gives every firehose.Client it starts WithCursor(0), so a challenge issued
+// while this process was not running is still discovered once it starts and
+// resubscribes from the beginning, rather than only ever seeing challenges
+// created after that moment. This only affects the FIRST connection
+// attempt; every reconnect after that already resumes from LastSequence
+// (whatever was last actually processed), which is always >= cursor once
+// the first message has been processed.
+func WithCursor(cursor int64) Option {
+	return func(c *Client) {
+		c.lastSequence = cursor
+	}
+}
+
 // NewClient creates a new firehose client
 func NewClient(handler EventHandler, opts ...Option) *Client {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -129,6 +164,7 @@ func NewClient(handler EventHandler, opts ...Option) *Client {
 		cancel:         cancel,
 		reconnectDelay: initialReconnectDelay,
 		dialer:         websocket.DefaultDialer,
+		lastSequence:   -1, // no cursor established yet; see the field's doc comment
 	}
 
 	for _, opt := range opts {
@@ -180,8 +216,9 @@ func (c *Client) IsConnected() bool {
 	return c.connected
 }
 
-// LastSequence returns the last processed firehose sequence number.
-// Safe for concurrent use.
+// LastSequence returns the last processed firehose sequence number, or -1 if
+// no cursor has been established yet (a brand new client with no WithCursor
+// override that has not processed a message). Safe for concurrent use.
 func (c *Client) LastSequence() int64 {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -234,9 +271,12 @@ func (c *Client) run() {
 func (c *Client) connect() (context.Context, error) {
 	c.logger.Info().Str("url", c.url).Msg("Connecting to firehose")
 
-	// Build URL with cursor if we have a sequence
+	// Build URL with cursor if we have one established (-1 means "none
+	// yet" -- see lastSequence's field doc comment; 0 is a legitimate,
+	// distinct value meaning "replay from the very beginning", used for
+	// atchess-1c9.11's backfill-on-login via WithCursor(0)).
 	url := c.url
-	if lastSeq := c.LastSequence(); lastSeq > 0 {
+	if lastSeq := c.LastSequence(); lastSeq >= 0 {
 		url = fmt.Sprintf("%s?cursor=%d", url, lastSeq)
 	}
 
@@ -817,8 +857,8 @@ func getEventType(path string) EventType {
 		return EventTypeResignation
 	case strings.Contains(path, "app.atchess.game"):
 		return EventTypeGame
-	case strings.Contains(path, "app.atchess.challengeNotification"):
-		return EventTypeChallengeNotification
+	case strings.Contains(path, "app.atchess.challengeResponse"):
+		return EventTypeChallengeResponse
 	case strings.Contains(path, "app.atchess.challengeAcceptance"):
 		return EventTypeChallengeAcceptance
 	case strings.Contains(path, "app.atchess.challenge"):

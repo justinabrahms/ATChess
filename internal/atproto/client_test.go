@@ -3,23 +3,24 @@ package atproto
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
-	"time"
 )
 
-// TestCreateChallenge_NotificationFailureRollsBackAndReturnsError is a
-// regression test for atchess-1c9.31: CreateChallenge used to log a failed
-// notification write with fmt.Printf and return success anyway, leaving an
-// orphaned app.atchess.challenge record and telling the caller a challenge
-// was created when the challenged player was never notified. This asserts
-// CreateChallenge instead rolls back the challenge record and returns
-// ErrChallengeNotificationFailed.
-func TestCreateChallenge_NotificationFailureRollsBackAndReturnsError(t *testing.T) {
-	var deleteCalled bool
-	var deletedRkey string
+// TestCreateChallenge_WritesOnlyToOwnRepo is a regression test for
+// atchess-1c9.11: CreateChallenge used to follow up its own-repo challenge
+// write with a second, cross-repo createRecord call naming the challenged
+// player's DID as "repo" -- a write AT Protocol never permits (you may only
+// write to your own repo with your own session credentials). That call has
+// been removed entirely (see atchess-1c9.11's notes: "leaving it invites a
+// retry"). This asserts CreateChallenge issues exactly one createRecord
+// call, into the caller's own repo, and never attempts to name any other
+// repo.
+func TestCreateChallenge_WritesOnlyToOwnRepo(t *testing.T) {
+	var createRecordCalls int
+	var lastRepo, lastCollection string
+	var lastRecord map[string]interface{}
 
 	mockPDS := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -31,29 +32,17 @@ func TestCreateChallenge_NotificationFailureRollsBackAndReturnsError(t *testing.
 				"handle":    "challenger.test",
 			})
 		case "/xrpc/com.atproto.repo.createRecord":
+			createRecordCalls++
 			var req map[string]interface{}
 			json.NewDecoder(r.Body).Decode(&req)
-			switch req["collection"] {
-			case "app.atchess.challenge":
-				w.Header().Set("Content-Type", "application/json")
-				json.NewEncoder(w).Encode(map[string]interface{}{
-					"uri": "at://did:plc:challenger123/app.atchess.challenge/chal789",
-					"cid": "challenge-cid",
-				})
-			case "app.atchess.challengeNotification":
-				// Simulate the real-world failure this bead fixes: the
-				// challenged player's repo rejects the cross-repo write.
-				w.WriteHeader(http.StatusForbidden)
-				json.NewEncoder(w).Encode(map[string]interface{}{"error": "AccountNotFound"})
-			default:
-				w.WriteHeader(http.StatusNotFound)
-			}
-		case "/xrpc/com.atproto.repo.deleteRecord":
-			deleteCalled = true
-			var req map[string]interface{}
-			json.NewDecoder(r.Body).Decode(&req)
-			deletedRkey, _ = req["rkey"].(string)
-			w.WriteHeader(http.StatusOK)
+			lastRepo, _ = req["repo"].(string)
+			lastCollection, _ = req["collection"].(string)
+			lastRecord, _ = req["record"].(map[string]interface{})
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"uri": "at://did:plc:challenger123/app.atchess.challenge/chal789",
+				"cid": "challenge-cid",
+			})
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -66,53 +55,57 @@ func TestCreateChallenge_NotificationFailureRollsBackAndReturnsError(t *testing.
 	}
 
 	challenge, err := client.CreateChallenge(context.Background(), "did:plc:challenged456", "white", "gg")
+	if err != nil {
+		t.Fatalf("expected CreateChallenge to succeed with no cross-repo write attempted, got: %v", err)
+	}
+	if challenge == nil || challenge.ID == "" {
+		t.Fatalf("expected a non-nil challenge with an ID, got %+v", challenge)
+	}
 
-	if err == nil {
-		t.Fatal("expected CreateChallenge to return an error when the notification write fails, got nil (unqualified success)")
+	if createRecordCalls != 1 {
+		t.Errorf("expected exactly 1 createRecord call (no follow-up cross-repo write), got %d", createRecordCalls)
 	}
-	if challenge != nil {
-		t.Errorf("expected nil challenge on failure, got %+v", challenge)
+	if lastRepo != "did:plc:challenger123" {
+		t.Errorf("expected the challenge record's repo to be the caller's own did (did:plc:challenger123), got %q", lastRepo)
 	}
-	if !errors.Is(err, ErrChallengeNotificationFailed) {
-		t.Errorf("expected error to wrap ErrChallengeNotificationFailed, got: %v", err)
+	if lastCollection != "app.atchess.challenge" {
+		t.Errorf("expected collection app.atchess.challenge, got %q", lastCollection)
 	}
-	if !deleteCalled {
-		t.Error("expected the orphaned challenge record to be rolled back via deleteRecord, but it was never called")
+	if got, _ := lastRecord["challengerHandle"].(string); got != "challenger.test" {
+		t.Errorf("expected the challenge record to embed challengerHandle=%q, got %q", "challenger.test", got)
 	}
-	if deletedRkey != "chal789" {
-		t.Errorf("expected rollback to delete rkey chal789, got %q", deletedRkey)
+	if got, _ := lastRecord["challenged"].(string); got != "did:plc:challenged456" {
+		t.Errorf("expected the challenge record's challenged field to be did:plc:challenged456, got %q", got)
 	}
 }
 
-func TestCreateChallengeNotification(t *testing.T) {
-	// Mock server to simulate PDS
+// TestRespondToChallenge_WritesOnlyToOwnRepo asserts decline is expressed by
+// a record in the RESPONDING player's own repository, referencing the
+// original challenge by strongRef, never by writing into the challenger's
+// repo (atchess-1c9.11).
+func TestRespondToChallenge_WritesOnlyToOwnRepo(t *testing.T) {
+	var lastRepo, lastCollection string
+	var lastRecord map[string]interface{}
+
 	mockPDS := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/xrpc/com.atproto.server.createSession":
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(map[string]interface{}{
 				"accessJwt": "test-jwt",
-				"did":       "did:plc:test123",
-				"handle":    "test.user",
+				"did":       "did:plc:responder123",
+				"handle":    "responder.test",
 			})
 		case "/xrpc/com.atproto.repo.createRecord":
-			// Verify the request is creating a challenge notification
 			var req map[string]interface{}
 			json.NewDecoder(r.Body).Decode(&req)
-
-			if req["collection"] != "app.atchess.challengeNotification" {
-				t.Errorf("Expected collection app.atchess.challengeNotification, got %v", req["collection"])
-			}
-
-			record := req["record"].(map[string]interface{})
-			if record["challenger"] != "did:plc:test123" {
-				t.Errorf("Expected challenger DID to be client's DID, got %v", record["challenger"])
-			}
-
+			lastRepo, _ = req["repo"].(string)
+			lastCollection, _ = req["collection"].(string)
+			lastRecord, _ = req["record"].(map[string]interface{})
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(map[string]interface{}{
-				"uri": "at://did:plc:challenged456/app.atchess.challengeNotification/test123",
-				"cid": "test-cid",
+				"uri": "at://did:plc:responder123/app.atchess.challengeResponse/resp1",
+				"cid": "response-cid",
 			})
 		default:
 			w.WriteHeader(http.StatusNotFound)
@@ -120,249 +113,58 @@ func TestCreateChallengeNotification(t *testing.T) {
 	}))
 	defer mockPDS.Close()
 
-	// Create client
-	client, err := NewClient(mockPDS.URL, "test.user", "password")
+	client, err := NewClient(mockPDS.URL, "responder.test", "password")
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}
 
-	// Test creating a challenge notification
-	timeControl := map[string]interface{}{
-		"daysPerMove": 3,
-		"type":        "correspondence",
-	}
-	err = client.CreateChallengeNotification(
-		context.Background(),
-		"did:plc:challenged456",
-		"at://did:plc:challenger123/app.atchess.challenge/abc123",
-		"challenge-cid",
-		"challenger.handle",
-		"white",
-		"Let's play!",
-		timeControl,
-	)
-
+	challengeURI := "at://did:plc:challenger789/app.atchess.challenge/chal1"
+	err = client.RespondToChallenge(context.Background(), challengeURI, "challenge-cid", "declined")
 	if err != nil {
-		t.Errorf("Expected no error, got %v", err)
+		t.Fatalf("expected RespondToChallenge to succeed, got: %v", err)
+	}
+
+	if lastRepo != "did:plc:responder123" {
+		t.Errorf("expected the response record's repo to be the responder's own did, got %q", lastRepo)
+	}
+	if lastCollection != "app.atchess.challengeResponse" {
+		t.Errorf("expected collection app.atchess.challengeResponse, got %q", lastCollection)
+	}
+	challengeRef, _ := lastRecord["challenge"].(map[string]interface{})
+	if uri, _ := challengeRef["uri"].(string); uri != challengeURI {
+		t.Errorf("expected the response record to reference challenge uri %q, got %q", challengeURI, uri)
+	}
+	if got, _ := lastRecord["response"].(string); got != "declined" {
+		t.Errorf("expected response field to be \"declined\", got %q", got)
 	}
 }
 
-func TestGetChallengeNotifications(t *testing.T) {
-	// Mock server
+// TestRespondToChallenge_RejectsUnsupportedResponse guards against silently
+// writing a record with an out-of-lexicon response value.
+func TestRespondToChallenge_RejectsUnsupportedResponse(t *testing.T) {
 	mockPDS := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/xrpc/com.atproto.server.createSession":
 			w.Header().Set("Content-Type", "application/json")
 			json.NewEncoder(w).Encode(map[string]interface{}{
 				"accessJwt": "test-jwt",
-				"did":       "did:plc:test123",
-				"handle":    "test.user",
-			})
-		case "/xrpc/com.atproto.repo.listRecords":
-			// Return mock challenge notifications
-			now := time.Now()
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"records": []map[string]interface{}{
-					{
-						"uri": "at://did:plc:test123/app.atchess.challengeNotification/notif1",
-						"cid": "cid1",
-						"value": map[string]interface{}{
-							"createdAt": now.Add(-1 * time.Hour).Format(time.RFC3339),
-							"challenge": map[string]interface{}{
-								"uri": "at://did:plc:challenger1/app.atchess.challenge/chal1",
-								"cid": "chalcid1",
-							},
-							"challenger":       "did:plc:challenger1",
-							"challengerHandle": "player1.chess",
-							"timeControl": map[string]interface{}{
-								"daysPerMove": 3,
-								"type":        "correspondence",
-							},
-							"color":     "white",
-							"message":   "Good luck!",
-							"expiresAt": now.Add(23 * time.Hour).Format(time.RFC3339),
-						},
-					},
-					{
-						"uri": "at://did:plc:test123/app.atchess.challengeNotification/notif2",
-						"cid": "cid2",
-						"value": map[string]interface{}{
-							"createdAt": now.Add(-30 * time.Minute).Format(time.RFC3339),
-							"challenge": map[string]interface{}{
-								"uri": "at://did:plc:challenger2/app.atchess.challenge/chal2",
-								"cid": "chalcid2",
-							},
-							"challenger":       "did:plc:challenger2",
-							"challengerHandle": "player2.chess",
-							"timeControl": map[string]interface{}{
-								"daysPerMove": 1,
-								"type":        "correspondence",
-							},
-							"color":     "random",
-							"expiresAt": now.Add(23*time.Hour + 30*time.Minute).Format(time.RFC3339),
-						},
-					},
-				},
+				"did":       "did:plc:responder123",
+				"handle":    "responder.test",
 			})
 		default:
+			t.Errorf("unexpected request to %s; RespondToChallenge should have rejected the response value before making any write", r.URL.Path)
 			w.WriteHeader(http.StatusNotFound)
 		}
 	}))
 	defer mockPDS.Close()
 
-	// Create client
-	client, err := NewClient(mockPDS.URL, "test.user", "password")
+	client, err := NewClient(mockPDS.URL, "responder.test", "password")
 	if err != nil {
 		t.Fatalf("Failed to create client: %v", err)
 	}
 
-	// Get notifications
-	notifications, err := client.GetChallengeNotifications(context.Background())
-	if err != nil {
-		t.Fatalf("Failed to get notifications: %v", err)
-	}
-
-	// Verify results
-	if len(notifications) != 2 {
-		t.Errorf("Expected 2 notifications, got %d", len(notifications))
-	}
-
-	// Check first notification
-	if notifications[0].ChallengerHandle != "player1.chess" {
-		t.Errorf("Expected challenger handle player1.chess, got %s", notifications[0].ChallengerHandle)
-	}
-	if daysPerMove, ok := notifications[0].TimeControl["daysPerMove"].(float64); !ok || int(daysPerMove) != 3 {
-		t.Errorf("Expected 3 days per move, got %v", notifications[0].TimeControl["daysPerMove"])
-	}
-	if notifications[0].Color != "white" {
-		t.Errorf("Expected color white, got %s", notifications[0].Color)
-	}
-}
-
-func TestDeleteChallengeNotification(t *testing.T) {
-	deleteCalled := false
-
-	// Mock server
-	mockPDS := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/xrpc/com.atproto.server.createSession":
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"accessJwt": "test-jwt",
-				"did":       "did:plc:test123",
-				"handle":    "test.user",
-			})
-		case "/xrpc/com.atproto.repo.deleteRecord":
-			deleteCalled = true
-
-			// Verify the request
-			var req map[string]interface{}
-			json.NewDecoder(r.Body).Decode(&req)
-
-			if req["collection"] != "app.atchess.challengeNotification" {
-				t.Errorf("Expected collection app.atchess.challengeNotification, got %v", req["collection"])
-			}
-			if req["rkey"] != "notif123" {
-				t.Errorf("Expected rkey notif123, got %v", req["rkey"])
-			}
-
-			w.WriteHeader(http.StatusOK)
-		default:
-			w.WriteHeader(http.StatusNotFound)
-		}
-	}))
-	defer mockPDS.Close()
-
-	// Create client
-	client, err := NewClient(mockPDS.URL, "test.user", "password")
-	if err != nil {
-		t.Fatalf("Failed to create client: %v", err)
-	}
-
-	// Delete notification - need to provide full URI
-	err = client.DeleteChallengeNotification(context.Background(), "at://did:plc:test123/app.atchess.challengeNotification/notif123")
-	if err != nil {
-		t.Errorf("Failed to delete notification: %v", err)
-	}
-
-	if !deleteCalled {
-		t.Error("Delete endpoint was not called")
-	}
-}
-
-func TestChallengeNotificationExpiration(t *testing.T) {
-	// Mock server that returns both expired and valid notifications
-	mockPDS := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/xrpc/com.atproto.server.createSession":
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"accessJwt": "test-jwt",
-				"did":       "did:plc:test123",
-				"handle":    "test.user",
-			})
-		case "/xrpc/com.atproto.repo.listRecords":
-			now := time.Now()
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"records": []map[string]interface{}{
-					{
-						// Valid notification
-						"uri": "at://did:plc:test123/app.atchess.challengeNotification/valid",
-						"cid": "cid1",
-						"value": map[string]interface{}{
-							"createdAt":        now.Add(-1 * time.Hour).Format(time.RFC3339),
-							"challenger":       "did:plc:challenger1",
-							"challengerHandle": "player1.chess",
-							"challenge": map[string]interface{}{
-								"uri": "at://challenge1",
-								"cid": "chalcid1",
-							},
-							"expiresAt": now.Add(1 * time.Hour).Format(time.RFC3339), // Future
-						},
-					},
-					{
-						// Expired notification
-						"uri": "at://did:plc:test123/app.atchess.challengeNotification/expired",
-						"cid": "cid2",
-						"value": map[string]interface{}{
-							"createdAt":        now.Add(-25 * time.Hour).Format(time.RFC3339),
-							"challenger":       "did:plc:challenger2",
-							"challengerHandle": "player2.chess",
-							"challenge": map[string]interface{}{
-								"uri": "at://challenge2",
-								"cid": "chalcid2",
-							},
-							"expiresAt": now.Add(-1 * time.Hour).Format(time.RFC3339), // Past
-						},
-					},
-				},
-			})
-		default:
-			w.WriteHeader(http.StatusNotFound)
-		}
-	}))
-	defer mockPDS.Close()
-
-	// Create client
-	client, err := NewClient(mockPDS.URL, "test.user", "password")
-	if err != nil {
-		t.Fatalf("Failed to create client: %v", err)
-	}
-
-	// Get notifications - should filter out expired ones
-	notifications, err := client.GetChallengeNotifications(context.Background())
-	if err != nil {
-		t.Fatalf("Failed to get notifications: %v", err)
-	}
-
-	// Should only return 1 valid notification
-	if len(notifications) != 1 {
-		t.Errorf("Expected 1 valid notification, got %d", len(notifications))
-	}
-
-	if len(notifications) > 0 && notifications[0].ChallengerHandle != "player1.chess" {
-		t.Errorf("Expected valid notification from player1.chess, got %s", notifications[0].ChallengerHandle)
+	err = client.RespondToChallenge(context.Background(), "at://did:plc:challenger789/app.atchess.challenge/chal1", "cid", "accepted")
+	if err == nil {
+		t.Fatal("expected an error for an unsupported response value, got nil")
 	}
 }

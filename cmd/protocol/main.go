@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -76,19 +77,49 @@ func main() {
 	// Create firehose processor with shared challenge store
 	processor := firehose.NewEventProcessor(hub, challengeStore)
 
-	// Start firehose client (optional - can be disabled in config)
+	// Start firehose client(s) (optional -- can be disabled in config).
+	// Challenge delivery (atchess-1c9.11) depends on this: a challenge
+	// record only ever lives in its CHALLENGER's own repo (AT Protocol
+	// forbids writing it anywhere else), so the challenged player's own
+	// instance can only discover it by watching the firehose of whatever
+	// PDS(es) might host a challenger. cfg.Firehose.URL may name more than
+	// one PDS's com.atproto.sync.subscribeRepos endpoint, comma-separated
+	// (see FirehoseConfig.URL's doc comment) -- this harness/deployment
+	// topology has no relay/Jetstream aggregator in front of it, so every
+	// watched PDS needs its own subscription. Each one gets its own
+	// firehose.Client (sequence numbers, and therefore cursors, are
+	// per-source), all reporting into the same shared processor/challengeStore.
 	if cfg.Firehose.Enabled {
-		firehoseClient := firehose.NewClient(
-			firehose.CreateChessEventHandler(processor),
-			firehose.WithURL(cfg.Firehose.URL),
-		)
+		urls := splitFirehoseURLs(cfg.Firehose.URL)
+		if len(urls) == 0 {
+			log.Warn().Msg("firehose enabled but no URL(s) configured; challenge delivery will not work")
+		}
+		for _, u := range urls {
+			u := u
+			firehoseClient := firehose.NewClient(
+				firehose.CreateChessEventHandler(processor),
+				firehose.WithURL(u),
+				// WithCursor(0) forces THIS process's first connection to
+				// every watched PDS to replay from the very beginning of
+				// its commit log, not just the live tip -- this is
+				// atchess-1c9.11's backfill-on-login: a challenge issued
+				// while this process was not running is still discovered
+				// once it starts and (re)subscribes, rather than only ever
+				// seeing challenges created after that moment. Every
+				// subsequent reconnect resumes from whatever sequence was
+				// actually last processed (see firehose.Client.LastSequence),
+				// not cursor 0 again, once at least one message has been
+				// processed.
+				firehose.WithCursor(0),
+			)
 
-		go func() {
-			log.Info().Str("url", cfg.Firehose.URL).Msg("Starting firehose client")
-			if err := firehoseClient.Start(); err != nil {
-				log.Error().Err(err).Msg("Firehose client error")
-			}
-		}()
+			go func() {
+				log.Info().Str("url", u).Msg("Starting firehose client (backfill-from-beginning + live subscription)")
+				if err := firehoseClient.Start(); err != nil {
+					log.Error().Err(err).Str("url", u).Msg("Firehose client error")
+				}
+			}()
+		}
 
 		// Track the current user's games
 		processor.TrackPlayer(client.GetDID())
@@ -139,7 +170,7 @@ func main() {
 	authed.HandleFunc("/moves", service.MakeMoveHandler).Methods("POST")
 	authed.HandleFunc("/challenges", service.CreateChallengeHandler).Methods("POST")
 	authed.HandleFunc("/challenge-notifications", service.GetChallengeNotificationsHandler).Methods("GET")
-	authed.HandleFunc("/challenge-notifications/{key}", service.DeleteChallengeNotificationHandler).Methods("DELETE")
+	authed.HandleFunc("/challenge-notifications/{key}", service.DeclineChallengeHandler).Methods("DELETE")
 	authed.HandleFunc("/draw-offers", service.OfferDrawHandler).Methods("POST")
 	authed.HandleFunc("/draw-offers/respond", service.RespondToDrawHandler).Methods("POST")
 	authed.HandleFunc("/resign", service.ResignGameHandler).Methods("POST")
@@ -253,6 +284,20 @@ func main() {
 	}
 
 	log.Info().Msg("Server exited")
+}
+
+// splitFirehoseURLs parses cfg.Firehose.URL (see FirehoseConfig.URL's doc
+// comment) as a comma-separated list of com.atproto.sync.subscribeRepos
+// websocket URLs, trimming whitespace and dropping empty entries.
+func splitFirehoseURLs(raw string) []string {
+	var urls []string
+	for _, part := range strings.Split(raw, ",") {
+		u := strings.TrimSpace(part)
+		if u != "" {
+			urls = append(urls, u)
+		}
+	}
+	return urls
 }
 
 func showHelpMessage() {

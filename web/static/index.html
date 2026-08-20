@@ -1105,21 +1105,41 @@
                 return;
             }
             
+            // NOTE: these field names (challengeUri, challengerHandle,
+            // challengerDid, color, message) are the lowercase JSON tags
+            // internal/challenge.PendingChallenge actually serializes
+            // (internal/web/service.go's GetChallengeNotificationsHandler) --
+            // NOT the old capitalized atproto.ChallengeNotification shape
+            // this file used to (wrongly) assume. See atchess-1c9.11 defect 5.
             container.innerHTML = challenges.map(challenge => `
                 <div class="challenge-item">
-                    <div class="challenge-from">From: @${challenge.ChallengerHandle || 'Unknown'}</div>
+                    <div class="challenge-from">From: @${challenge.challengerHandle || 'Unknown'}</div>
                     <div class="challenge-details">
-                        Color: ${challenge.Color === 'white' ? 'White' : challenge.Color === 'black' ? 'Black' : 'Random'}
+                        Color: ${challenge.color === 'white' ? 'White' : challenge.color === 'black' ? 'Black' : 'Random'}
                     </div>
-                    ${challenge.Message ? `<div class="challenge-details">"${challenge.Message}"</div>` : ''}
+                    ${challenge.message ? `<div class="challenge-details">"${challenge.message}"</div>` : ''}
                     <div class="challenge-actions">
-                        <button class="btn-accept" onclick="acceptChallenge('${challenge.URI}', '${challenge.Challenger}', '${challenge.Color}')">Accept</button>
-                        <button class="btn-decline" onclick="declineChallenge('${challenge.URI}')">Decline</button>
+                        <button class="btn-accept" onclick="acceptChallenge('${challenge.challengeUri}', '${challenge.challengerDid}', '${challenge.color}')">Accept</button>
+                        <button class="btn-decline" onclick="declineChallenge('${challenge.challengeUri}')">Decline</button>
                     </div>
                 </div>
             `).join('');
         }
-        
+
+        // encodeChallengeKey URL-safe-base64-encodes a challenge's full at://
+        // URI exactly the way DeclineChallengeHandler's {key} route segment
+        // expects it (internal/web/service.go's decodeGameID, reused there --
+        // see its doc comment). A bare record key can never work here: the
+        // challenge record lives in the CHALLENGER's repo, an arbitrary DID
+        // this browser has no other way to reconstruct a full at:// URI for
+        // (atchess-1c9.11 defect 4).
+        function encodeChallengeKey(uri) {
+            const bytes = new TextEncoder().encode(uri);
+            let binary = '';
+            bytes.forEach(b => { binary += String.fromCharCode(b); });
+            return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_');
+        }
+
         // Accept challenge
         async function acceptChallenge(notificationUri, challengerDid, theirColor) {
             try {
@@ -1150,14 +1170,21 @@
                 }
                 
                 const game = await response.json();
-                
-                // Delete notification
-                const uriParts = notificationUri.split('/');
-                const key = uriParts[uriParts.length - 1];
-                await fetch(`${API_BASE}/challenge-notifications/${key}`, {
-                    method: 'DELETE'
-                });
-                
+
+                // NOTE: intentionally NOT calling
+                // DELETE /api/challenge-notifications/{key} here. That route
+                // now has real semantics (atchess-1c9.11): it records a
+                // DECLINE (an app.atchess.challengeResponse in the caller's
+                // own repo), which would be actively wrong to write for a
+                // challenge that was just ACCEPTED. There is no dedicated
+                // accept-link endpoint yet (POST /api/games does not
+                // reference the originating challenge at all, a separate,
+                // pre-existing gap -- see test/e2e/federation_test.go's
+                // ADAPTATION NOTE), so the accepted challenge may still
+                // reappear in the pending list until it expires; that is a
+                // known, distinct limitation, not something to paper over by
+                // mislabeling it as declined.
+
                 // Load the game
                 loadGame(btoa(game.id).replace(/[+/]/g, c => ({'+': '-', '/': '_'})[c]));
                 
@@ -1169,18 +1196,22 @@
             }
         }
         
-        // Decline challenge
-        async function declineChallenge(notificationUri) {
+        // Decline challenge. challengeUri is the challenge's full at:// URI
+        // (challenge.challengeUri from displayChallenges), not a bare
+        // record key -- see encodeChallengeKey's doc comment for why.
+        async function declineChallenge(challengeUri) {
             try {
-                const uriParts = notificationUri.split('/');
-                const key = uriParts[uriParts.length - 1];
-                
-                await fetch(`${API_BASE}/challenge-notifications/${key}`, {
+                const key = encodeChallengeKey(challengeUri);
+
+                const response = await fetch(`${API_BASE}/challenge-notifications/${key}`, {
                     method: 'DELETE'
                 });
-                
+                if (!response.ok) {
+                    throw new Error('Failed to decline challenge');
+                }
+
                 loadChallenges();
-                
+
             } catch (error) {
                 alert('Error declining challenge: ' + error.message);
             }

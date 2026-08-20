@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/justinabrahms/atchess/internal/challenge"
 	"github.com/justinabrahms/atchess/internal/web"
@@ -66,8 +65,6 @@ func (p *EventProcessor) ProcessEvent(ctx context.Context, event Event) error {
 		return p.processResignationEvent(ctx, event)
 	case EventTypeChallenge:
 		return p.processChallengeEvent(ctx, event)
-	case EventTypeChallengeNotification:
-		return p.processChallengeNotificationEvent(ctx, event)
 	default:
 		log.Debug().
 			Str("type", string(event.Type)).
@@ -208,50 +205,30 @@ func (p *EventProcessor) processResignationEvent(ctx context.Context, event Even
 	return nil
 }
 
-// processChallengeEvent handles challenge records from the firehose and indexes them.
+// processChallengeEvent handles challenge records discovered via a watched
+// PDS's firehose (live, cursor-resumed, or a startup backfill resubscribe --
+// see cmd/protocol/main.go) and indexes them into the shared challenge.Store
+// CACHE (never a write path -- see that package's doc comment) so
+// GET /api/challenge-notifications can serve them without a repo round trip
+// per request.
 func (p *EventProcessor) processChallengeEvent(ctx context.Context, event Event) error {
 	record, ok := event.Record.(map[string]interface{})
 	if !ok {
 		return fmt.Errorf("invalid challenge record format")
 	}
 
+	rkey := strings.TrimPrefix(event.Path, "app.atchess.challenge/")
+
 	// Index the challenge so the challenged player can discover it
 	if p.challengeStore != nil {
-		challengedDID, _ := record["challenged"].(string)
-		challengerDID, _ := record["challenger"].(string)
-		color, _ := record["color"].(string)
-		message, _ := record["message"].(string)
-		proposedGameID, _ := record["proposedGameId"].(string)
-
-		createdAt := time.Now()
-		if ts, ok := record["createdAt"].(string); ok {
-			if parsed, err := time.Parse(time.RFC3339, ts); err == nil {
-				createdAt = parsed
-			}
-		}
-		expiresAt := createdAt.Add(24 * time.Hour)
-		if ts, ok := record["expiresAt"].(string); ok {
-			if parsed, err := time.Parse(time.RFC3339, ts); err == nil {
-				expiresAt = parsed
-			}
-		}
-
-		challengeURI := fmt.Sprintf("at://%s/%s", event.Repo, event.Path)
-
-		p.challengeStore.Add(&challenge.PendingChallenge{
-			ChallengeURI:   challengeURI,
-			ChallengeCID:   event.CID,
-			ChallengerDID:  challengerDID,
-			ChallengedDID:  challengedDID,
-			Color:          color,
-			Message:        message,
-			ProposedGameID: proposedGameID,
-			CreatedAt:      createdAt,
-			ExpiresAt:      expiresAt,
-		})
+		pending := challenge.FromChallengeRecord(event.Repo, rkey, event.CID, record)
+		p.challengeStore.Add(pending)
 	}
 
-	// Notify challenged player via WebSocket
+	// Notify challenged player via WebSocket, for clients connected right
+	// now (this is purely a UX nicety layered on top of the Store cache
+	// above -- GET /api/challenge-notifications does not depend on it, so a
+	// dropped WebSocket message is not a delivery failure).
 	challengedDID, _ := record["challenged"].(string)
 	if challengedDID != "" {
 		update := web.GameUpdate{
@@ -266,24 +243,6 @@ func (p *EventProcessor) processChallengeEvent(ctx context.Context, event Event)
 		Str("path", event.Path).
 		Msg("Indexed challenge from firehose")
 
-	return nil
-}
-
-// processChallengeNotificationEvent handles challenge notifications
-func (p *EventProcessor) processChallengeNotificationEvent(ctx context.Context, event Event) error {
-	notification, ok := event.Record.(map[string]interface{})
-	if !ok {
-		return fmt.Errorf("invalid challenge notification record format")
-	}
-
-	// Send to the challenged player
-	update := web.GameUpdate{
-		Type: "challenge_notification",
-		Data: notification,
-	}
-
-	// The repo is the challenged player's DID
-	p.hub.BroadcastToPlayer(event.Repo, update)
 	return nil
 }
 

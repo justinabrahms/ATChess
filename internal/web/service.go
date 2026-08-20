@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -320,23 +319,27 @@ func (s *Service) CreateChallengeHandler(w http.ResponseWriter, r *http.Request)
 
 	ch, err := client.CreateChallenge(context.Background(), opponentDID, req.Color, req.Message)
 	if err != nil {
+		// atchess-1c9.11: CreateChallenge no longer attempts a cross-repo
+		// notification write (AT Protocol never permitted it to succeed --
+		// see atchess-1c9.31/.11's notes), so the only failure modes left
+		// here are this instance's own PDS request failing outright (bad
+		// input, network, auth). There is no longer a distinct "delivery
+		// failed but the challenge record itself is fine" case to map to
+		// 502; a plain 500 is the right signal now.
 		log.Error().Err(err).Msg("Failed to create challenge")
-		if errors.Is(err, atproto.ErrChallengeNotificationFailed) {
-			// The challenge record write itself succeeded, but delivering
-			// the notification to the challenged player's own repository --
-			// a write against a PDS we don't control -- failed and was
-			// rolled back. That's an upstream dependency failing, not a
-			// defect in this service, so 502 (Bad Gateway) fits better than
-			// 500: it tells the caller (and any monitoring) that the fault
-			// is downstream, in AT Protocol federation, not here.
-			http.Error(w, fmt.Sprintf("Failed to create challenge: %v", err), http.StatusBadGateway)
-			return
-		}
 		http.Error(w, "Failed to create challenge", http.StatusInternalServerError)
 		return
 	}
 
-	// Index the challenge locally so the challenged player can discover it
+	// Index the challenge in this instance's local cache immediately, so a
+	// same-process GET (including the challenger's own inbound list, which
+	// must NOT show it -- see challenge.Store.ForPlayer's DID keying)
+	// reflects it without waiting on this instance's own firehose
+	// subscription to redeliver the record it just wrote. This is purely a
+	// latency optimization: the firehose subscription (or the challenged
+	// player's own backfill-on-login) is the actual source of cross-process
+	// delivery, and Store.Add dedupes by URI, so redelivery here is
+	// harmless.
 	if s.challengeStore != nil {
 		createdAt, _ := time.Parse(time.RFC3339, ch.CreatedAt)
 		expiresAt, _ := time.Parse(time.RFC3339, ch.ExpiresAt)
@@ -357,40 +360,79 @@ func (s *Service) CreateChallengeHandler(w http.ResponseWriter, r *http.Request)
 	_ = json.NewEncoder(w).Encode(ch)
 }
 
+// GetChallengeNotificationsHandler returns pending challenges addressed to
+// the authenticated caller, sourced from this instance's challenge.Store
+// cache (atchess-1c9.11) -- populated by internal/firehose.EventProcessor as
+// app.atchess.challenge commits arrive from every watched PDS, live and via
+// the startup backfill resubscribe (see cmd/protocol/main.go). There is no
+// remaining fallback to a per-repo notification record: that mechanism
+// (app.atchess.challengeNotification, written cross-repo) has been removed
+// entirely because AT Protocol never permitted the write it depended on to
+// succeed.
 func (s *Service) GetChallengeNotificationsHandler(w http.ResponseWriter, r *http.Request) {
-	// Use the local challenge store for discovery (works across federation)
+	var challenges []*challenge.PendingChallenge
 	if s.challengeStore != nil {
-		challenges := s.challengeStore.ForPlayer(AuthenticatedDID(r))
-		w.Header().Set("Content-Type", "application/json")
-		if challenges == nil {
-			challenges = []*challenge.PendingChallenge{}
-		}
-		_ = json.NewEncoder(w).Encode(challenges)
-		return
+		challenges = s.challengeStore.ForPlayer(AuthenticatedDID(r))
 	}
-
-	// Fallback to legacy repo-based notifications (only works same-PDS)
-	client, ok := s.requireClient(w, r)
-	if !ok {
-		return
-	}
-	notifications, err := client.GetChallengeNotifications(context.Background())
-	if err != nil {
-		log.Error().Err(err).Msg("Failed to fetch challenge notifications")
-		http.Error(w, "Failed to fetch notifications", http.StatusInternalServerError)
-		return
-	}
-
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(notifications)
+	if challenges == nil {
+		challenges = []*challenge.PendingChallenge{}
+	}
+	_ = json.NewEncoder(w).Encode(challenges)
 }
 
-func (s *Service) DeleteChallengeNotificationHandler(w http.ResponseWriter, r *http.Request) {
+// DeclineChallengeHandler ("decline"; the route is still
+// DELETE /api/challenge-notifications/{key} for frontend-compatibility, but
+// nothing is actually deleted from AT Protocol -- see below) expresses a
+// decline WITHOUT writing to the challenger's repo (atchess-1c9.11): it
+// creates an app.atchess.challengeResponse record in the AUTHENTICATED
+// CALLER's own repo, referencing the challenge by strongRef, then drops the
+// challenge from this instance's local cache so it stops appearing in the
+// caller's own GET /api/challenge-notifications.
+//
+// {key} must be the challenge's full at:// URI, URL-safe-base64 encoded
+// (decodeGameID's encoding, reused here) -- NOT a bare record key. A bare
+// rkey cannot be resolved to a full URI on this end, because the challenge
+// record lives in the CHALLENGER's repo (an arbitrary DID this instance
+// does not otherwise know), not the caller's own -- this was defect 4 from
+// atchess-1c9.11's brief (mux's {key} segment vs
+// atproto.Client.DeleteChallengeNotification's full-URI requirement).
+//
+// The caller must have an entry for this challenge URI in their own cached
+// inbound list (i.e. it must be addressed to them) -- this is both the
+// authorization check (you can only decline your own challenges) and how
+// the challenge's CID (required by the strongRef) is obtained without an
+// extra repo read.
+func (s *Service) DeclineChallengeHandler(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
-	notificationKey := vars["key"]
+	encodedKey := vars["key"]
+	if encodedKey == "" {
+		http.Error(w, "Missing challenge key", http.StatusBadRequest)
+		return
+	}
 
-	if notificationKey == "" {
-		http.Error(w, "Missing notification key", http.StatusBadRequest)
+	challengeURI, err := s.decodeGameID(encodedKey)
+	if err != nil {
+		log.Error().Err(err).Str("encodedKey", encodedKey).Msg("Failed to decode challenge key")
+		http.Error(w, "Invalid challenge key", http.StatusBadRequest)
+		return
+	}
+
+	if s.challengeStore == nil {
+		http.Error(w, "Challenge discovery is not available", http.StatusInternalServerError)
+		return
+	}
+
+	authedDID := AuthenticatedDID(r)
+	var target *challenge.PendingChallenge
+	for _, c := range s.challengeStore.ForPlayer(authedDID) {
+		if c.ChallengeURI == challengeURI {
+			target = c
+			break
+		}
+	}
+	if target == nil {
+		http.Error(w, "No pending challenge with that key was found for the authenticated user", http.StatusNotFound)
 		return
 	}
 
@@ -399,12 +441,13 @@ func (s *Service) DeleteChallengeNotificationHandler(w http.ResponseWriter, r *h
 		return
 	}
 
-	err := client.DeleteChallengeNotification(context.Background(), notificationKey)
-	if err != nil {
-		log.Error().Err(err).Str("key", notificationKey).Msg("Failed to delete notification")
-		http.Error(w, "Failed to delete notification", http.StatusInternalServerError)
+	if err := client.RespondToChallenge(context.Background(), challengeURI, target.ChallengeCID, "declined"); err != nil {
+		log.Error().Err(err).Str("challengeURI", challengeURI).Msg("Failed to record challenge decline")
+		http.Error(w, "Failed to decline challenge", http.StatusInternalServerError)
 		return
 	}
+
+	s.challengeStore.Remove(challengeURI)
 
 	w.WriteHeader(http.StatusNoContent)
 }

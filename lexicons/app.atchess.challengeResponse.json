@@ -1,0 +1,32 @@
+{
+  "lexicon": 1,
+  "id": "app.atchess.challengeResponse",
+  "defs": {
+    "main": {
+      "type": "record",
+      "description": "A response (currently: decline) to a challenge, written into the RESPONDING player's own repository. AT Protocol does not permit writing into another account's repository, so this record -- unlike the retired app.atchess.challengeNotification design -- always lives with its author, the responder, and references the original challenge by strongRef rather than being co-located with it. An 'accept' response is instead expressed by the app.atchess.game record the accepting player creates (see app.atchess.game's optional 'challenge' strongRef field), so this record type is only ever written for a decline.",
+      "key": "tid",
+      "record": {
+        "type": "object",
+        "required": ["createdAt", "challenge", "response"],
+        "properties": {
+          "createdAt": {
+            "type": "string",
+            "format": "datetime",
+            "description": "When the response was recorded"
+          },
+          "challenge": {
+            "type": "ref",
+            "ref": "com.atproto.repo.strongRef",
+            "description": "Reference (uri + cid) to the original app.atchess.challenge record in the challenger's repo"
+          },
+          "response": {
+            "type": "string",
+            "enum": ["declined"],
+            "description": "The responder's decision. Only \"declined\" is ever written by this record type; acceptance is expressed by creating an app.atchess.game record referencing the same challenge instead."
+          }
+        }
+      }
+    }
+  }
+}

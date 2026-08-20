@@ -25,6 +25,10 @@
             "format": "did",
             "description": "DID of the player being challenged"
           },
+          "challengerHandle": {
+            "type": "string",
+            "description": "Handle of the challenging player at the time of the challenge, embedded here (rather than looked up separately) so a subscriber discovering this record via the firehose/Jetstream can display it without an extra DID-to-handle resolution round trip. Best-effort/display-only: not authoritative identity."
+          },
           "status": {
             "type": "string",
             "enum": ["pending", "accepted", "declined", "cancelled"],

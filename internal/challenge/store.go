@@ -1,6 +1,7 @@
 package challenge
 
 import (
+	"fmt"
 	"sync"
 	"time"
 )
@@ -19,11 +20,22 @@ type PendingChallenge struct {
 	ExpiresAt        time.Time `json:"expiresAt"`
 }
 
-// Store is an in-memory index of pending challenges, keyed by challenged DID.
-// This solves the fundamental AT Protocol limitation where you cannot write to
-// another user's repository. Instead of trying to create notification records
-// in the challenged player's repo (which always fails in federation), we
-// maintain a local index that both the API and firehose can populate.
+// Store is a per-process, in-memory CACHE of pending challenges, keyed by
+// challenged DID -- it is deliberately not the source of truth (atchess-1c9.11).
+// The source of truth is always each app.atchess.challenge record in its
+// author's (the challenger's) own AT Protocol repo; a challenge can never be
+// written into the challenged player's repo (AT Protocol does not permit
+// writing into a repo that isn't your own). Store exists purely so
+// GET /api/challenge-notifications does not have to re-derive "which
+// challenges are addressed to me" from scratch on every request: it is
+// populated by (1) internal/firehose.EventProcessor as
+// app.atchess.challenge commits arrive live, subscribed directly against
+// every watched PDS, with cursor-based resumption across reconnects, and
+// (2) an explicit backfill resubscribe (cursor 0) performed at startup so
+// challenges issued while this process was not running are not missed --
+// see cmd/protocol/main.go. Because it is only a cache, losing it (e.g. a
+// process restart) is not data loss: the next backfill resubscribe
+// rebuilds it from the same repo records.
 type Store struct {
 	mu sync.RWMutex
 	// challenges indexed by challenged DID
@@ -109,4 +121,49 @@ func (s *Store) PruneExpired() int {
 		}
 	}
 	return pruned
+}
+
+// FromChallengeRecord builds a *PendingChallenge from an app.atchess.challenge
+// record's decoded fields (as delivered by internal/firehose, whether live or
+// during a backfill resubscribe), plus the repo DID, record key, and CID the
+// commit that carried it identified. It is the single place that maps the
+// wire record shape to PendingChallenge, shared by the live and backfill
+// paths so they cannot drift out of sync with each other.
+//
+// A missing/unparsable createdAt defaults to now; a missing/unparsable
+// expiresAt defaults to 24h after createdAt (matching CreateChallenge's own
+// default expiry, internal/atproto/client.go).
+func FromChallengeRecord(repoDID, rkey, cid string, record map[string]interface{}) *PendingChallenge {
+	challengedDID, _ := record["challenged"].(string)
+	challengerDID, _ := record["challenger"].(string)
+	challengerHandle, _ := record["challengerHandle"].(string)
+	color, _ := record["color"].(string)
+	message, _ := record["message"].(string)
+	proposedGameID, _ := record["proposedGameId"].(string)
+
+	createdAt := time.Now()
+	if ts, ok := record["createdAt"].(string); ok {
+		if parsed, err := time.Parse(time.RFC3339, ts); err == nil {
+			createdAt = parsed
+		}
+	}
+	expiresAt := createdAt.Add(24 * time.Hour)
+	if ts, ok := record["expiresAt"].(string); ok {
+		if parsed, err := time.Parse(time.RFC3339, ts); err == nil {
+			expiresAt = parsed
+		}
+	}
+
+	return &PendingChallenge{
+		ChallengeURI:     fmt.Sprintf("at://%s/app.atchess.challenge/%s", repoDID, rkey),
+		ChallengeCID:     cid,
+		ChallengerDID:    challengerDID,
+		ChallengerHandle: challengerHandle,
+		ChallengedDID:    challengedDID,
+		Color:            color,
+		Message:          message,
+		ProposedGameID:   proposedGameID,
+		CreatedAt:        createdAt,
+		ExpiresAt:        expiresAt,
+	}
 }

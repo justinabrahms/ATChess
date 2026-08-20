@@ -7,7 +7,6 @@ import (
 	"encoding/base32"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -17,18 +16,7 @@ import (
 
 	"github.com/justinabrahms/atchess/internal/auth"
 	"github.com/justinabrahms/atchess/internal/chess"
-	"github.com/rs/zerolog/log"
 )
-
-// ErrChallengeNotificationFailed indicates a challenge record was written to
-// the challenger's own repository, but the corresponding notification could
-// not be delivered to the challenged player's repository (e.g. their PDS
-// rejected the cross-repo write, is unreachable, or the account was not
-// found). CreateChallenge rolls back the challenge record in this case and
-// wraps the underlying error with this sentinel so callers -- notably the
-// HTTP handler -- can distinguish "upstream delivery failed" from other
-// failure modes. See atchess-1c9.31.
-var ErrChallengeNotificationFailed = errors.New("challenge notification delivery failed")
 
 type Client struct {
 	pdsURL      string
@@ -512,20 +500,40 @@ func (c *Client) RecordMove(ctx context.Context, gameURI string, move *chess.Mov
 	return nil
 }
 
+// CreateChallenge writes an app.atchess.challenge record into the CALLER's
+// OWN repository (c.did) naming opponentDID as the challenged party. It
+// deliberately does NOT attempt to write anything into the challenged
+// player's repository -- AT Protocol never permits writing into a repo that
+// isn't your own with your own session credentials, so an attempt to do that
+// (the retired CreateChallengeNotification, see atchess-1c9.11) always
+// failed in federation and has been removed entirely rather than retried.
+//
+// Delivery to the challenged player is instead the responsibility of the
+// discovery mechanism described in internal/challenge and
+// internal/firehose: the challenged player's own protocol-service instance
+// discovers this record by subscribing to the firehose of any PDS that
+// might host a challenger (see cmd/protocol/main.go) and indexing
+// app.atchess.challenge commits whose "challenged" field matches its own
+// authenticated users, plus a startup backfill (an explicit cursor-0
+// resubscribe that replays each watched PDS's full commit history) for
+// challenges issued while offline. challengerHandle is embedded directly in
+// the record so a subscriber can display it without a second DID resolution
+// round trip.
 func (c *Client) CreateChallenge(ctx context.Context, opponentDID, color, message string) (*chess.Challenge, error) {
 	createdAt := time.Now()
 	proposedGameID := generateGameID(c.did, opponentDID, createdAt)
 
 	challengeRecord := map[string]interface{}{
-		"$type":          "app.atchess.challenge",
-		"createdAt":      createdAt.Format(time.RFC3339),
-		"challenger":     c.did,
-		"challenged":     opponentDID,
-		"status":         "pending",
-		"color":          color,
-		"proposedGameId": proposedGameID,
-		"message":        message,
-		"expiresAt":      createdAt.Add(24 * time.Hour).Format(time.RFC3339),
+		"$type":            "app.atchess.challenge",
+		"createdAt":        createdAt.Format(time.RFC3339),
+		"challenger":       c.did,
+		"challengerHandle": c.handle,
+		"challenged":       opponentDID,
+		"status":           "pending",
+		"color":            color,
+		"proposedGameId":   proposedGameID,
+		"message":          message,
+		"expiresAt":        createdAt.Add(24 * time.Hour).Format(time.RFC3339),
 	}
 
 	createReq := map[string]interface{}{
@@ -554,36 +562,6 @@ func (c *Client) CreateChallenge(ctx context.Context, opponentDID, color, messag
 		return nil, fmt.Errorf("failed to decode response: %w", err)
 	}
 
-	// Create a notification in the challenged player's repository. Delivery
-	// of this notification is not best-effort: it is how the challenged
-	// player learns the challenge exists at all. If it fails, the challenge
-	// record we just wrote to our own repo is an orphan nobody was told
-	// about and nobody will ever respond to, so we roll it back and fail
-	// the whole operation rather than reporting success (atchess-1c9.31).
-	timeControl := map[string]interface{}{
-		"type":        "correspondence",
-		"daysPerMove": 3,
-	}
-
-	notificationErr := c.CreateChallengeNotification(ctx, opponentDID, createResp.URI, createResp.CID, c.handle, color, message, timeControl)
-	if notificationErr != nil {
-		log.Error().
-			Err(notificationErr).
-			Str("challengeURI", createResp.URI).
-			Str("challengedDID", opponentDID).
-			Msg("challenge notification delivery failed; rolling back challenge record")
-
-		if delErr := c.deleteChallengeRecord(createResp.URI); delErr != nil {
-			log.Error().
-				Err(delErr).
-				Str("challengeURI", createResp.URI).
-				Msg("failed to roll back orphaned challenge record after notification delivery failure; manual cleanup required")
-			return nil, fmt.Errorf("%w: %v (rollback of orphaned challenge record %s also failed: %v)", ErrChallengeNotificationFailed, notificationErr, createResp.URI, delErr)
-		}
-
-		return nil, fmt.Errorf("%w: %v", ErrChallengeNotificationFailed, notificationErr)
-	}
-
 	return &chess.Challenge{
 		ID:             createResp.URI,
 		Challenger:     c.did,
@@ -597,35 +575,49 @@ func (c *Client) CreateChallenge(ctx context.Context, opponentDID, color, messag
 	}, nil
 }
 
-// deleteChallengeRecord deletes an app.atchess.challenge record from the
-// challenger's own repository (c.did). It is used by CreateChallenge to roll
-// back a just-created challenge record when the follow-up notification write
-// to the challenged player's repository fails, so a failed CreateChallenge
-// call never leaves a challenge record behind that the caller was not told
-// about (atchess-1c9.31).
-func (c *Client) deleteChallengeRecord(challengeURI string) error {
-	parts := strings.Split(challengeURI, "/")
-	if len(parts) < 5 || !strings.HasPrefix(challengeURI, "at://") {
-		return fmt.Errorf("invalid challenge URI format: %s", challengeURI)
+// RespondToChallenge records a decline of a pending challenge by writing an
+// app.atchess.challengeResponse record into the CALLER's (the responding
+// player's) OWN repository -- never into the challenger's, which AT
+// Protocol does not permit. It references the original challenge by
+// strongRef (challengeURI + challengeCID) rather than being co-located with
+// it. Acceptance is not expressed through this method: an accepted
+// challenge is instead represented by the app.atchess.game record the
+// accepting player creates (see CreateGameFromChallenge), which already
+// carries the same challenge strongRef.
+//
+// response is currently always "declined" -- the parameter exists (rather
+// than a bool) so the lexicon's enum can grow without an API change.
+func (c *Client) RespondToChallenge(ctx context.Context, challengeURI, challengeCID, response string) error {
+	if response != "declined" {
+		return fmt.Errorf("unsupported challenge response %q (only \"declined\" is currently supported)", response)
 	}
-	rkey := parts[4]
 
-	deleteReq := map[string]interface{}{
+	record := map[string]interface{}{
+		"$type":     "app.atchess.challengeResponse",
+		"createdAt": time.Now().Format(time.RFC3339),
+		"challenge": map[string]interface{}{
+			"uri": challengeURI,
+			"cid": challengeCID,
+		},
+		"response": response,
+	}
+
+	createReq := map[string]interface{}{
 		"repo":       c.did,
-		"collection": "app.atchess.challenge",
-		"rkey":       rkey,
+		"collection": "app.atchess.challengeResponse",
+		"record":     record,
 	}
 
-	reqBody, _ := json.Marshal(deleteReq)
-	resp, err := c.makeRequest("POST", xrpcURL(c.pdsURL, "com.atproto.repo.deleteRecord", nil), reqBody)
+	reqBody, _ := json.Marshal(createReq)
+	resp, err := c.makeRequest("POST", xrpcURL(c.pdsURL, "com.atproto.repo.createRecord", nil), reqBody)
 	if err != nil {
-		return fmt.Errorf("failed to delete challenge record: %w", err)
+		return fmt.Errorf("failed to create challenge response record: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("failed to delete challenge record: HTTP %d - %s", resp.StatusCode, string(body))
+		return fmt.Errorf("failed to create challenge response record: HTTP %d - %s", resp.StatusCode, string(body))
 	}
 
 	return nil
@@ -1094,204 +1086,6 @@ func (c *Client) resolveHandleSamePDS(ctx context.Context, handle string) (strin
 	}
 
 	return result.DID, nil
-}
-
-// CreateChallengeNotification creates a notification in the challenged player's repository
-func (c *Client) CreateChallengeNotification(ctx context.Context, challengedDID, challengeURI, challengeCID, challengerHandle, color, message string, timeControl map[string]interface{}) error {
-	// Calculate expiration time (24 hours from now)
-	expiresAt := time.Now().Add(24 * time.Hour)
-
-	// Create notification record
-	notificationRecord := map[string]interface{}{
-		"$type":     "app.atchess.challengeNotification",
-		"createdAt": time.Now().Format(time.RFC3339),
-		"challenge": map[string]interface{}{
-			"uri": challengeURI,
-			"cid": challengeCID,
-		},
-		"challenger":       c.did,
-		"challengerHandle": challengerHandle,
-		"color":            color,
-		"expiresAt":        expiresAt.Format(time.RFC3339),
-	}
-
-	// Add optional fields
-	if message != "" {
-		notificationRecord["message"] = message
-	}
-
-	if timeControl != nil {
-		notificationRecord["timeControl"] = timeControl
-	}
-
-	// Create record in challenged player's repository
-	createReq := map[string]interface{}{
-		"repo":       challengedDID,
-		"collection": "app.atchess.challengeNotification",
-		"record":     notificationRecord,
-	}
-
-	reqBody, _ := json.Marshal(createReq)
-	resp, err := c.makeRequest("POST", xrpcURL(c.pdsURL, "com.atproto.repo.createRecord", nil), reqBody)
-	if err != nil {
-		return fmt.Errorf("failed to create challenge notification: %w", err)
-	}
-	defer resp.Body.Close()
-
-	// Handle expected error cases
-	if resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusUnauthorized {
-		// We don't have permission to write to the challenged player's repo
-		// This is expected in many cases (different PDS, privacy settings, etc.)
-		body, _ := io.ReadAll(resp.Body)
-		log.Error().
-			Int("status", resp.StatusCode).
-			Str("body", string(body)).
-			Str("challengedDID", challengedDID).
-			Msg("cannot write challenge notification to challenged player's repository")
-		return fmt.Errorf("cannot write to challenged player's repository: HTTP %d - %s", resp.StatusCode, string(body))
-	}
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		log.Error().
-			Int("status", resp.StatusCode).
-			Str("body", string(body)).
-			Str("challengedDID", challengedDID).
-			Msg("failed to create challenge notification")
-		return fmt.Errorf("failed to create challenge notification: HTTP %d - %s", resp.StatusCode, string(body))
-	}
-
-	return nil
-}
-
-// GetChallengeNotifications retrieves pending challenge notifications for the current user
-func (c *Client) GetChallengeNotifications(ctx context.Context) ([]*ChallengeNotification, error) {
-	// List records in the challengeNotification collection
-	params := url.Values{"repo": {c.did}, "collection": {"app.atchess.challengeNotification"}, "limit": {"100"}}
-	resp, err := c.getXRPC(ctx, c.pdsURL, true, "com.atproto.repo.listRecords", params)
-	if err != nil {
-		return nil, fmt.Errorf("failed to list challenge notifications: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("failed to list challenge notifications: HTTP %d - %s", resp.StatusCode, string(body))
-	}
-
-	var listResp struct {
-		Records []struct {
-			URI   string `json:"uri"`
-			CID   string `json:"cid"`
-			Value struct {
-				Type      string `json:"$type"`
-				CreatedAt string `json:"createdAt"`
-				Challenge struct {
-					URI string `json:"uri"`
-					CID string `json:"cid"`
-				} `json:"challenge"`
-				Challenger       string                 `json:"challenger"`
-				ChallengerHandle string                 `json:"challengerHandle"`
-				Color            string                 `json:"color"`
-				Message          string                 `json:"message"`
-				ExpiresAt        string                 `json:"expiresAt"`
-				TimeControl      map[string]interface{} `json:"timeControl"`
-			} `json:"value"`
-		} `json:"records"`
-	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&listResp); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %w", err)
-	}
-
-	// Filter out expired notifications and convert to our type
-	var notifications []*ChallengeNotification
-	now := time.Now()
-
-	for _, record := range listResp.Records {
-		// Parse expiration time
-		expiresAt, err := time.Parse(time.RFC3339, record.Value.ExpiresAt)
-		if err != nil {
-			continue // Skip if we can't parse the expiration
-		}
-
-		// Skip expired notifications
-		if expiresAt.Before(now) {
-			continue
-		}
-
-		notification := &ChallengeNotification{
-			URI:              record.URI,
-			CID:              record.CID,
-			CreatedAt:        record.Value.CreatedAt,
-			ChallengeURI:     record.Value.Challenge.URI,
-			ChallengeCID:     record.Value.Challenge.CID,
-			Challenger:       record.Value.Challenger,
-			ChallengerHandle: record.Value.ChallengerHandle,
-			Color:            record.Value.Color,
-			Message:          record.Value.Message,
-			ExpiresAt:        record.Value.ExpiresAt,
-			TimeControl:      record.Value.TimeControl,
-		}
-
-		notifications = append(notifications, notification)
-	}
-
-	return notifications, nil
-}
-
-// ChallengeNotification represents a challenge notification record
-type ChallengeNotification struct {
-	URI              string
-	CID              string
-	CreatedAt        string
-	ChallengeURI     string
-	ChallengeCID     string
-	Challenger       string
-	ChallengerHandle string
-	Color            string
-	Message          string
-	ExpiresAt        string
-	TimeControl      map[string]interface{}
-}
-
-// DeleteChallengeNotification removes a challenge notification from the user's repository
-func (c *Client) DeleteChallengeNotification(ctx context.Context, notificationURI string) error {
-	// Parse the URI to extract repo and rkey
-	// Format: at://did:plc:USER/app.atchess.challengeNotification/RKEY
-	parts := strings.Split(notificationURI, "/")
-	if len(parts) < 5 || !strings.HasPrefix(notificationURI, "at://") {
-		return fmt.Errorf("invalid notification URI format: %s", notificationURI)
-	}
-
-	repo := parts[2] // The DID
-	rkey := parts[4] // The record key
-
-	// Verify this notification belongs to the current user
-	if repo != c.did {
-		return fmt.Errorf("cannot delete notification from another user's repository")
-	}
-
-	// Delete the record
-	deleteReq := map[string]interface{}{
-		"repo":       repo,
-		"collection": "app.atchess.challengeNotification",
-		"rkey":       rkey,
-	}
-
-	reqBody, _ := json.Marshal(deleteReq)
-	resp, err := c.makeRequest("POST", xrpcURL(c.pdsURL, "com.atproto.repo.deleteRecord", nil), reqBody)
-	if err != nil {
-		return fmt.Errorf("failed to delete notification: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("failed to delete notification: HTTP %d - %s", resp.StatusCode, string(body))
-	}
-
-	return nil
 }
 
 // OfferDraw creates a draw offer record for a game

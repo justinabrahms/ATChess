@@ -181,21 +181,15 @@ func TestFederation(t *testing.T) {
 	// ---------------------------------------------------------------
 	handleResolutionOK := false
 	resolvedBobDID := ""
-	t.Run("HandleResolution_Expect502UntilAtchess1c9dot11_NotAtchess1c9dot5", func(t *testing.T) {
-		// This subtest's ORIGINAL purpose (atchess-1c9.5) was to pin
-		// cross-PDS handle resolution being broken (ResolveHandle only
-		// ever querying the caller's own PDS). atchess-1c9.10 fixed that
-		// (DID-to-PDS resolution and per-target routing): empirically,
-		// against this harness, alice's instance now successfully
-		// resolves bob's cross-PDS handle to his real DID. What now
-		// stands between this call and HTTP 200 is the SEPARATE,
-		// downstream, expected atchess-1c9.31/atchess-1c9.11 issue: once
-		// resolution succeeds, CreateChallenge still 502s because the
-		// challenge-notification write to bob's own repo cannot succeed
-		// yet. So the status this subtest expects today is 502 (proof
-		// resolution worked and the request got past it), not 400 (which
-		// would mean resolution itself failed -- still checked for and
-		// reported distinctly below, in case of a genuine regression).
+	t.Run("HandleResolution", func(t *testing.T) {
+		// atchess-1c9.10 fixed cross-PDS handle resolution (ResolveHandle
+		// used to only ever query the caller's own PDS). atchess-1c9.11
+		// removed the cross-repo challenge-notification write that used to
+		// make this call 502 even after resolution succeeded (see
+		// atchess-1c9.31). So the expected outcome now is a plain HTTP 200:
+		// alice's instance resolves bob's cross-PDS handle to his real DID
+		// and the challenge record is created in alice's own repo, with no
+		// downstream write against bob's repo to fail.
 		status, body := apiPostExpectStatus(t, alice, "/api/challenges", map[string]interface{}{
 			"opponent_did": accounts.Bob.Handle,
 			"color":        "white",
@@ -209,39 +203,7 @@ func TestFederation(t *testing.T) {
 				services.AliceURL, alice.PDSURL, accounts.Bob.Handle, accounts.Bob.PDSURL, accounts.Bob.DID, status, body,
 				accounts.Bob.Handle, accounts.Bob.DID, alice.PDSURL, accounts.Bob.PDSURL)
 			return
-		case http.StatusBadGateway:
-			// Resolution succeeded FAR ENOUGH (we got past ResolveHandle to
-			// CreateChallenge, i.e. did not get the 400 above); the 502 is
-			// the separate, expected, challenge-notification-delivery
-			// failure pinned in atchess-1c9.31 and owned by atchess-1c9.11.
-			//
-			// NOTE: this branch does NOT verify that ResolveHandle resolved
-			// bob's handle to his ACTUAL, correct DID -- only that
-			// resolution got far enough to reach CreateChallenge. The
-			// resolved DID itself is not observable from this HTTP
-			// response: CreateChallengeHandler (internal/web/service.go)
-			// discards it internally once resolved, and the 502 error body
-			// (built from atproto.ErrChallengeNotificationFailed) never
-			// carries it. This matters because a resolve-to-WRONG-DID
-			// regression would ALSO 502 here and be indistinguishable from
-			// a correct resolution: the cross-repo challenge-notification
-			// write CreateChallenge attempts next fails categorically
-			// regardless of which DID it targets (see
-			// test/e2e/challenge_delivery_test.go's package doc comment,
-			// finding 1), so this branch cannot catch that class of
-			// regression -- only the 400 (total resolution failure) and 200
-			// (full success, verified against accounts.Bob.DID below) cases
-			// can. resolvedBobDID below is populated from the harness's
-			// KNOWN-GOOD DID, not from anything actually observed on this
-			// response, purely so downstream steps have a DID to use.
-			handleResolutionOK = true
-			resolvedBobDID = accounts.Bob.DID
-			t.Logf("OK: alice's instance got past handle resolution to CreateChallenge, which then 502'd for the separate, expected atchess-1c9.31/.11 reason (resolved-DID correctness is NOT verified on this path -- see comment above -- only that resolution didn't fail outright): %s", body)
-			return
 		case http.StatusOK:
-			// Forward-compatible with atchess-1c9.11 landing: once
-			// challenge-notification delivery is fixed, this call
-			// should succeed outright.
 			var decoded map[string]interface{}
 			if err := json.Unmarshal([]byte(body), &decoded); err != nil {
 				t.Fatalf("handle resolution: POST /api/challenges returned HTTP 200 but an undecodable body: %v (body: %s)", err, body)
@@ -253,10 +215,10 @@ func TestFederation(t *testing.T) {
 			}
 			handleResolutionOK = true
 			resolvedBobDID = challenged
-			t.Logf("OK (atchess-1c9.11 appears to have landed): alice resolved bob's handle %q to %q and the challenge succeeded outright", accounts.Bob.Handle, challenged)
+			t.Logf("OK: alice resolved bob's handle %q to %q and the challenge succeeded outright", accounts.Bob.Handle, challenged)
 			return
 		default:
-			t.Fatalf("unexpected status %d (want 502 -- resolution OK, expected pending challenge-notification-delivery failure -- or 400 -- resolution itself failed -- or 200 -- fully fixed): %s", status, body)
+			t.Fatalf("unexpected status %d (want 200 -- resolution and challenge creation both succeeded -- or 400 -- resolution itself failed): %s", status, body)
 		}
 	})
 
@@ -271,15 +233,16 @@ func TestFederation(t *testing.T) {
 	// blocked by a HandleResolution failure), then "Bob accepts" (emulated;
 	// see the ADAPTATION NOTE in the package doc comment).
 	// ---------------------------------------------------------------
-	t.Run("Challenge_Expect502UntilAtchess1c9dot11", func(t *testing.T) {
+	t.Run("ChallengeAcrossPDSes", func(t *testing.T) {
 		// Independent of HandleResolution above (which probes ResolveHandle
-		// specifically): this reproduces the same expected,
-		// atchess-1c9.31/atchess-1c9.11 challenge-notification-delivery
-		// failure directly by DID. It is not a prerequisite for anything
-		// below -- Accept_EMULATED creates bob's game directly via
-		// POST /api/games, not by accepting this challenge -- so this
-		// subtest exists purely to pin the current, honest cross-PDS
-		// challenge behavior.
+		// specifically): this exercises the same challenge-creation path
+		// directly by DID, across PDSes. As of atchess-1c9.11 there is no
+		// cross-repo write left to fail: CreateChallenge only ever writes
+		// into the caller's (alice's) own repo, so this should succeed
+		// (HTTP 200) whether or not handle resolution above did. It is not
+		// a prerequisite for anything below -- Accept_EMULATED creates
+		// bob's game directly via POST /api/games, not by accepting this
+		// challenge.
 		if !handleResolutionOK {
 			t.Logf("DEGRADED: using bob's known DID (%s) instead of his handle, because HandleResolution failed above", resolvedBobDID)
 		}
@@ -288,10 +251,10 @@ func TestFederation(t *testing.T) {
 			"color":        "white",
 			"message":      "federation test challenge",
 		})
-		if status != http.StatusBadGateway {
-			t.Fatalf("expected HTTP 502 (challenge-notification delivery is expected to fail and roll back until atchess-1c9.11 -- see atchess-1c9.31), got %d: %s", status, body)
+		if status != http.StatusOK {
+			t.Fatalf("expected HTTP 200 (atchess-1c9.11: CreateChallenge only ever writes to the caller's own repo, so there is no cross-repo write left to fail), got %d: %s", status, body)
 		}
-		t.Logf("OK (expected until atchess-1c9.11): alice's challenge to bob (%s) 502'd as designed: %s", resolvedBobDID, body)
+		t.Logf("OK: alice's challenge to bob (%s), across PDSes, succeeded: %s", resolvedBobDID, body)
 	})
 
 	var gameURI string

@@ -94,3 +94,58 @@ func TestStoreRemove(t *testing.T) {
 		t.Fatal("expected Add to succeed after Remove")
 	}
 }
+
+func TestFromChallengeRecord(t *testing.T) {
+	record := map[string]interface{}{
+		"challenged":       "did:plc:bob",
+		"challenger":       "did:plc:alice",
+		"challengerHandle": "alice.test",
+		"color":            "white",
+		"message":          "gg",
+		"proposedGameId":   "game123",
+		"createdAt":        "2026-01-01T00:00:00Z",
+		"expiresAt":        "2026-01-02T00:00:00Z",
+	}
+
+	pc := FromChallengeRecord("did:plc:alice", "abc123", "bafycid", record)
+
+	if pc.ChallengeURI != "at://did:plc:alice/app.atchess.challenge/abc123" {
+		t.Errorf("unexpected ChallengeURI: %s", pc.ChallengeURI)
+	}
+	if pc.ChallengeCID != "bafycid" {
+		t.Errorf("unexpected ChallengeCID: %s", pc.ChallengeCID)
+	}
+	if pc.ChallengerDID != "did:plc:alice" || pc.ChallengedDID != "did:plc:bob" {
+		t.Errorf("unexpected DIDs: challenger=%s challenged=%s", pc.ChallengerDID, pc.ChallengedDID)
+	}
+	if pc.ChallengerHandle != "alice.test" {
+		t.Errorf("unexpected ChallengerHandle: %s", pc.ChallengerHandle)
+	}
+	if pc.Color != "white" || pc.Message != "gg" || pc.ProposedGameID != "game123" {
+		t.Errorf("unexpected fields: color=%s message=%s proposedGameID=%s", pc.Color, pc.Message, pc.ProposedGameID)
+	}
+	if pc.CreatedAt.Format(time.RFC3339) != "2026-01-01T00:00:00Z" {
+		t.Errorf("unexpected CreatedAt: %v", pc.CreatedAt)
+	}
+	if pc.ExpiresAt.Format(time.RFC3339) != "2026-01-02T00:00:00Z" {
+		t.Errorf("unexpected ExpiresAt: %v", pc.ExpiresAt)
+	}
+}
+
+func TestFromChallengeRecord_DefaultsWhenTimestampsMissing(t *testing.T) {
+	record := map[string]interface{}{
+		"challenged": "did:plc:bob",
+		"challenger": "did:plc:alice",
+	}
+
+	before := time.Now()
+	pc := FromChallengeRecord("did:plc:alice", "abc123", "bafycid", record)
+	after := time.Now()
+
+	if pc.CreatedAt.Before(before) || pc.CreatedAt.After(after) {
+		t.Errorf("expected CreatedAt to default to now, got %v (window %v..%v)", pc.CreatedAt, before, after)
+	}
+	if !pc.ExpiresAt.Equal(pc.CreatedAt.Add(24 * time.Hour)) {
+		t.Errorf("expected ExpiresAt to default to CreatedAt+24h, got created=%v expires=%v", pc.CreatedAt, pc.ExpiresAt)
+	}
+}
