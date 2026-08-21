@@ -1388,6 +1388,47 @@ func (c *Client) ListMovesForGame(ctx context.Context, gameURI string) ([]Stored
 	return moves, nil
 }
 
+// deriveTerminalFlagsFromFEN derives whether the given board position is a
+// checkmate or a rules-forced draw directly from the FEN, rather than
+// trusting a move record's self-reported checkmate/draw flags (see
+// atchess-1c9.108). atchess-1c9.100 already established that a move
+// record's FEN is the trusted board state (game.FEN = latestMove.FEN), so
+// deriving these flags from that same FEN adds no new trust surface -- it
+// removes one: a forged record can no longer claim a terminal outcome its
+// own FEN does not actually reach.
+//
+// notnil/chess can evaluate a bare FEN (no move history) for every
+// AUTOMATIC outcome that is fully determined by a single position
+// snapshot: checkmate, stalemate, insufficient material, and the
+// (halfmove-clock-driven) seventy-five-move rule -- confirmed empirically
+// against the loaded chess engine before writing this. The one automatic
+// draw method that is NOT derivable from a bare FEN is fivefold
+// repetition, since that requires the full position history a lone FEN
+// snapshot doesn't carry. A genuine fivefold-repetition draw will
+// therefore not be recognized as terminal here -- a false negative (an
+// honest draw goes unrecognized), never a false positive (nothing can be
+// forged INTO recognition), so this is the safe direction to fail in.
+// Non-automatic outcomes (draw by agreement, resignation, time violation)
+// are not move-record concerns at all -- they are handled by their own
+// dedicated record types and getXOutcome functions elsewhere in this
+// file, each with their own authorship corroboration.
+//
+// An invalid or unparseable FEN is treated as non-terminal (both false).
+func deriveTerminalFlagsFromFEN(fen string) (checkmate, draw bool) {
+	engine, err := chess.NewEngineFromFEN(fen)
+	if err != nil {
+		return false, false
+	}
+	switch engine.GetStatus() {
+	case chess.StatusWhiteWon, chess.StatusBlackWon:
+		return true, false
+	case chess.StatusDraw:
+		return false, true
+	default:
+		return false, false
+	}
+}
+
 // getLatestMoveForGame fetches moves from both players' repos and returns
 // the latest move for the given game. This is the source of truth for game state.
 func (c *Client) getLatestMoveForGame(ctx context.Context, gameURI string, whiteDID, blackDID string) (*moveRecord, error) {
@@ -1424,6 +1465,7 @@ func (c *Client) getLatestMoveForGame(ctx context.Context, gameURI string, white
 						URI string `json:"uri"`
 					} `json:"game"`
 					FEN       string `json:"fen"`
+					Player    string `json:"player"`
 					Checkmate bool   `json:"checkmate"`
 					Draw      bool   `json:"draw"`
 					CreatedAt string `json:"createdAt"`
@@ -1440,17 +1482,40 @@ func (c *Client) getLatestMoveForGame(ctx context.Context, gameURI string, white
 			if record.Value.Game.URI != gameURI {
 				continue
 			}
+			// atchess-1c9.108: the hosting repo IS the authorship proof --
+			// AT Protocol only permits writing into your own repo -- so a
+			// record listed from playerDID's repo that claims a DIFFERENT
+			// player made the move is forged. Mirrors getLastMove's
+			// corroboration (atchess-1c9.104). Compare against playerDID,
+			// the repo CURRENTLY being read in this loop iteration, not a
+			// fixed DID -- comparing against the wrong side here would
+			// silently drop every legitimate move instead of only forged
+			// ones.
+			if record.Value.Player != playerDID {
+				log.Warn().Str("gameURI", gameURI).Str("repo", playerDID).
+					Str("claimedPlayer", record.Value.Player).
+					Str("recordURI", record.URI).
+					Msg("ignoring forged move record: repo owner is not the player it names as mover")
+				continue
+			}
 			t, err := time.Parse(time.RFC3339, record.Value.CreatedAt)
 			if err != nil {
 				continue
 			}
 			rkey := recordKey(record.URI)
 			if latest == nil || moveRecordIsAfter(record.Value.FEN, t, rkey, latest.FEN, latest.CreatedAt, latest.rkey) {
+				// atchess-1c9.108: derive checkmate/draw from the FEN
+				// itself rather than trusting the record's self-reported
+				// flags -- see deriveTerminalFlagsFromFEN's doc comment.
+				// atchess-1c9.100 already established the FEN as the
+				// trusted board state (game.FEN = latestMove.FEN), so this
+				// adds no new trust surface; it removes one.
+				checkmate, draw := deriveTerminalFlagsFromFEN(record.Value.FEN)
 				latest = &moveRecord{
 					FEN:       record.Value.FEN,
-					Checkmate: record.Value.Checkmate,
+					Checkmate: checkmate,
 					rkey:      rkey,
-					Draw:      record.Value.Draw,
+					Draw:      draw,
 					CreatedAt: t,
 				}
 			}
