@@ -425,6 +425,15 @@ func BuildChallengeURI(repoDID, rkey string) string {
 	return fmt.Sprintf("at://%s/app.atchess.challenge/%s", repoDID, rkey)
 }
 
+// challengeClockSkewTolerance is how far ahead of our local clock a
+// record's self-reported createdAt is allowed to be before FromChallengeRecord
+// stops trusting it as the anchor for the expiresAt ceiling (see below).
+// Records arrive from other people's PDSes, so a LEGITIMATE createdAt can
+// sit a little ahead of our own clock due to ordinary NTP-level clock
+// skew; a few minutes comfortably covers that without giving an attacker
+// meaningful room to extend a forged/spam challenge's lifetime.
+const challengeClockSkewTolerance = 5 * time.Minute
+
 // FromChallengeRecord builds a *PendingChallenge from an app.atchess.challenge
 // record's decoded fields (as delivered by internal/firehose, whether live or
 // during a backfill resubscribe), plus the repo DID, record key, and CID the
@@ -446,6 +455,30 @@ func BuildChallengeURI(repoDID, rkey string) string {
 // A missing/unparsable createdAt defaults to now; a missing/unparsable
 // expiresAt defaults to 24h after createdAt (matching CreateChallenge's own
 // default expiry, internal/atproto/client.go).
+//
+// expiresAt is bounded to at most 24h after createdAt (atchess-1c9.107).
+// Crucially, that ceiling is anchored to a BOUNDED createdAt, not the
+// record's raw self-reported one: a record's createdAt is itself
+// attacker-controlled (it comes from the same untrusted record as
+// expiresAt), so a naive "expiresAt <= createdAt+24h" clamp does nothing
+// if createdAt is ALSO claimed to be in the year 3000 -- the ceiling just
+// moves out with it, and the challenge is still never pruned or filtered
+// out. To close that, createdAt is itself clamped to "now" before it is
+// used as the ceiling's anchor, whenever it claims to be more than
+// challengeClockSkewTolerance ahead of our local clock. That tolerance
+// (a few minutes) exists because these records come from other people's
+// PDSes: a LEGITIMATE createdAt can sit slightly ahead of our local clock
+// due to ordinary clock skew, and clamping hard to "now" would shorten
+// that challenge's window by the skew amount for no attacker-related
+// reason. Only a createdAt beyond that tolerance -- i.e. one that cannot
+// plausibly be explained by clock skew -- is treated as untrusted and
+// anchored to "now" instead. The stored CreatedAt field itself is left as
+// the record's original (unbounded) claim; only the expiresAt ceiling
+// computation uses the bounded anchor.
+//
+// An expiresAt in the past, or before createdAt, is left as-is;
+// PruneExpired/ForPlayer already treat an expired row as inert, so no
+// separate floor is needed.
 func FromChallengeRecord(repoDID, rkey, cid string, record map[string]interface{}) *PendingChallenge {
 	challengedDID, _ := record["challenged"].(string)
 	challengerDID, _ := record["challenger"].(string)
@@ -467,10 +500,35 @@ func FromChallengeRecord(repoDID, rkey, cid string, record map[string]interface{
 			createdAt = parsed
 		}
 	}
+
+	// The 24h ceiling below matches what CreateChallenge itself writes
+	// (internal/atproto/client.go: expiresAt = createdAt.Add(24*time.Hour)),
+	// so no legitimate challenge from our own client is ever clamped. The
+	// ceiling's anchor (anchorCreatedAt) is createdAt itself EXCEPT when
+	// createdAt claims to be more than challengeClockSkewTolerance ahead
+	// of our local clock -- at that point createdAt is no longer
+	// plausible as ordinary clock skew from a remote PDS and is treated
+	// as untrusted, so the anchor falls back to "now" instead. Without
+	// this, an attacker could claim a far-future createdAt AND a
+	// far-future expiresAt together, and the ceiling would simply move
+	// out to match: the record would still never be pruned or filtered
+	// out (atchess-1c9.107).
+	now := time.Now()
+	anchorCreatedAt := createdAt
+	if anchorCreatedAt.After(now.Add(challengeClockSkewTolerance)) {
+		anchorCreatedAt = now
+	}
+	maxExpiresAt := anchorCreatedAt.Add(24 * time.Hour)
 	expiresAt := createdAt.Add(24 * time.Hour)
+	if expiresAt.After(maxExpiresAt) {
+		expiresAt = maxExpiresAt
+	}
 	if ts, ok := record["expiresAt"].(string); ok {
 		if parsed, err := time.Parse(time.RFC3339, ts); err == nil {
 			expiresAt = parsed
+			if expiresAt.After(maxExpiresAt) {
+				expiresAt = maxExpiresAt
+			}
 		}
 	}
 

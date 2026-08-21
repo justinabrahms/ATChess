@@ -821,3 +821,203 @@ func TestStore_PruneExpired_RetainsRemovedTombstoneInsertedBeforeCreate(t *testi
 		t.Fatalf("expected removed challenge to stay suppressed after prune + late create replay, got %d", len(got))
 	}
 }
+
+// TestFromChallengeRecord_FarFutureExpiresAt_Clamped is the atchess-1c9.107
+// regression test. FromChallengeRecord previously took a record's
+// self-reported "expiresAt" verbatim once it parsed -- the 24h default
+// (see the doc comment above FromChallengeRecord) applied ONLY when the
+// field was missing or unparseable. A record claiming a year-3000 expiry
+// was therefore never pruned by PruneExpired and never filtered out by
+// ForPlayer's ExpiresAt.After(now) check: it sat in the challenged
+// player's notification list indefinitely (not exploitable -- see
+// atchess-1c9.106 -- but unbounded attacker-controlled durable state and
+// a nuisance vector).
+//
+// This asserts the fix: expiresAt is clamped to createdAt+24h (the same
+// ceiling CreateChallenge itself writes, internal/atproto/client.go),
+// applied to a PARSED value, not just a missing one. It then proves the
+// clamp actually closes the hole end-to-end by running PruneExpired once
+// the clamped time has passed.
+func TestFromChallengeRecord_FarFutureExpiresAt_Clamped(t *testing.T) {
+	record := map[string]interface{}{
+		"challenged": "did:plc:bob",
+		"challenger": "did:plc:alice",
+		"createdAt":  "2026-01-01T00:00:00Z",
+		"expiresAt":  "3000-01-01T00:00:00Z", // absurd, attacker-controlled
+	}
+
+	pc := FromChallengeRecord("did:plc:alice", "farfuture1", "bafycid", record)
+	if pc == nil {
+		t.Fatal("expected a non-nil PendingChallenge")
+	}
+
+	wantMax := pc.CreatedAt.Add(24 * time.Hour)
+	if !pc.ExpiresAt.Equal(wantMax) {
+		t.Fatalf("expected ExpiresAt clamped to CreatedAt+24h (%v), got %v", wantMax, pc.ExpiresAt)
+	}
+
+	// Prove the clamp actually closes the hole: once the clamped expiry
+	// has passed, PruneExpired must delete the row. Backdate CreatedAt
+	// (via the record's own createdAt) so the clamped ExpiresAt is
+	// already in the past by the time we prune.
+	record["createdAt"] = "2020-01-01T00:00:00Z"
+	pcPast := FromChallengeRecord("did:plc:alice", "farfuture2", "bafycid2", record)
+	if pcPast == nil {
+		t.Fatal("expected a non-nil PendingChallenge")
+	}
+	if !pcPast.ExpiresAt.Before(time.Now()) {
+		t.Fatalf("expected clamped ExpiresAt to be in the past given an old createdAt, got %v", pcPast.ExpiresAt)
+	}
+
+	s, _ := newTestStore(t)
+	if _, err := s.Add(pcPast); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	pruned, err := s.PruneExpired()
+	if err != nil {
+		t.Fatalf("PruneExpired: %v", err)
+	}
+	if pruned != 1 {
+		t.Fatalf("expected the clamped far-future challenge to be pruned once its clamped expiry passed, got pruned=%d", pruned)
+	}
+}
+
+// TestFromChallengeRecord_LegitimateExpiresAt_Preserved is the regression
+// control for TestFromChallengeRecord_FarFutureExpiresAt_Clamped: a
+// record whose self-reported expiresAt is within the clamp bound
+// (CreatedAt+24h, inclusive) must be preserved UNCHANGED, not silently
+// shortened. TestFromChallengeRecord above already covers the exact-24h
+// boundary; this covers a value strictly inside it.
+func TestFromChallengeRecord_LegitimateExpiresAt_Preserved(t *testing.T) {
+	record := map[string]interface{}{
+		"challenged": "did:plc:bob",
+		"challenger": "did:plc:alice",
+		"createdAt":  "2026-01-01T00:00:00Z",
+		"expiresAt":  "2026-01-01T12:00:00Z", // 12h later, well within 24h bound
+	}
+
+	pc := FromChallengeRecord("did:plc:alice", "legit1", "bafycid", record)
+	if pc == nil {
+		t.Fatal("expected a non-nil PendingChallenge")
+	}
+	want, _ := time.Parse(time.RFC3339, "2026-01-01T12:00:00Z")
+	if !pc.ExpiresAt.Equal(want) {
+		t.Fatalf("expected legitimate ExpiresAt preserved unchanged, got %v want %v", pc.ExpiresAt, want)
+	}
+}
+
+// TestFromChallengeRecord_FarFutureCreatedAtAndExpiresAt_BothClamped is the
+// atchess-1c9.107 REVIEW-FIX regression test. The first fix for this bead
+// anchored the expiresAt ceiling to createdAt+24h, but createdAt itself
+// comes from the SAME untrusted record as expiresAt. A record that claims
+// a far-future createdAt AND a far-future expiresAt together defeated
+// that first fix: the ceiling simply moved out to match the forged
+// createdAt, so expiresAt was never actually bounded -- PruneExpired
+// removed 0 rows and ForPlayer returned the row forever, an exact repeat
+// of the original bug via one extra forged field. Proven by review with a
+// probe:
+//
+//	record: createdAt "3000-01-01T00:00:00Z", expiresAt "3000-01-01T12:00:00Z"
+//	ExpiresAt after clamp = 3000-01-01 12:00:00 UTC   // inside the ceiling, not clamped
+//	PruneExpired removed 0 rows
+//	ForPlayer returned 1 rows                          // still visible forever
+//
+// The fix anchors the ceiling to a BOUNDED createdAt: createdAt is only
+// trusted as the anchor when it is no more than
+// challengeClockSkewTolerance ahead of our local clock (ordinary clock
+// skew from a remote PDS); beyond that it is untrusted and the anchor
+// falls back to "now". This test asserts the resulting ExpiresAt is
+// bounded near now+24h (NOT the record's year-3000 claim), then -- since
+// the point is that this row is no longer permanently unprunable, only
+// bounded to at most ~24h -- proves prunability directly by
+// fast-forwarding the STORED row's expiry into the past (there is no
+// clock to inject into FromChallengeRecord itself, so this simulates what
+// happens once wall time actually reaches the clamped point) and
+// confirming PruneExpired removes it.
+func TestFromChallengeRecord_FarFutureCreatedAtAndExpiresAt_BothClamped(t *testing.T) {
+	record := map[string]interface{}{
+		"challenged": "did:plc:bob",
+		"challenger": "did:plc:alice",
+		"createdAt":  "3000-01-01T00:00:00Z",
+		"expiresAt":  "3000-01-01T12:00:00Z",
+	}
+
+	before := time.Now()
+	pc := FromChallengeRecord("did:plc:alice", "bothfuture1", "bafycid", record)
+	after := time.Now()
+
+	if pc == nil {
+		t.Fatal("expected a non-nil PendingChallenge")
+	}
+	if pc.ExpiresAt.Year() >= 3000 {
+		t.Fatalf("expected ExpiresAt bounded away from the record's claimed year-3000 expiry, got %v", pc.ExpiresAt)
+	}
+	// anchorCreatedAt falls back to "now" here because the claimed
+	// createdAt (year 3000) is far beyond challengeClockSkewTolerance
+	// ahead of our clock, so the ceiling is bounded by
+	// before.Add(24h)..after.Add(24h).
+	minExpiresAt := before.Add(24 * time.Hour)
+	maxExpiresAt := after.Add(24 * time.Hour)
+	if pc.ExpiresAt.Before(minExpiresAt) || pc.ExpiresAt.After(maxExpiresAt) {
+		t.Fatalf("expected ExpiresAt bounded to ~now+24h (%v..%v), got %v", minExpiresAt, maxExpiresAt, pc.ExpiresAt)
+	}
+
+	s, _ := newTestStore(t)
+	if _, err := s.Add(pc); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	// Confirm it is NOT prunable yet -- correctly, since its bounded
+	// expiry (~24h out) hasn't arrived. This is the crucial contrast with
+	// the pre-fix bug: that row was not merely "not yet" prunable, it was
+	// NEVER prunable (year 3000). This one will be, once real time
+	// reaches its bounded expiry -- simulated below by fast-forwarding
+	// the stored row directly.
+	prunedTooEarly, err := s.PruneExpired()
+	if err != nil {
+		t.Fatalf("PruneExpired (too early): %v", err)
+	}
+	if prunedTooEarly != 0 {
+		t.Fatalf("expected the still-live bounded challenge to survive an early prune, got pruned=%d", prunedTooEarly)
+	}
+
+	if _, err := s.db.Exec(`UPDATE challenges SET expires_at = ? WHERE uri = ?`,
+		time.Now().Add(-1*time.Minute).UTC().Format(timeFormat), pc.ChallengeURI); err != nil {
+		t.Fatalf("fast-forwarding stored expiry: %v", err)
+	}
+
+	pruned, err := s.PruneExpired()
+	if err != nil {
+		t.Fatalf("PruneExpired: %v", err)
+	}
+	if pruned != 1 {
+		t.Fatalf("expected the bounded challenge to be pruned once its (simulated) clamped expiry passed, got pruned=%d", pruned)
+	}
+}
+
+// TestFromChallengeRecord_CreatedAtWithinClockSkewTolerance_NotShortened is
+// the clock-skew regression control: a createdAt that is only SLIGHTLY
+// ahead of our local clock (within challengeClockSkewTolerance) is
+// ordinary clock skew from a remote PDS, not an attack, and must NOT have
+// its legitimate expiresAt window shortened.
+func TestFromChallengeRecord_CreatedAtWithinClockSkewTolerance_NotShortened(t *testing.T) {
+	skewedCreatedAt := time.Now().Add(2 * time.Minute) // within the 5m tolerance
+	legitExpiresAt := skewedCreatedAt.Add(24 * time.Hour)
+
+	record := map[string]interface{}{
+		"challenged": "did:plc:bob",
+		"challenger": "did:plc:alice",
+		"createdAt":  skewedCreatedAt.Format(time.RFC3339),
+		"expiresAt":  legitExpiresAt.Format(time.RFC3339),
+	}
+
+	pc := FromChallengeRecord("did:plc:alice", "skew1", "bafycid", record)
+	if pc == nil {
+		t.Fatal("expected a non-nil PendingChallenge")
+	}
+	want, _ := time.Parse(time.RFC3339, legitExpiresAt.Format(time.RFC3339))
+	if !pc.ExpiresAt.Equal(want) {
+		t.Fatalf("expected ExpiresAt preserved unchanged for a createdAt within clock-skew tolerance, got %v want %v", pc.ExpiresAt, want)
+	}
+}
