@@ -110,7 +110,7 @@ func (g *roundGate) arrive() {
 	rg.arrive()
 }
 
-// --- mock PDS with real optimistic-concurrency (swapCid) enforcement -----
+// --- mock PDS with real optimistic-concurrency (swapRecord) enforcement -----
 
 type raceRecord struct {
 	cid   string
@@ -123,8 +123,8 @@ type raceRecord struct {
 // (move_and_draw_ownership_test.go), which hands out a fixed,
 // content-independent cid per rkey, this mock gives every record a cid
 // that changes on every write and enforces com.atproto.repo.putRecord's
-// "swapCid" optimistic-concurrency parameter for real: a putRecord whose
-// swapCid does not match the record's current cid is rejected with a
+// "swapRecord" optimistic-concurrency parameter for real: a putRecord whose
+// swapRecord does not match the record's current cid is rejected with a
 // non-200 response, exactly as a real PDS would -- see
 // internal/atproto/client.go's RecordMove, which relies on this to make
 // "two concurrent writers to the same game record, only one wins" true.
@@ -271,7 +271,7 @@ func (m *raceMockPDS) handle(w http.ResponseWriter, r *http.Request) {
 		collection, _ := req["collection"].(string)
 		rkey, _ := req["rkey"].(string)
 		record, _ := req["record"].(map[string]interface{})
-		swapCid, hasSwap := req["swapCid"].(string)
+		swapRecord, hasSwap := req["swapRecord"].(string)
 
 		m.mu.Lock()
 		defer m.mu.Unlock()
@@ -280,10 +280,10 @@ func (m *raceMockPDS) handle(w http.ResponseWriter, r *http.Request) {
 		if m.records[repo] != nil {
 			cur = m.records[repo][collection][rkey]
 		}
-		if hasSwap && (cur == nil || cur.cid != swapCid) {
-			m.writeCalls = append(m.writeCalls, fmt.Sprintf("putRecord REJECTED(swapCid mismatch) repo=%s collection=%s rkey=%s", repo, collection, rkey))
+		if hasSwap && (cur == nil || cur.cid != swapRecord) {
+			m.writeCalls = append(m.writeCalls, fmt.Sprintf("putRecord REJECTED(swapRecord mismatch) repo=%s collection=%s rkey=%s", repo, collection, rkey))
 			w.WriteHeader(http.StatusBadRequest)
-			_ = json.NewEncoder(w).Encode(map[string]string{"error": "InvalidSwapError", "message": "record was concurrently updated"})
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "InvalidSwap", "message": "record was concurrently updated"})
 			return
 		}
 
@@ -425,7 +425,7 @@ func TestMakeMoveHandler_ConcurrentMove_TwoPlayers_ExactlyOneSucceeds(t *testing
 // player, same simultaneously-read snapshot), so the guard that actually
 // makes "exactly one succeeds" true here is downstream, in
 // internal/atproto/client.go's RecordMove: its optimistic-concurrency
-// (swapCid) game-record update. A roundGate forces BOTH the initial
+// (swapRecord) game-record update. A roundGate forces BOTH the initial
 // client.GetGame read AND the second read RecordMove itself performs
 // (getGameRecord, to fetch the cid to swap against) to be simultaneous
 // for both goroutines on every run -- without gating that second read too,
@@ -477,7 +477,7 @@ func TestMakeMoveHandler_ConcurrentMove_SamePlayerTwice_ExactlyOneSucceeds(t *te
 		case http.StatusOK:
 			successes++
 		case http.StatusConflict:
-			// atchess-1c9.87: a CAS conflict (the game record's swapCid
+			// atchess-1c9.87: a CAS conflict (the game record's swapRecord
 			// lost the race) is not a server fault, so the loser gets
 			// 409, not 500 -- distinct from a genuine RecordMove failure
 			// (network error, PDS 5xx, malformed response), which is
@@ -514,7 +514,7 @@ func TestMakeMoveHandler_ConcurrentMove_SamePlayerTwice_ExactlyOneSucceeds(t *te
 // item 3): it serves the game record's getRecord normally, but always
 // fails its putRecord with a genuine server error that carries NO
 // "InvalidSwap"-prefixed structured "error" body -- the opposite of
-// raceMockPDS's swapCid-mismatch rejection above. This proves
+// raceMockPDS's swapRecord-mismatch rejection above. This proves
 // isInvalidSwapBody (internal/atproto/client.go) does not match too
 // broadly: a real outage (an unreachable dependency, a malformed PDS
 // response, an ordinary 500) must still surface as ErrGameRecordConflict's
@@ -573,7 +573,7 @@ func (p *nonConflictFailurePDS) handle(w http.ResponseWriter, r *http.Request) {
 		return
 
 	case "/xrpc/com.atproto.repo.putRecord":
-		// A genuine server-side failure, NOT a swapCid conflict: no
+		// A genuine server-side failure, NOT a swapRecord conflict: no
 		// "error" field at all, let alone one prefixed "InvalidSwap".
 		w.WriteHeader(http.StatusInternalServerError)
 		_ = json.NewEncoder(w).Encode(map[string]string{"message": "internal database error"})

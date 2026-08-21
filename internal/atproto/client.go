@@ -117,26 +117,27 @@ var ErrChallengeNotAcceptable = errors.New("challenge is not in an acceptable st
 var ErrChallengeChallengerForged = errors.New("challenge record's challenger field disagrees with its own repo")
 
 // ErrGameRecordConflict indicates a game record update inside RecordMove
-// failed its compare-and-swap (com.atproto.repo.putRecord's "swapCid")
-// because another write landed on the same record first -- almost always
-// the other player's move winning a race, not a server fault. Detected
-// from the PDS response body's structured "error" field beginning with
+// failed its compare-and-swap (com.atproto.repo.putRecord's "swapRecord"
+// parameter -- NOT "swapCid", which is not a real putRecord parameter and
+// is silently ignored by the PDS if sent; see atchess-1c9.112) because
+// another write landed on the same record first -- almost always the
+// other player's move winning a race, not a server fault. Detected from
+// the PDS response body's structured "error" field beginning with
 // "InvalidSwap" (see isInvalidSwapBody), NEVER from the bare HTTP status
-// code alone: the real AT Protocol PDS reports this as "InvalidSwap", and
-// this codebase's own two in-memory PDS test doubles for concurrent
-// moves already disagree on the exact string --
-// internal/web/move_concurrency_test.go's raceMockPDS uses
-// "InvalidSwapError" -- so an exact match would miss it, hence the prefix
-// match. An unparseable or non-matching body is deliberately NOT treated
-// as a conflict: RecordMove falls back to its ordinary "failed to update
-// game record" error, which MakeMoveHandler maps to 500, so an ambiguous
+// code alone: the real AT Protocol PDS reports this as exactly
+// "InvalidSwap" (verified against a live PDS, atchess-1c9.112), and a
+// prefix match is used rather than an exact one so that any future
+// suffixed variant (e.g. a more specific subtype) still matches. An
+// unparseable or non-matching body is deliberately NOT treated as a
+// conflict: RecordMove falls back to its ordinary "failed to update game
+// record" error, which MakeMoveHandler maps to 500, so an ambiguous
 // failure fails closed toward "server error" rather than toward "just
 // retry" and silently swallowing a genuine outage.
 var ErrGameRecordConflict = errors.New("game record update conflict: the game record was updated by another write first")
 
 // isInvalidSwapBody reports whether an AT Protocol error response body
 // carries a structured "error" field indicating a failed
-// compare-and-swap (a "swapCid" that no longer matches the record's
+// compare-and-swap (a "swapRecord" that no longer matches the record's
 // current CID) on a putRecord call. See ErrGameRecordConflict's doc
 // comment for why this is a prefix match rather than an exact one, and
 // why the bare HTTP status code is never used as the signal instead.
@@ -919,7 +920,7 @@ func (c *Client) RecordMove(ctx context.Context, gameURI string, move *chess.Mov
 			"collection": "app.atchess.game",
 			"rkey":       rkey,
 			"record":     gameValue,
-			"swapCid":    gameCID, // Optimistic concurrency control
+			"swapRecord": gameCID, // Optimistic concurrency control
 		}
 
 		putReqBody, _ := json.Marshal(putReq)
@@ -2889,7 +2890,7 @@ func (c *Client) RespondToDrawOffer(ctx context.Context, drawOfferURI string, ac
 					"collection": "app.atchess.game",
 					"rkey":       gameRkey,
 					"record":     gameValue,
-					"swapCid":    gCID,
+					"swapRecord": gCID,
 				}
 				updateGameReqBody, _ := json.Marshal(updateGameReq)
 				if updateGameResp, err := c.makeRequest("POST", xrpcURL(c.pdsURL, "com.atproto.repo.putRecord", nil), updateGameReqBody); err == nil {
@@ -2981,7 +2982,7 @@ func (c *Client) ResignGame(ctx context.Context, gameID string, reason string) e
 			"collection": "app.atchess.game",
 			"rkey":       rkey,
 			"record":     gameValue,
-			"swapCid":    gameCID,
+			"swapRecord": gameCID,
 		}
 
 		updateReqBody, _ := json.Marshal(updateReq)
@@ -3457,7 +3458,7 @@ func (c *Client) ClaimTimeVictory(ctx context.Context, gameID string) error {
 			"collection": "app.atchess.game",
 			"rkey":       rkey,
 			"record":     gameValue,
-			"swapCid":    gameCID,
+			"swapRecord": gameCID,
 		}
 
 		updateReqBody, _ := json.Marshal(updateReq)
