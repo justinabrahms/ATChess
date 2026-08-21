@@ -1,6 +1,7 @@
 package atproto
 
 import (
+	"encoding/json"
 	"regexp"
 	"testing"
 )
@@ -144,5 +145,85 @@ func TestMoveRecordContentEqual_NewFieldIsNotSilentlyExcluded(t *testing.T) {
 	b["totallyNewHypotheticalField"] = "value-two"
 	if moveRecordContentEqual(a, b) {
 		t.Fatalf("expected a difference in a field neither hardcoded field list nor any prior test knew about to still be detected, not silently ignored")
+	}
+}
+
+// TestMoveRecordContentEqual_NewFieldIsNotSilentlyExcluded_Numeric extends
+// the .115 drift guard above to a NUMERIC field, alongside the existing
+// string one. A string field's type never changes across a JSON round
+// trip, so it can't exercise atchess-1c9.116's hazard (int vs float64) --
+// this test adds a same-named, same-valued numeric field to both sides
+// and confirms they still compare equal, i.e. that adding a numeric field
+// to moveRecord does not, by itself, start producing spurious inequality.
+func TestMoveRecordContentEqual_NewFieldIsNotSilentlyExcluded_Numeric(t *testing.T) {
+	a := baseMoveRecordValue()
+	b := baseMoveRecordValue()
+	a["totallyNewHypotheticalNumericField"] = 7
+	b["totallyNewHypotheticalNumericField"] = 7
+	if !moveRecordContentEqual(a, b) {
+		t.Fatalf("expected an identical numeric field present on both sides to compare equal")
+	}
+
+	a["totallyNewHypotheticalNumericField"] = 7
+	b["totallyNewHypotheticalNumericField"] = 8
+	if moveRecordContentEqual(a, b) {
+		t.Fatalf("expected a difference in a new numeric field to still be detected, not silently ignored")
+	}
+}
+
+// TestMoveRecordContentEqual_NumericFieldSurvivesJSONRoundTrip is the
+// atchess-1c9.116 headline: RecordMove compares a Go-built moveRecord
+// (where an int field stays an int) against one just read back via
+// getRecordByURI, which decodes the PDS's JSON response into
+// map[string]interface{} -- and encoding/json always decodes a JSON
+// number as float64, never int. Simulate that real round trip explicitly
+// (rather than hand-writing a float64 literal, which would not pin the
+// actual hazard): "goSide" holds an int, exactly as moveRecord would after
+// gaining a numeric field such as the lexicon's declared-but-unwritten
+// "moveNumber" (atchess-1c9.8); "pdsSide" is the SAME logical record after
+// a JSON marshal/unmarshal, exactly as getRecordByURI's json.Decode would
+// produce it. These must compare equal -- an identical resubmission must
+// not be misclassified as ErrMoveRecordConflict (HTTP 409) merely because
+// int != float64.
+func TestMoveRecordContentEqual_NumericFieldSurvivesJSONRoundTrip(t *testing.T) {
+	goSide := baseMoveRecordValue()
+	goSide["moveNumber"] = 5 // int, exactly as a Go literal in moveRecord would be
+
+	buf, err := json.Marshal(goSide)
+	if err != nil {
+		t.Fatalf("failed to marshal goSide: %v", err)
+	}
+	var pdsSide map[string]interface{}
+	if err := json.Unmarshal(buf, &pdsSide); err != nil {
+		t.Fatalf("failed to unmarshal pdsSide: %v", err)
+	}
+	// Sanity check the hazard is actually present in this test's setup:
+	// pdsSide's "moveNumber" must have decoded as float64, not int, or
+	// this test would not be exercising atchess-1c9.116 at all.
+	if _, ok := pdsSide["moveNumber"].(float64); !ok {
+		t.Fatalf("test setup invalid: expected pdsSide[\"moveNumber\"] to decode as float64 (got %T), this test is meaningless without that", pdsSide["moveNumber"])
+	}
+
+	if !moveRecordContentEqual(goSide, pdsSide) {
+		t.Fatalf("expected an identical resubmission differing only in numeric-field Go type (int) vs JSON-decoded type (float64) to compare equal, not be misclassified as a conflict")
+	}
+}
+
+// TestMoveRecordContentEqual_NilValuePresentVsKeyAbsent_SymmetricInBothDirections
+// pins the atchess-1c9.116 asymmetry fix: a key present with an explicit
+// nil value on one side and absent entirely from the other must compare
+// UNEQUAL, regardless of which side is passed as "a" and which as "b".
+// Unreachable via moveRecord today (it never sets a nil value), but
+// latent and worth pinning directly at the unit level.
+func TestMoveRecordContentEqual_NilValuePresentVsKeyAbsent_SymmetricInBothDirections(t *testing.T) {
+	withNil := baseMoveRecordValue()
+	withNil["extra"] = nil
+	withoutKey := baseMoveRecordValue()
+
+	if moveRecordContentEqual(withNil, withoutKey) {
+		t.Fatalf("expected a key present-with-nil on the first argument and absent from the second to compare unequal")
+	}
+	if moveRecordContentEqual(withoutKey, withNil) {
+		t.Fatalf("expected a key present-with-nil on the second argument and absent from the first to compare unequal")
 	}
 }

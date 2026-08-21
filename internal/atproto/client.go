@@ -1473,26 +1473,98 @@ func moveRkeyForPly(gameURI string, ply int) string {
 // themselves makes that class of drift structurally impossible: any key
 // added to moveRecord is automatically part of this comparison. "createdAt"
 // is the one deliberate, visible exception (see doc comment above).
+//
+// atchess-1c9.116: "a" is always built directly in Go (moveRecord's own
+// numeric/bool literals keep their Go types -- an int stays an int), while
+// "b" -- or vice versa, this is called with either side in either
+// position -- can be a record just decoded from JSON by getRecordByURI,
+// where encoding/json's decode-into-map[string]interface{} turns EVERY
+// JSON number into a float64 regardless of whether it was written as "5"
+// or "5.0". Comparing those two representations directly with
+// reflect.DeepEqual would treat a same-valued int(5) and float64(5) as
+// unequal -- harmless today because moveRecord has no numeric field yet,
+// but the moment one is added (app.atchess.move's lexicon already
+// declares "moveNumber", currently unwritten) an identical resubmission's
+// Go-typed int would stop matching its own just-written, JSON-decoded
+// float64 and RecordMove would wrongly return ErrMoveRecordConflict
+// instead of treating it as an idempotent success.
+//
+// Fixed by normalizing BOTH sides through the same JSON marshal-then-
+// unmarshal round trip before comparing (normalizeRecordForComparison,
+// below) rather than, say, hardcoding int/float coercion rules: it makes
+// both maps' types converge on whatever encoding/json itself would
+// produce -- exactly what getRecordByURI already does to "existing" -- so
+// there is nothing further for this function to special-case as moveRecord
+// gains new field types over time. It costs one cheap marshal/unmarshal
+// pair per call, which is negligible next to the network round trip
+// RecordMove already just made.
 func moveRecordContentEqual(a, b map[string]interface{}) bool {
-	for k := range a {
+	na, aErr := normalizeRecordForComparison(a)
+	nb, bErr := normalizeRecordForComparison(b)
+	if aErr != nil || bErr != nil {
+		// Neither map should ever fail to round-trip through JSON: "a"
+		// and "b" are always either built from this package's own
+		// string/bool/nested-string-map literals (moveRecord, above) or
+		// already came FROM a successful json.Decode in getRecordByURI.
+		// Not expected in practice, but fail closed (not equal) rather
+		// than guess, matching RecordMove's own stated fail-closed
+		// philosophy for its post-collision read-back.
+		return false
+	}
+
+	keys := make(map[string]struct{}, len(na)+len(nb))
+	for k := range na {
+		keys[k] = struct{}{}
+	}
+	for k := range nb {
+		keys[k] = struct{}{}
+	}
+
+	for k := range keys {
 		if k == "createdAt" {
 			continue
 		}
-		if !reflect.DeepEqual(a[k], b[k]) {
+		va, aOK := na[k]
+		vb, bOK := nb[k]
+		// Presence is checked explicitly (aOK != bOK), rather than
+		// relying on Go's zero-value-on-missing-key map access, so a key
+		// present with a nil/JSON-null value on one side and absent
+		// entirely on the other is correctly unequal in BOTH directions
+		// -- the pre-atchess-1c9.116 version of this function instead
+		// read a missing key's zero value as an implicit nil, which
+		// happened to match an explicit nil on the other side (equal)
+		// when walking a's keys, but did NOT match when walking b's keys
+		// (unequal), an order-dependent asymmetry. Not reachable today
+		// (moveRecord never sets a nil value), but fixed here rather than
+		// left latent alongside the numeric-type fix above.
+		if aOK != bOK {
 			return false
 		}
-	}
-	for k := range b {
-		if k == "createdAt" {
-			continue
-		}
-		if _, ok := a[k]; !ok {
-			// b has a key a lacks entirely (as opposed to a differing
-			// value, already caught above): still not equal.
+		if aOK && !reflect.DeepEqual(va, vb) {
 			return false
 		}
 	}
 	return true
+}
+
+// normalizeRecordForComparison round-trips a move record map through
+// encoding/json (marshal, then unmarshal back into a fresh
+// map[string]interface{}) so that moveRecordContentEqual can compare two
+// maps built by DIFFERENT paths -- one constructed directly in Go
+// (moveRecord's own literals) and one decoded from JSON by
+// getRecordByURI -- without either path's type choices (int vs float64,
+// in particular) affecting the result. See moveRecordContentEqual's doc
+// comment for why that matters.
+func normalizeRecordForComparison(m map[string]interface{}) (map[string]interface{}, error) {
+	buf, err := json.Marshal(m)
+	if err != nil {
+		return nil, fmt.Errorf("normalizing move record for comparison: %w", err)
+	}
+	var normalized map[string]interface{}
+	if err := json.Unmarshal(buf, &normalized); err != nil {
+		return nil, fmt.Errorf("normalizing move record for comparison: %w", err)
+	}
+	return normalized, nil
 }
 
 // moveRecordIsAfter reports whether the move record (fen, t, rkey) should
