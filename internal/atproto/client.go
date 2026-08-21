@@ -1466,38 +1466,128 @@ func (c *Client) getLatestMoveForGame(ctx context.Context, gameURI string, white
 // source -- each itself read across BOTH players' repos, since a terminal
 // event is always written into the triggering player's own repo, which may
 // not be the repo that owns the shared (and otherwise possibly stale)
-// app.atchess.game record -- and applies whichever is most recent. at/rkey
-// feed moveIsAfter's (createdAt, TID) tiebreak, since createdAt alone is
-// only second-resolution: for a checkmate/draw event this constructor
-// value is populated from a moveRecord that was ALREADY correctly ordered
-// by moveRecordIsAfter (see getLatestMoveForGame), so it carries the
-// domain-correct outcome forward even though this struct itself has no
-// FEN to re-derive ply from; for resignation/timeViolation/drawAccept
-// events (which have no board position) moveIsAfter's TID tiebreak is the
-// best available signal -- see its doc comment for exactly what that
-// tiebreak does and does not guarantee (atchess-1c9.100).
+// app.atchess.game record -- and applies whichever is most recent.
+//
+// at/rkey/kind feed latestTerminalEvent's ordering, since createdAt alone
+// is only second-resolution and cross-repo ties are ordinary:
+//
+//   - for a checkmate/draw event (kind == terminalEventFromMove), the
+//     at/rkey fields are populated from a moveRecord that was ALREADY
+//     correctly ordered against every OTHER move by moveRecordIsAfter (see
+//     getLatestMoveForGame), so a move-vs-move tie can never reach this
+//     struct in a way that matters -- it carries the domain-correct
+//     per-move outcome forward even though this struct itself has no FEN
+//     to re-derive ply from;
+//   - resignation/timeViolation/drawAccept events have no board position
+//     at all, so there is no ply-like signal for THOSE to carry;
+//   - what remains, and what atchess-1c9.101 fixed, is a same-second tie
+//     BETWEEN a move event and a resignation/drawAccept event (proven the
+//     only reachable cross-kind tie -- see latestTerminalEvent's doc
+//     comment). kind is what lets that be resolved by chess rule rather
+//     than by moveIsAfter's TID tiebreak, which atchess-1c9.100 already
+//     proved is not a chronological signal across repos. moveIsAfter's TID
+//     tiebreak is retained ONLY as the last-resort, kind-blind fallback
+//     for every OTHER cross-kind pairing (e.g. resignation vs. drawAccept).
+//     Those pairings were NOT ANALYSED for reachability -- which is not the
+//     same as being unreachable, and resignation vs. drawAccept in
+//     particular is reachable by the same concurrent-write mechanism as the
+//     tie fixed here. They are merely lower-stakes: both candidates are
+//     terminal and the result is deterministic either way. See moveIsAfter's
+//     doc comment for exactly what its tiebreak does and does not
+//     guarantee.
 type terminalEvent struct {
 	status chess.GameStatus
 	at     time.Time
 	rkey   string
+	kind   terminalEventKind
 }
+
+// terminalEventKind classifies a terminalEvent by the record type it was
+// derived from, so latestTerminalEvent can break a same-second tie between
+// two DIFFERENT kinds by a domain rule instead of by TID (see
+// terminalEventIsAfter).
+type terminalEventKind int
+
+const (
+	// terminalEventUnknown is the ZERO VALUE on purpose. terminalEventIsAfter
+	// gives move-sourced events precedence, so if the dominant kind sat at
+	// iota 0 a future construction site that forgot to set kind would
+	// silently win every same-second tie. An unset kind must be the inert
+	// one, not the decisive one.
+	terminalEventUnknown terminalEventKind = iota
+
+	// terminalEventFromMove is a checkmate or rules-forced draw (e.g.
+	// stalemate) carried forward from getLatestMoveForGame's already
+	// ply-ordered result.
+	terminalEventFromMove
+	terminalEventFromResignation
+	terminalEventFromTimeViolation
+	terminalEventFromDrawAccept
+)
 
 // latestTerminalEvent returns whichever of the given candidate terminal
 // events (any of which may be nil, meaning "that source found nothing") is
 // most recent, or nil if none were found. In a well-behaved client at most
 // one of these should ever be non-nil for a given game, but ties are
-// broken deterministically rather than left to map/slice iteration order.
+// broken deterministically rather than left to map/slice iteration order --
+// see terminalEventIsAfter for exactly how.
 func latestTerminalEvent(events ...*terminalEvent) *terminalEvent {
 	var latest *terminalEvent
 	for _, e := range events {
 		if e == nil {
 			continue
 		}
-		if latest == nil || moveIsAfter(e.at, e.rkey, latest.at, latest.rkey) {
+		if latest == nil || terminalEventIsAfter(e, latest) {
 			latest = e
 		}
 	}
 	return latest
+}
+
+// terminalEventIsAfter reports whether candidate should be considered
+// strictly more recent than current, for latestTerminalEvent's purpose of
+// picking a game's single final outcome among heterogeneous terminal-event
+// sources.
+//
+// atchess-1c9.101: of the cross-kind pairings its reachability analysis
+// examined, only ONE is reachable in practice -- a terminal move (checkmate
+// or a rules-forced draw) tying, in the same wall-clock second, with a
+// resignation or an accepted draw offer. (move-vs-timeViolation is
+// unreachable because getTimeViolationOutcome rejects any claim less than a
+// full time-limit period -- at least a day -- after the last move; a
+// non-terminal move never becomes a moveEvent candidate at all; see the
+// bead for the full proof. Pairings among resignation/timeViolation/
+// drawAccept themselves were not part of that analysis and are left to the
+// fallback below, unchanged.) For that one reachable pairing, the two
+// candidates are not symmetric under chess rules: a checkmate or
+// forced-draw board position is final the instant it is reached -- mate is
+// not negotiable -- while a resignation or draw-agreement is a voluntary
+// claim by a player that a game (which may, unbeknownst to them, have
+// already ended) is over. A resignation/drawAccept landing in the same
+// recorded second as the mating move cannot retroactively un-happen that
+// move, so the move-sourced candidate always wins such a tie, in EITHER
+// argument order -- this function does not care which candidate is "latest
+// so far" and which is newly compared.
+//
+// Every other cross-kind pairing (e.g. resignation vs. drawAccept) has no
+// such domain rule available -- neither candidate's kind is more
+// "decisive" than the other's, and in a well-behaved client the two
+// sources are mutually exclusive for a live game in the first place -- so
+// it falls back to moveIsAfter's (createdAt, TID) tiebreak: fully
+// deterministic, but (per moveIsAfter's own doc comment) not a
+// chronological guarantee. That fallback is unchanged from before this fix
+// and is not what atchess-1c9.101 addresses.
+func terminalEventIsAfter(candidate, current *terminalEvent) bool {
+	if !candidate.at.Equal(current.at) {
+		return candidate.at.After(current.at)
+	}
+	if candidate.kind == terminalEventFromMove && current.kind != terminalEventFromMove {
+		return true
+	}
+	if current.kind == terminalEventFromMove && candidate.kind != terminalEventFromMove {
+		return false
+	}
+	return moveIsAfter(candidate.at, candidate.rkey, current.at, current.rkey)
 }
 
 // getResignationOutcome scans app.atchess.resignation records in BOTH
@@ -1580,7 +1670,7 @@ func (c *Client) getResignationOutcome(ctx context.Context, gameURI, whiteDID, b
 				if record.Value.ResigningPlayer == whiteDID {
 					status = chess.StatusBlackWon
 				}
-				candidate := &terminalEvent{status: status, at: t, rkey: recordKey(record.URI)}
+				candidate := &terminalEvent{status: status, at: t, rkey: recordKey(record.URI), kind: terminalEventFromResignation}
 				if latest == nil || moveIsAfter(candidate.at, candidate.rkey, latest.at, latest.rkey) {
 					latest = candidate
 				}
@@ -1802,7 +1892,7 @@ func (c *Client) getTimeViolationOutcome(ctx context.Context, gameURI, whiteDID,
 				if record.Value.ViolatingPlayer == whiteDID {
 					status = chess.StatusBlackWon
 				}
-				candidate := &terminalEvent{status: status, at: t, rkey: recordKey(record.URI)}
+				candidate := &terminalEvent{status: status, at: t, rkey: recordKey(record.URI), kind: terminalEventFromTimeViolation}
 				if latest == nil || moveIsAfter(candidate.at, candidate.rkey, latest.at, latest.rkey) {
 					latest = candidate
 				}
@@ -1933,7 +2023,7 @@ func (c *Client) getDrawAcceptOutcome(ctx context.Context, gameURI, whiteDID, bl
 				if err != nil {
 					continue
 				}
-				candidate := &terminalEvent{status: chess.StatusDraw, at: t, rkey: recordKey(record.URI)}
+				candidate := &terminalEvent{status: chess.StatusDraw, at: t, rkey: recordKey(record.URI), kind: terminalEventFromDrawAccept}
 				if latest == nil || moveIsAfter(candidate.at, candidate.rkey, latest.at, latest.rkey) {
 					latest = candidate
 				}
@@ -2074,9 +2164,9 @@ func (c *Client) GetGame(ctx context.Context, gameURI string) (*chess.Game, erro
 			if len(fenParts) > 1 && fenParts[1] == "w" {
 				status = chess.StatusBlackWon
 			}
-			moveEvent = &terminalEvent{status: status, at: latestMove.CreatedAt, rkey: latestMove.rkey}
+			moveEvent = &terminalEvent{status: status, at: latestMove.CreatedAt, rkey: latestMove.rkey, kind: terminalEventFromMove}
 		} else if latestMove.Draw {
-			moveEvent = &terminalEvent{status: chess.StatusDraw, at: latestMove.CreatedAt, rkey: latestMove.rkey}
+			moveEvent = &terminalEvent{status: chess.StatusDraw, at: latestMove.CreatedAt, rkey: latestMove.rkey, kind: terminalEventFromMove}
 		}
 	}
 

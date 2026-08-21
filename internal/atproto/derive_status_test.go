@@ -726,6 +726,163 @@ func TestGetGame_SameSecondTie_ResolvedByTIDRkey(t *testing.T) {
 	}
 }
 
+// --- atchess-1c9.101: terminal move vs resignation/drawAccept same-second
+// tie, decided by kind rather than TID ---
+//
+// atchess-1c9.100 fixed move-vs-move ordering; atchess-1c9.101's
+// reachability analysis proved the only remaining cross-kind tie possible
+// in practice is a terminal move (checkmate, or a rules-forced draw) vs a
+// same-second resignation or accepted draw offer. These are CONSTRUCTED
+// regression tests, not timing tests: each move's rkey is deliberately
+// chosen to sort LOWER, lexicographically, than the competing
+// resignation/drawResponse rkey -- the OPPOSITE of what the old
+// moveIsAfter TID tiebreak needed in order to (wrongly) pick the move.
+// They only pass if terminalEventIsAfter's kind-based rule -- a checkmate
+// is not negotiable, so it beats a resignation/draw-agreement on a tie,
+// regardless of TID -- is what decides the outcome.
+
+// scholarsMateWinFEN is the position after 1.e4 e5 2.Bc4 Nc6 3.Qh5 Nf6??
+// 4.Qxf7#: white delivers checkmate. Active color "b" (black to move, but
+// mated) is what latestTerminalEvent's caller (GetGame) reads to decide
+// checkmate's winner -- see the "fenParts[1] == \"w\"" check next to
+// moveEvent's construction.
+const scholarsMateWinFEN = "r1bqkb1r/pppp1Qpp/2n2n2/4p3/2B1P3/8/PPPP1PPP/RNB1K1NR b KQkq - 0 4"
+
+// TestGetGame_SameSecondTie_CheckmateMoveBeatsResignation pins the
+// reachable worst case atchess-1c9.101 describes: white's mating move
+// lands in the same recorded second as (an adversarial/pathological, but
+// individually well-formed) resignation record that disagrees with the
+// board. The move's rkey sorts LOWER than the resignation's, so the old
+// TID tiebreak would have picked the resignation; the fix must still pick
+// the move.
+func TestGetGame_SameSecondTie_CheckmateMoveBeatsResignation(t *testing.T) {
+	mock := newDeriveTestPDS(t)
+	srv := mock.server()
+	defer srv.Close()
+
+	gameURI := mock.seedActiveGame(t, time.Now().Add(-time.Hour), nil)
+	sameSecond := time.Now().Truncate(time.Second)
+
+	mock.seed(whiteDID, "app.atchess.move", "3aaaaaaaaaaaa", map[string]interface{}{
+		"$type":     "app.atchess.move",
+		"createdAt": sameSecond.Format(time.RFC3339),
+		"game":      map[string]interface{}{"uri": gameURI},
+		"player":    whiteDID,
+		"from":      "h5",
+		"to":        "f7",
+		"san":       "Qxf7#",
+		"fen":       scholarsMateWinFEN,
+		"checkmate": true,
+	})
+
+	// Same second, white ALSO (pathologically) resigns -- a claim that, if
+	// honoured, would flip the outcome to black_won. Its rkey is chosen
+	// HIGHER than the move's, the direction the old TID tiebreak needed to
+	// pick it as "later".
+	mock.seed(whiteDID, "app.atchess.resignation", "3zzzzzzzzzzzz", map[string]interface{}{
+		"$type":           "app.atchess.resignation",
+		"createdAt":       sameSecond.Format(time.RFC3339),
+		"game":            map[string]interface{}{"uri": gameURI},
+		"resigningPlayer": whiteDID, // -> black_won, if honoured
+	})
+
+	client := newDeriveTestClient(t, mock)
+	game, err := client.GetGame(context.Background(), gameURI)
+	if err != nil {
+		t.Fatalf("GetGame: %v", err)
+	}
+	if game.Status != chess.StatusWhiteWon {
+		t.Errorf("expected white_won (checkmate is structurally decisive over a same-second resignation), got %q", game.Status)
+	}
+}
+
+// TestGetGame_SameSecondTie_CheckmateMoveBeatsDrawAccept is the bead's
+// headline example: white's mating move ties, in the same recorded second,
+// with an accepted draw offer -- "the UI shows a checkmated board labelled
+// draw" if TID decides it. As above, the move's rkey sorts LOWER than the
+// drawResponse's, the opposite of what the old TID tiebreak needed.
+func TestGetGame_SameSecondTie_CheckmateMoveBeatsDrawAccept(t *testing.T) {
+	mock := newDeriveTestPDS(t)
+	srv := mock.server()
+	defer srv.Close()
+
+	gameURI := mock.seedActiveGame(t, time.Now().Add(-time.Hour), nil)
+	sameSecond := time.Now().Truncate(time.Second)
+
+	mock.seed(whiteDID, "app.atchess.move", "3aaaaaaaaaaaa", map[string]interface{}{
+		"$type":     "app.atchess.move",
+		"createdAt": sameSecond.Format(time.RFC3339),
+		"game":      map[string]interface{}{"uri": gameURI},
+		"player":    whiteDID,
+		"from":      "h5",
+		"to":        "f7",
+		"san":       "Qxf7#",
+		"fen":       scholarsMateWinFEN,
+		"checkmate": true,
+	})
+
+	offerURI, offerCID := mock.seed(blackDID, "app.atchess.drawOffer", "offer1", map[string]interface{}{
+		"$type":     "app.atchess.drawOffer",
+		"createdAt": sameSecond.Format(time.RFC3339),
+		"game":      map[string]interface{}{"uri": gameURI, "cid": "cid-game1"},
+		"offeredBy": blackDID,
+		"status":    "pending",
+	})
+	// Same second, white ALSO accepts a draw offer -- a claim that, if
+	// honoured, would flip the outcome to draw. Its rkey is chosen HIGHER
+	// than the move's, the direction the old TID tiebreak needed.
+	mock.seed(whiteDID, "app.atchess.drawResponse", "3zzzzzzzzzzzz", map[string]interface{}{
+		"$type":       "app.atchess.drawResponse",
+		"createdAt":   sameSecond.Format(time.RFC3339),
+		"drawOffer":   map[string]interface{}{"uri": offerURI, "cid": offerCID},
+		"game":        map[string]interface{}{"uri": gameURI, "cid": "cid-game1"},
+		"respondedBy": whiteDID,
+		"response":    "accepted",
+	})
+
+	client := newDeriveTestClient(t, mock)
+	game, err := client.GetGame(context.Background(), gameURI)
+	if err != nil {
+		t.Fatalf("GetGame: %v", err)
+	}
+	if game.Status != chess.StatusWhiteWon {
+		t.Errorf("expected white_won (checkmate is structurally decisive over a same-second draw acceptance), got %q", game.Status)
+	}
+}
+
+// TestLatestTerminalEvent_MoveBeatsResignation_OrderIndependent proves the
+// fix does not depend on which candidate happens to be read/passed first --
+// unlike the old moveIsAfter TID tiebreak, which was symmetric anyway, this
+// directly pins terminalEventIsAfter's kind-based rule under BOTH argument
+// orderings, standing in for "which repo's scan happened to finish first".
+func TestLatestTerminalEvent_MoveBeatsResignation_OrderIndependent(t *testing.T) {
+	sameSecond := time.Now().Truncate(time.Second)
+	moveEvent := &terminalEvent{status: chess.StatusWhiteWon, at: sameSecond, rkey: "3aaaaaaaaaaaa", kind: terminalEventFromMove}
+	resignationEvent := &terminalEvent{status: chess.StatusBlackWon, at: sameSecond, rkey: "3zzzzzzzzzzzz", kind: terminalEventFromResignation}
+
+	if got := latestTerminalEvent(moveEvent, resignationEvent); got != moveEvent {
+		t.Errorf("move-first order: expected the move event to win, got status %q", got.status)
+	}
+	if got := latestTerminalEvent(resignationEvent, moveEvent); got != moveEvent {
+		t.Errorf("resignation-first order: expected the move event to STILL win (repo-read order must not matter), got status %q", got.status)
+	}
+}
+
+// TestLatestTerminalEvent_MoveBeatsDrawAccept_OrderIndependent is the
+// drawAccept counterpart of the above.
+func TestLatestTerminalEvent_MoveBeatsDrawAccept_OrderIndependent(t *testing.T) {
+	sameSecond := time.Now().Truncate(time.Second)
+	moveEvent := &terminalEvent{status: chess.StatusBlackWon, at: sameSecond, rkey: "3aaaaaaaaaaaa", kind: terminalEventFromMove}
+	drawAcceptEvent := &terminalEvent{status: chess.StatusDraw, at: sameSecond, rkey: "3zzzzzzzzzzzz", kind: terminalEventFromDrawAccept}
+
+	if got := latestTerminalEvent(moveEvent, drawAcceptEvent); got != moveEvent {
+		t.Errorf("move-first order: expected the move event to win, got status %q", got.status)
+	}
+	if got := latestTerminalEvent(drawAcceptEvent, moveEvent); got != moveEvent {
+		t.Errorf("drawAccept-first order: expected the move event to STILL win (repo-read order must not matter), got status %q", got.status)
+	}
+}
+
 // --- Forgery / soundness regression tests (atchess-1c9.48 review) ---
 
 // TestGetGame_ForgedResignation_Rejected proves black cannot unilaterally
