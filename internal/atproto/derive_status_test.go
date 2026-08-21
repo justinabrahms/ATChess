@@ -55,6 +55,21 @@ type deriveTestPDS struct {
 	// JSON.
 	listFail map[string]string
 
+	// getRecordFail, when set for a "repo|collection" key (see
+	// setGetRecordFail), makes every com.atproto.repo.getRecord call
+	// against that specific repo+collection pair return a bare HTTP 500
+	// -- added for atchess-1c9.54, to simulate a per-record read flake
+	// (e.g. getDrawAcceptOutcome's getRecordByURI(offerURI) call) that is
+	// NARROWER than listFail: com.atproto.repo.listRecords against the
+	// same repo (including the same collection) keeps working normally,
+	// and com.atproto.repo.getRecord against a DIFFERENT collection in
+	// the same repo -- notably app.atchess.game, which GetGame's very
+	// first read depends on -- is unaffected. Scoping by collection
+	// (rather than failing the whole repo's getRecord traffic) is what
+	// lets a test prove listRecords succeeded while ONLY the offer fetch
+	// failed, as the bead requires.
+	getRecordFail map[string]bool
+
 	// writeCalls counts every com.atproto.repo.createRecord/putRecord
 	// request this server has actually received, regardless of outcome.
 	// Used by RespondToDrawOffer's terminal-game guard tests
@@ -148,8 +163,13 @@ func (m *deriveTestPDS) handle(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
 		repo, collection, rkey := q.Get("repo"), q.Get("collection"), q.Get("rkey")
 		m.mu.Lock()
+		fail := m.getRecordFail[repo+"|"+collection]
 		val, ok := m.records[repo][collection][rkey]
 		m.mu.Unlock()
+		if fail {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
 		if !ok {
 			w.WriteHeader(http.StatusNotFound)
 			_ = json.NewEncoder(w).Encode(map[string]string{"error": "RecordNotFound"})
@@ -357,6 +377,20 @@ func (m *deriveTestPDS) setListFail(did, mode string) {
 		m.listFail = map[string]string{}
 	}
 	m.listFail[did] = mode
+}
+
+// setGetRecordFail makes every com.atproto.repo.getRecord call against
+// did's repo for the given collection return a bare HTTP 500, while
+// com.atproto.repo.listRecords (any collection, including this one) and
+// com.atproto.repo.getRecord against OTHER collections in the same repo
+// keep working normally. See getRecordFail's doc comment.
+func (m *deriveTestPDS) setGetRecordFail(did, collection string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.getRecordFail == nil {
+		m.getRecordFail = map[string]bool{}
+	}
+	m.getRecordFail[did+"|"+collection] = true
 }
 
 // newDeriveTestClient wires up a *Client (as white.test / did:plc:white)
@@ -1089,6 +1123,74 @@ func TestGetGame_IncompleteDerivation_OpponentUnreachable_Resigned(t *testing.T)
 	}
 	if game.Status == chess.StatusActive {
 		t.Errorf("must not report the game as active when derivation could not be verified; got %q", game.Status)
+	}
+}
+
+// TestGetGame_IncompleteDerivation_DrawOfferFetchFails_NoLongerActive is
+// atchess-1c9.54: getDrawAcceptOutcome's own per-record
+// getRecordByURI(offerURI) call used to swallow its failure with a bare
+// "continue" (log-and-drop, no entry in errs), unlike every OTHER read
+// failure in the four status-derivation scans (atchess-1c9.51). That made
+// it the one place a still-fail-open hole survived .51's fail-closed
+// sweep.
+//
+// Both players' repos are otherwise fully reachable here: black's
+// com.atproto.repo.listRecords call for app.atchess.drawResponse succeeds
+// and finds a genuine "accepted" response referencing a real drawOffer in
+// white's repo. ONLY the follow-up com.atproto.repo.getRecord fetch of
+// that specific drawOffer (via setGetRecordFail, scoped to white's
+// app.atchess.drawOffer collection -- NOT white's app.atchess.game
+// collection, which GetGame's very first read depends on, and NOT
+// listRecords against either repo) is made to fail. This isolates "the
+// accepted draw was found by listRecords but couldn't be corroborated" so
+// a test that stayed green against the unfixed code (which silently
+// returned status "active" with a nil error) can't hide behind some
+// other, coarser failure this bead's fix doesn't touch.
+func TestGetGame_IncompleteDerivation_DrawOfferFetchFails_NoLongerActive(t *testing.T) {
+	mock := newDeriveTestPDS(t)
+	srv := mock.server()
+	defer srv.Close()
+
+	gameURI := mock.seedActiveGame(t, time.Now().Add(-time.Hour), nil)
+
+	offerURI, offerCID := mock.seed(whiteDID, "app.atchess.drawOffer", "offer1", map[string]interface{}{
+		"$type":     "app.atchess.drawOffer",
+		"createdAt": time.Now().Format(time.RFC3339),
+		"game":      map[string]interface{}{"uri": gameURI, "cid": "cid-game1"},
+		"offeredBy": whiteDID,
+		"status":    "pending",
+	})
+
+	mock.seed(blackDID, "app.atchess.drawResponse", "resp1", map[string]interface{}{
+		"$type":       "app.atchess.drawResponse",
+		"createdAt":   time.Now().Format(time.RFC3339),
+		"drawOffer":   map[string]interface{}{"uri": offerURI, "cid": offerCID},
+		"game":        map[string]interface{}{"uri": gameURI, "cid": "cid-game1"},
+		"respondedBy": blackDID,
+		"response":    "accepted",
+	})
+
+	// Only the offer's own getRecord fetch fails -- listRecords (either
+	// repo, any collection) and getRecord against white's app.atchess.game
+	// collection both keep working normally.
+	mock.setGetRecordFail(whiteDID, "app.atchess.drawOffer")
+
+	client := newDeriveTestClient(t, mock)
+	game, err := client.GetGame(context.Background(), gameURI)
+	if err == nil {
+		t.Fatalf("expected a non-nil error (the accepted draw's offer record could not be fetched), got nil with status %q", game.Status)
+	}
+	if !errors.Is(err, ErrIncompleteDerivation) {
+		t.Errorf("expected errors.Is(err, ErrIncompleteDerivation), got: %v", err)
+	}
+	if game == nil {
+		t.Fatalf("expected a non-nil partial *Game alongside the error")
+	}
+	if !game.DerivationIncomplete {
+		t.Errorf("expected game.DerivationIncomplete == true")
+	}
+	if game.Status == chess.StatusDraw {
+		t.Errorf("must not report the game as a confirmed draw when the offer record backing it could not be read; got %q", game.Status)
 	}
 }
 

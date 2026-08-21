@@ -2440,6 +2440,16 @@ func (c *Client) getDrawAcceptOutcome(ctx context.Context, gameURI, whiteDID, bl
 			if err != nil {
 				log.Warn().Err(err).Str("gameURI", gameURI).Str("recordURI", record.URI).Str("offerURI", offerURI).
 					Msg("ignoring drawResponse record: its referenced drawOffer could not be read (no offer, no draw)")
+				// ErrRecordNotFound means the PDS affirmatively told us
+				// the offer doesn't exist -- a genuinely forged
+				// drawResponse, correctly rejected, not a read failure.
+				// Any OTHER error (network, HTTP 500, timeout, ...)
+				// means we could not tell either way, so it must fail
+				// closed like every other read failure in the four scans
+				// (atchess-1c9.51, atchess-1c9.54).
+				if !errors.Is(err, ErrRecordNotFound) {
+					errs = append(errs, fmt.Errorf("read drawOffer %s for %s: %w: %v", offerURI, playerDID, ErrIncompleteDerivation, err))
+				}
 				continue
 			}
 			if offerCID != value.DrawOffer.CID {
