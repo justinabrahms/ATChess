@@ -2291,6 +2291,32 @@ func (c *Client) currentGameStatus(ctx context.Context, gameURI string) (chess.G
 	return g.Status, nil
 }
 
+// currentGameStatusAndFEN returns gameURI's authoritative, derived status
+// AND FEN together (see GetGame's doc comment) -- never the raw,
+// possibly-stale "fen"/"status" fields cached on the app.atchess.game
+// record itself. The cached "fen" is stale after every move made by the
+// player who does not own the game record, since RecordMove
+// (client.go:820) only refreshes it when the mover owns the record;
+// GetGame already compensates for this by deriving FEN from the latest
+// move record (or, if no move records exist yet, correctly falling back
+// to the cached FEN, since nobody has moved). CheckTimeViolation used to
+// read gameValue["fen"] raw despite already calling currentGameStatus,
+// which pays for this exact derivation and discards the FEN -- this
+// function reuses that same derivation to get both values for the price
+// of one, instead of triggering a second, independent
+// getLatestMoveForGame call for data GetGame already computed
+// (atchess-1c9.103). Like currentGameStatus, it fails closed: on error
+// (which may wrap ErrIncompleteDerivation) callers MUST reject whatever
+// write they were about to authorize rather than guessing from unverified
+// data -- see currentGameStatus's doc comment.
+func (c *Client) currentGameStatusAndFEN(ctx context.Context, gameURI string) (chess.GameStatus, string, error) {
+	g, err := c.GetGame(ctx, gameURI)
+	if err != nil {
+		return "", "", err
+	}
+	return g.Status, g.FEN, nil
+}
+
 // OfferDraw creates a draw offer record for a game
 func (c *Client) OfferDraw(ctx context.Context, gameID string, message string) (*DrawOffer, error) {
 	// First, fetch the game record to get its CID
@@ -2747,13 +2773,19 @@ func (c *Client) CheckTimeViolation(ctx context.Context, gameID string) (bool, *
 		return false, nil, fmt.Errorf("failed to get game record: %w", err)
 	}
 
-	// Check if game is still active. Uses the derived status (GetGame), not
-	// the raw cached gameValue["status"] field -- see OfferDraw's comment
-	// (atchess-1c9.48 review). Fail closed if the status could not be
-	// verified at all (atchess-1c9.51): this result also gates
-	// ClaimTimeVictory's write, so "could not verify" must not be treated
-	// as "still active".
-	status, statusErr := c.currentGameStatus(ctx, gameID)
+	// Check if game is still active, AND derive the current FEN, together.
+	// Both use the derived values (GetGame), not the raw cached
+	// gameValue["status"]/gameValue["fen"] fields -- see OfferDraw's
+	// comment (atchess-1c9.48 review) for status, and
+	// currentGameStatusAndFEN's doc comment (atchess-1c9.103) for FEN: the
+	// cached fen is one ply stale after every move by the player who
+	// doesn't own the game record, which used to name the WRONG player as
+	// the one to move (and therefore the one exclude'd from getLastMove
+	// below, making the false-violation window LONGER, not shorter). Fail
+	// closed if either could not be verified at all (atchess-1c9.51): this
+	// result also gates ClaimTimeVictory's write, so "could not verify"
+	// must not be treated as "still active" or guessed at.
+	status, derivedFEN, statusErr := c.currentGameStatusAndFEN(ctx, gameID)
 	if statusErr != nil {
 		return false, nil, fmt.Errorf("cannot verify game is still active: %w", statusErr)
 	}
@@ -2765,9 +2797,9 @@ func (c *Client) CheckTimeViolation(ctx context.Context, gameID string) (bool, *
 	whiteDID, _ := gameValue["white"].(string)
 	blackDID, _ := gameValue["black"].(string)
 
-	// Determine whose turn it is from FEN
-	fen, _ := gameValue["fen"].(string)
-	fenParts := strings.Split(fen, " ")
+	// Determine whose turn it is from the derived FEN (not the raw cached
+	// gameValue["fen"] -- see above).
+	fenParts := strings.Split(derivedFEN, " ")
 	if len(fenParts) < 2 {
 		return false, nil, fmt.Errorf("invalid FEN format")
 	}
@@ -3122,8 +3154,28 @@ func (c *Client) GetTimeRemaining(ctx context.Context, gameID string) (time.Dura
 	whiteDID, _ := gameValue["white"].(string)
 	blackDID, _ := gameValue["black"].(string)
 
-	// Determine whose turn it is from FEN
-	fen, _ := gameValue["fen"].(string)
+	// Determine whose turn it is from the derived FEN, not the raw cached
+	// gameValue["fen"] field -- that cache is one ply stale after every
+	// move by the player who doesn't own the game record (see
+	// currentGameStatusAndFEN's doc comment, atchess-1c9.103). This reuses
+	// the same derivation path as GetGame/CheckTimeViolation
+	// (getLatestMoveForGame) rather than inventing a third way to work out
+	// the current position. If no move records exist yet, the cached FEN
+	// is correct (nobody has moved) and is used as-is. If derivation
+	// itself fails (e.g. the opponent's PDS is unreachable), fail closed
+	// rather than falling back to the possibly-stale cached FEN: unlike
+	// CheckTimeViolation this doesn't already pay for a GetGame call, so
+	// this does add network round trips (up to one listRecords call per
+	// player) to a function that previously made none for this purpose.
+	cachedFEN, _ := gameValue["fen"].(string)
+	latestMove, moveErr := c.getLatestMoveForGame(ctx, gameID, whiteDID, blackDID)
+	if moveErr != nil {
+		return 0, fmt.Errorf("cannot verify current position: %w", moveErr)
+	}
+	fen := cachedFEN
+	if latestMove != nil {
+		fen = latestMove.FEN
+	}
 	fenParts := strings.Split(fen, " ")
 	if len(fenParts) < 2 {
 		return 0, fmt.Errorf("invalid FEN format")
