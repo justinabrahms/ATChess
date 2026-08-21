@@ -69,6 +69,61 @@ func TestProcessChallengeEvent_IndexesChallenge(t *testing.T) {
 	}
 }
 
+// TestProcessChallengeEvent_ForgedChallenger_NotIndexedNotBroadcast pins
+// atchess-1c9.106's fix (a) as observed through the firehose path: a
+// record whose "challenger" field disagrees with event.Repo (the repo it
+// actually came from -- e.g. Mallory writing a challenge into HER OWN
+// repo naming Carol as "challenger") must be neither indexed into the
+// durable Store nor broadcast to the challenged player.
+//
+// The Hub here is deliberately never started (no `go hub.Run()`):
+// Hub.BroadcastToPlayer sends on an unbuffered channel that only Run's
+// goroutine ever drains, so if processChallengeEvent's early refusal
+// didn't ALSO skip the broadcast call below it, ProcessEvent would block
+// forever on that send and this test would time out -- a structural
+// proof of "not broadcast", not just an absence-of-row check.
+func TestProcessChallengeEvent_ForgedChallenger_NotIndexedNotBroadcast(t *testing.T) {
+	hub := web.NewHub()
+	store := newTestChallengeStore(t)
+	p := NewEventProcessor(hub, store)
+
+	event := Event{
+		Type:      EventTypeChallenge,
+		Repo:      "did:plc:mallory",
+		Path:      "app.atchess.challenge/forged1",
+		CID:       "cid-forged1",
+		Timestamp: time.Now(),
+		Action:    "create",
+		Record: map[string]interface{}{
+			"challenger":     "did:plc:carol",
+			"challenged":     "did:plc:bob",
+			"color":          "white",
+			"proposedGameId": "forgedgame",
+			"createdAt":      time.Now().UTC().Format(time.RFC3339),
+			"expiresAt":      time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339),
+		},
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- p.ProcessEvent(context.Background(), event) }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("ProcessEvent: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("ProcessEvent did not return -- it appears to have blocked broadcasting a forged challenge that should have been refused before ever reaching Hub.BroadcastToPlayer")
+	}
+
+	got, err := store.ForPlayer("did:plc:bob")
+	if err != nil {
+		t.Fatalf("ForPlayer: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("expected the forged challenge to NOT be indexed, got %d entries: %#v", len(got), got)
+	}
+}
+
 // TestProcessChallengeEvent_IdempotentReplay proves replaying the exact
 // same firehose event (e.g. after a cursor reset, or an at-least-once
 // redelivery) does not produce a duplicate entry -- required for

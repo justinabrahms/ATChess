@@ -404,7 +404,13 @@ func (b *Backfiller) listChallengesForRepo(ctx context.Context, base, repoDID, u
 		if rkey == "" {
 			continue
 		}
-		out = append(out, challenge.FromChallengeRecord(repoDID, rkey, rec.CID, rec.Value))
+		pending := challenge.FromChallengeRecord(repoDID, rkey, rec.CID, rec.Value)
+		if pending == nil {
+			// FromChallengeRecord already logged the forged-challenger
+			// mismatch; refuse to surface it during backfill either.
+			continue
+		}
+		out = append(out, pending)
 	}
 	return out, nil
 }

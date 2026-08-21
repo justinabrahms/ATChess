@@ -29,9 +29,10 @@ func newTestChallengeStore(t *testing.T) *challenge.Store {
 }
 
 const (
-	aliceDID = "did:plc:alice"
-	bobDID   = "did:plc:bob"
-	carolDID = "did:plc:carol"
+	aliceDID   = "did:plc:alice"
+	bobDID     = "did:plc:bob"
+	carolDID   = "did:plc:carol"
+	malloryDID = "did:plc:mallory"
 )
 
 // challengeRecord builds a minimal app.atchess.challenge record value.
@@ -147,6 +148,35 @@ func TestBackfillChallengesForUser_IgnoresChallengesAddressedToSomeoneElse(t *te
 	}
 	if len(got) != 0 {
 		t.Errorf("expected no pending challenges for bob, got %d", len(got))
+	}
+}
+
+// TestBackfillChallengesForUser_ForgedChallenger_NotIndexed pins
+// atchess-1c9.106's fix (a) as observed through the backfill path: a
+// record hosted in Mallory's repo but self-reporting Carol as
+// "challenger" must be refused, not indexed as if it came from Carol.
+func TestBackfillChallengesForUser_ForgedChallenger_NotIndexed(t *testing.T) {
+	server := newMockPDS(t, map[string]map[string]map[string]interface{}{
+		malloryDID: {
+			"forged1": challengeRecord(carolDID, bobDID), // hosted by Mallory, claims Carol as challenger
+		},
+	})
+	defer server.Close()
+
+	store := newTestChallengeStore(t)
+	b := New(store, zerolog.Nop())
+
+	result := b.BackfillChallengesForUser(context.Background(), bobDID, []string{wsURLFor(server.URL)})
+
+	if result.TotalFound() != 0 {
+		t.Fatalf("expected 0 challenges found for bob (forged challenger must be refused), got %d", result.TotalFound())
+	}
+	got, err := store.ForPlayer(bobDID)
+	if err != nil {
+		t.Fatalf("ForPlayer: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("expected no pending challenges indexed for bob, got %d: %#v", len(got), got)
 	}
 }
 

@@ -662,16 +662,20 @@ func (s *Service) DeclineChallengeHandler(w http.ResponseWriter, r *http.Request
 // bare record key alone.
 //
 // AUTHORISATION is delegated entirely to atproto.Client.AcceptChallenge,
-// which verifies the caller against the challenge record ITSELF (read
-// directly from the challenger's repo), never against this instance's
-// local challenge.Store cache and never against any caller-supplied
-// field -- see that method's doc comment for the full
-// ownership/idempotency contract this handler is a thin HTTP wrapper
-// around. In particular: a duplicate accept by either of the challenge's
-// two participants returns the same existing game (200), and a caller who
-// is neither gets 403 -- this handler only translates that method's
-// sentinel errors into the matching HTTP status, it does not implement
-// the policy itself.
+// which verifies the caller against the challenge record read from
+// {key}'s OWN at:// URI -- whichever repo that URI actually names, not
+// necessarily the challenger's. AcceptChallenge itself corroborates the
+// record's self-reported "challenger" field against that same URI's
+// repo authority (atchess-1c9.106: AT Protocol only permits writing into
+// your own repo, so the URI's repo -- not any field inside the record --
+// is the authorship proof) before trusting anything else in it, and
+// never against this instance's local challenge.Store cache -- see that
+// method's doc comment for the full ownership/idempotency contract this
+// handler is a thin HTTP wrapper around. In particular: a duplicate
+// accept by either of the challenge's two participants returns the same
+// existing game (200), and a caller who is neither gets 403 -- this
+// handler only translates that method's sentinel errors into the
+// matching HTTP status, it does not implement the policy itself.
 func (s *Service) AcceptChallengeHandler(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	encodedKey := vars["key"]
@@ -703,6 +707,13 @@ func (s *Service) AcceptChallengeHandler(w http.ResponseWriter, r *http.Request)
 			// these two are deliberately never conflated. A dangling
 			// challenge reference is never written in either case.
 			log.Warn().Err(err).Str("challengeURI", challengeURI).Msg("Accept: challenge record not found")
+			http.Error(w, "Challenge not found", http.StatusNotFound)
+		case errors.Is(err, atproto.ErrChallengeChallengerForged):
+			// The record's self-reported "challenger" disagrees with the
+			// repo hosting it -- not a real challenge from anyone, so
+			// treated the same as "does not exist" rather than leaking
+			// that a forged record was detected (atchess-1c9.106).
+			log.Warn().Err(err).Str("challengeURI", challengeURI).Str("did", AuthenticatedDID(r)).Msg("Accept: refusing forged challenge")
 			http.Error(w, "Challenge not found", http.StatusNotFound)
 		case errors.Is(err, atproto.ErrNotChallengeParticipant), errors.Is(err, atproto.ErrOnlyChallengedMayAccept):
 			// Either the caller is not one of this challenge's two

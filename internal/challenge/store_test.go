@@ -578,6 +578,33 @@ func TestFromChallengeRecord_DefaultsWhenTimestampsMissing(t *testing.T) {
 	}
 }
 
+// TestFromChallengeRecord_ForgedChallenger_Refused pins atchess-1c9.106's
+// fix (a): a record whose self-reported "challenger" disagrees with the
+// repo it was actually hosted in (repoDID -- what the firehose/backfill
+// caller observed the record living in, never trusted from any field
+// inside the record itself) must be refused outright, not merely
+// mislabeled. Without this, Mallory could write an app.atchess.challenge
+// into HER OWN repo naming Carol as "challenger", and it would be indexed
+// and broadcast to Bob as if it came from Carol.
+func TestFromChallengeRecord_ForgedChallenger_Refused(t *testing.T) {
+	record := map[string]interface{}{
+		"challenged":     "did:plc:bob",
+		"challenger":     "did:plc:carol", // claimed challenger
+		"color":          "white",
+		"proposedGameId": "game123",
+		"createdAt":      "2026-01-01T00:00:00Z",
+		"expiresAt":      "2026-01-02T00:00:00Z",
+	}
+
+	// repoDID ("did:plc:mallory") is the repo that ACTUALLY hosted this
+	// record -- it disagrees with the claimed "challenger" (Carol).
+	pc := FromChallengeRecord("did:plc:mallory", "forged1", "bafycid", record)
+
+	if pc != nil {
+		t.Fatalf("expected FromChallengeRecord to refuse a forged challenger and return nil, got %#v", pc)
+	}
+}
+
 func TestBuildChallengeURI(t *testing.T) {
 	got := BuildChallengeURI("did:plc:alice", "abc123")
 	want := "at://did:plc:alice/app.atchess.challenge/abc123"

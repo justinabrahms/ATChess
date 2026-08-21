@@ -100,6 +100,19 @@ var ErrChallengeConflict = errors.New("challenge conflicts with an existing, unr
 // not perform; tracked as separate follow-up work, out of scope here).
 var ErrChallengeNotAcceptable = errors.New("challenge is not in an acceptable state")
 
+// ErrChallengeChallengerForged indicates a challenge record's
+// self-reported "challenger" field disagrees with the DID authority of
+// the at:// URI it was fetched from. AT Protocol only permits a repo
+// owner to write into their own repo, so the repo hosting a record is
+// its authorship proof, not any field inside it (see BuildChallengeURI's
+// doc comment and getResignationOutcome's matching corroboration).
+// Without this check, anyone can write an app.atchess.challenge into
+// THEIR OWN repo naming an uninvolved third party as "challenger": the
+// challenged party's accept then mints a public app.atchess.game
+// crediting that third party as a player they never agreed to be
+// (atchess-1c9.106).
+var ErrChallengeChallengerForged = errors.New("challenge record's challenger field disagrees with its own repo")
+
 // isRecordNotFoundBody reports whether an AT Protocol error response body
 // carries the structured "RecordNotFound" error code. Used instead of the
 // HTTP status code alone -- see ErrRecordNotFound's doc comment for why.
@@ -718,6 +731,20 @@ func (c *Client) AcceptChallenge(ctx context.Context, challengeURI string) (*che
 	}
 	if proposedGameID == "" {
 		return nil, fmt.Errorf("challenge %s: record has no proposedGameId to derive a game rkey from", challengeURI)
+	}
+
+	// Corroborate the record's self-reported "challenger" against the
+	// repo it actually lives in -- AT Protocol only permits writing into
+	// your own repo, so the URI's authority (not the field) is the
+	// authorship proof. Without this, anyone can plant a challenge in
+	// THEIR OWN repo naming an uninvolved third party as challenger; the
+	// challenged party's honest accept below would otherwise mint a
+	// public game crediting that third party as a player (atchess-1c9.106).
+	if repoDID := recordRepo(challengeURI); repoDID != "" && repoDID != challengerDID {
+		log.Warn().Str("challengeURI", challengeURI).Str("repo", repoDID).
+			Str("claimedChallenger", challengerDID).
+			Msg("refusing forged challenge: repo hosting the record is not the challenger it names")
+		return nil, fmt.Errorf("%w: challenge %s is hosted in repo %s but names challenger %s", ErrChallengeChallengerForged, challengeURI, repoDID, challengerDID)
 	}
 
 	if c.did != challengerDID && c.did != challengedDID {

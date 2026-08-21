@@ -240,6 +240,17 @@ func (p *EventProcessor) processChallengeEvent(ctx context.Context, event Event)
 		return fmt.Errorf("invalid challenge record format")
 	}
 
+	// Corroborate the record's self-reported "challenger" against the
+	// repo it actually came from (event.Repo) BEFORE indexing OR
+	// broadcasting it -- run unconditionally, not just when a Store is
+	// configured, since a forged challenge must never reach the
+	// challenged player's UI either. FromChallengeRecord returns nil and
+	// logs the mismatch itself; refuse the whole record here.
+	pending := challenge.FromChallengeRecord(event.Repo, rkey, event.CID, record)
+	if pending == nil {
+		return nil
+	}
+
 	// Index the challenge so the challenged player can discover it. A
 	// failure here is logged AND returned (rather than swallowed): the
 	// caller (firehose.Client) logs it too and continues processing
@@ -248,7 +259,6 @@ func (p *EventProcessor) processChallengeEvent(ctx context.Context, event Event)
 	// internal/challenge.Store's doc comment on never letting a storage
 	// failure degrade into a confidently-wrong "no challenges" answer.
 	if p.challengeStore != nil {
-		pending := challenge.FromChallengeRecord(event.Repo, rkey, event.CID, record)
 		if _, err := p.challengeStore.Add(pending); err != nil {
 			log.Error().Err(err).Str("uri", pending.ChallengeURI).Msg("Failed to index challenge from firehose")
 			return fmt.Errorf("indexing challenge %s: %w", pending.ChallengeURI, err)

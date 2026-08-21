@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/rs/zerolog/log"
 	_ "modernc.org/sqlite"
 )
 
@@ -410,12 +411,16 @@ func (s *Store) PruneExpired() (int, error) {
 }
 
 // BuildChallengeURI constructs the at:// URI of an app.atchess.challenge
-// record from its repo (the CHALLENGER's DID -- a challenge record only
-// ever lives in its challenger's own repo) and record key. Exported so
-// internal/firehose can reconstruct the URI for a "delete" op, which
-// carries no record body to derive it from any other way (see
-// FromChallengeRecord, the single other place this same URI shape is
-// built, for the create/update path).
+// record from its repo and record key. The repo argument here is always
+// the repo the record actually lives in (event.Repo on the firehose path,
+// repoDID on the backfill path) -- NOT trusted from any field inside the
+// record. FromChallengeRecord, below, is what enforces that a record's
+// self-reported "challenger" field must agree with this same repo before
+// the record is indexed at all; a mismatched record is refused, not
+// merely mislabeled (atchess-1c9.106). Exported so internal/firehose can
+// reconstruct the URI for a "delete" op, which carries no record body to
+// derive it from any other way (see FromChallengeRecord, the single other
+// place this same URI shape is built, for the create/update path).
 func BuildChallengeURI(repoDID, rkey string) string {
 	return fmt.Sprintf("at://%s/app.atchess.challenge/%s", repoDID, rkey)
 }
@@ -427,6 +432,17 @@ func BuildChallengeURI(repoDID, rkey string) string {
 // wire record shape to PendingChallenge, shared by the live and backfill
 // paths so they cannot drift out of sync with each other.
 //
+// AT Protocol only permits a repo owner to write into their own repo, so
+// repoDID (the repo that actually hosted this record) is the record's
+// authorship proof -- its self-reported "challenger" field is not. If the
+// two disagree, this is a forged challenge: someone wrote a record into
+// THEIR OWN repo naming an uninvolved third party as challenger, hoping
+// the challenged party's accept mints a public game crediting that third
+// party as a player they never agreed to be (atchess-1c9.106). Such a
+// record is refused outright -- not indexed, not broadcast -- and this
+// function returns nil; callers MUST check for nil before using the
+// result.
+//
 // A missing/unparsable createdAt defaults to now; a missing/unparsable
 // expiresAt defaults to 24h after createdAt (matching CreateChallenge's own
 // default expiry, internal/atproto/client.go).
@@ -437,6 +453,13 @@ func FromChallengeRecord(repoDID, rkey, cid string, record map[string]interface{
 	color, _ := record["color"].(string)
 	message, _ := record["message"].(string)
 	proposedGameID, _ := record["proposedGameId"].(string)
+
+	if challengerDID != repoDID {
+		log.Warn().Str("repo", repoDID).Str("rkey", rkey).
+			Str("claimedChallenger", challengerDID).
+			Msg("refusing forged challenge: repo hosting the record is not the challenger it names")
+		return nil
+	}
 
 	createdAt := time.Now()
 	if ts, ok := record["createdAt"].(string); ok {

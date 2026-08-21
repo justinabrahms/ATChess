@@ -237,6 +237,8 @@ const (
 	testChallengerDID = "did:plc:challenger"
 	testChallengedDID = "did:plc:challenged"
 	testStrangerDID   = "did:plc:stranger"
+	testMalloryDID    = "did:plc:mallory" // hosts the forged challenge record
+	testCarolDID      = "did:plc:carol"   // forged/uninvolved third party
 )
 
 func seedBasicChallenge(pds *acceptTestPDS) (challengeURI, challengeCID string) {
@@ -329,6 +331,46 @@ func TestAcceptChallenge_DuplicateByChallengedPlayer_IdempotentNoSecondRecord(t 
 	}
 	if n := pds.gameCount(testChallengedDID); n != 1 {
 		t.Errorf("expected exactly 1 game record after a duplicate accept, got %d", n)
+	}
+}
+
+// TestAcceptChallenge_ForgedChallenger_MintsThirdPartyGame_ChainTest is
+// atchess-1c9.106's full chain proof: Mallory writes an
+// app.atchess.challenge into HER OWN repo naming Carol -- an uninvolved
+// third party who never wrote or agreed to anything -- as "challenger",
+// with Bob as "challenged". Before the fix, Bob's honest, ordinary
+// accept would mint a real, public app.atchess.game record in HIS OWN
+// repo crediting Carol as a player. This is also (b)'s isolation case:
+// the challenge is supplied directly by its at:// URI (exactly how
+// AcceptChallenge is always invoked -- from a notification, or directly),
+// never through internal/challenge.Store, so fix (a) alone cannot help
+// here -- only AcceptChallenge's own corroboration (fix (b)) can.
+func TestAcceptChallenge_ForgedChallenger_MintsThirdPartyGame_ChainTest(t *testing.T) {
+	pds := newAcceptTestPDS(t)
+	// Hosted in Mallory's repo, but claims Carol as challenger.
+	pds.putChallenge(testMalloryDID, "forged1", map[string]interface{}{
+		"$type":          "app.atchess.challenge",
+		"createdAt":      time.Now().Add(-time.Hour).Format(time.RFC3339),
+		"challenger":     testCarolDID,
+		"challenged":     testChallengedDID,
+		"status":         "pending",
+		"color":          "white",
+		"proposedGameId": "forgedgame1",
+		"expiresAt":      time.Now().Add(24 * time.Hour).Format(time.RFC3339),
+	})
+	forgedChallengeURI := "at://" + testMalloryDID + "/app.atchess.challenge/forged1"
+
+	bob := acceptTestClient(t, pds, testChallengedDID)
+
+	game, err := bob.AcceptChallenge(context.Background(), forgedChallengeURI)
+	if err == nil {
+		t.Fatalf("expected AcceptChallenge to refuse a forged challenge, but it SUCCEEDED and minted game %q naming challenger=%q (an uninvolved third party who never wrote this challenge) -- this is the exact chain atchess-1c9.106 describes", game.ID, testCarolDID)
+	}
+	if !errors.Is(err, ErrChallengeChallengerForged) {
+		t.Errorf("expected an error wrapping ErrChallengeChallengerForged, got: %v", err)
+	}
+	if n := pds.gameCount(testChallengedDID); n != 0 {
+		t.Errorf("expected NO game record to have been created for the forged challenge, got %d", n)
 	}
 }
 
