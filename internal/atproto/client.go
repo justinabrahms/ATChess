@@ -3034,6 +3034,15 @@ func (c *Client) resolveHandleSamePDS(ctx context.Context, handle string) (strin
 // atchess-1c9.51 fixed: an opponent-PDS outage must not silently reopen a
 // game that has already ended. Do not restore the old "err == nil &&
 // status != active" fail-open pattern here.
+//
+// ONE deliberate exception, and it is narrow: RespondToDrawOffer proceeds
+// best-effort on a non-nil error when the response is a DECLINE
+// (atchess-1c9.65). A decline authorizes nothing -- getDrawAcceptOutcome
+// only ever honours "accepted" responses, so a decline written against an
+// unverifiable game cannot alter derived status. Accepts on that same path
+// still fail closed. If you add a caller, fail closed; do not cite this
+// exception unless your write is likewise incapable of changing the
+// game's outcome.
 func (c *Client) currentGameStatus(ctx context.Context, gameURI string) (chess.GameStatus, error) {
 	g, err := c.GetGame(ctx, gameURI)
 	if err != nil {
@@ -3213,10 +3222,37 @@ func (c *Client) RespondToDrawOffer(ctx context.Context, drawOfferURI string, ac
 	// accepted into a game that had already ended, producing two
 	// competing terminal events (atchess-1c9.56). Uses the derived status
 	// (GetGame), not the raw cached game record status -- see OfferDraw's
-	// comment (atchess-1c9.48 review). Fail closed if the status could
-	// not be verified at all (atchess-1c9.51).
-	if status, statusErr := c.currentGameStatus(ctx, gameURI); statusErr != nil {
-		return fmt.Errorf("cannot verify game is still active: %w", statusErr)
+	// comment (atchess-1c9.48 review).
+	//
+	// The two branches below apply asymmetrically to accept vs. decline,
+	// and that asymmetry is deliberate -- see the gameCID comment further
+	// down for the full accept-vs-decline rationale (same reasoning
+	// applies here):
+	//
+	//   - Terminal status (derived successfully, but not Active): refused
+	//     for BOTH accept and decline. There is nothing meaningful to
+	//     decline on a game that has already ended, so this half is not
+	//     the asymmetric one.
+	//   - Underivable status (statusErr != nil): fails closed for accept
+	//     ONLY (atchess-1c9.51). A decline never updates the game record
+	//     and is invisible to getDrawAcceptOutcome (which only honours
+	//     "accepted" responses), so a decline written while the game's
+	//     status can't be verified cannot corrupt derived status -- it is
+	//     low-stakes exactly like the gameCID fallback below, and must
+	//     proceed best-effort rather than hard-fail. atchess-1c9.56
+	//     regressed this to hard-fail for declines too; atchess-1c9.65
+	//     un-regressed it. This is the SECOND time an accept-only
+	//     fail-closed guard has silently widened to cover decline as well
+	//     (the first was atchess-1c9.48, on the gameCID fetch below) --
+	//     if a third change touches this function, keep the accept/decline
+	//     split explicit rather than "simplifying" it away.
+	status, statusErr := c.currentGameStatus(ctx, gameURI)
+	if statusErr != nil {
+		if accept {
+			return fmt.Errorf("cannot verify game is still active: %w", statusErr)
+		}
+		log.Warn().Str("gameURI", gameURI).Str("drawOfferURI", drawOfferURI).Err(statusErr).
+			Msg("proceeding with draw decline despite unverifiable game status")
 	} else if status != chess.StatusActive {
 		return fmt.Errorf("cannot respond to draw offer in a game with status: %s", status)
 	}
@@ -3240,12 +3276,16 @@ func (c *Client) RespondToDrawOffer(ctx context.Context, drawOfferURI string, ac
 	// An accept is a meaningful state transition, so fetch the freshest
 	// possible game CID and fail loudly if that's not possible. A decline
 	// is comparatively low-stakes -- it never updates the game record
-	// (below) -- so it must not hard-fail just because the game record
+	// (below), and getDrawAcceptOutcome only ever honours "accepted"
+	// responses -- so it must not hard-fail just because the game record
 	// happens to be momentarily unreadable; fall back to the CID already
-	// recorded on the offer itself instead (atchess-1c9.48 review: this
-	// getGameRecord call used to be accept-only, and unconditionally
-	// requiring it here regressed declines to hard-fail on the same
-	// condition an accept does).
+	// recorded on the offer itself instead. This is the same
+	// accept-vs-decline rationale the terminal-game guard above applies to
+	// the derived-status check (atchess-1c9.65); the two guards are
+	// independent but the policy is the same one, applied twice.
+	// (atchess-1c9.48 review: this getGameRecord call used to be
+	// accept-only, and unconditionally requiring it here regressed
+	// declines to hard-fail on the same condition an accept does.)
 	var gameCID string
 	if accept {
 		gameCID, _, err = c.getGameRecord(ctx, gameURI)

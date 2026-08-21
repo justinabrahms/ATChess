@@ -1355,3 +1355,88 @@ func TestRespondToDrawOffer_Accept_ActiveGame_Succeeds(t *testing.T) {
 		t.Errorf("expected the accept to actually reach the fake server's write path, got %d writes", got)
 	}
 }
+
+// TestRespondToDrawOffer_Decline_SucceedsWhenDerivationIncomplete is the
+// atchess-1c9.65 regression test. atchess-1c9.56 made the terminal-game
+// guard's derivation-error branch fail closed for BOTH accept and decline,
+// contradicting the still-standing design note on the gameCID fallback a
+// few lines below (a decline "must not hard-fail just because the game
+// record happens to be momentarily unreadable"). A decline never updates
+// the game record and is invisible to getDrawAcceptOutcome (which only
+// honours "accepted" responses), so it must proceed best-effort even when
+// the game's derived status can't be verified -- unlike an accept, which
+// must still fail closed in the same situation (see
+// TestRespondToDrawOffer_FailsClosed_WhenDerivationIncomplete, which must
+// keep passing).
+func TestRespondToDrawOffer_Decline_SucceedsWhenDerivationIncomplete(t *testing.T) {
+	mock := newDeriveTestPDS(t)
+	srv := mock.server()
+	defer srv.Close()
+
+	// atchess-1c9.95 fix-pass: see setUnreachable's doc comment -- must be
+	// a validator-passing-but-dead endpoint, not a plain closed
+	// httptest.Server's own address.
+	mock.setUnreachable(t, blackDID)
+
+	gameURI := mock.seedActiveGame(t, time.Now().Add(-time.Hour), nil)
+
+	offerURI, _ := mock.seed(whiteDID, "app.atchess.drawOffer", "offer1", map[string]interface{}{
+		"$type":     "app.atchess.drawOffer",
+		"createdAt": time.Now().Format(time.RFC3339),
+		"game":      map[string]interface{}{"uri": gameURI, "cid": "cid-game1"},
+		"offeredBy": whiteDID,
+		"status":    "pending",
+	})
+
+	client := newDeriveTestClient(t, mock)
+	err := client.RespondToDrawOffer(context.Background(), offerURI, false)
+	if err != nil {
+		t.Fatalf("expected a decline to succeed best-effort when the game's status could not be verified (black's PDS unreachable), got error: %v", err)
+	}
+	// createRecord for the drawResponse. Declines never refresh the
+	// cached game record, so this is the only write expected.
+	if got := mock.writeCallCount(); got == 0 {
+		t.Errorf("expected the decline to actually reach the fake server's write path, got %d writes", got)
+	}
+}
+
+// TestRespondToDrawOffer_Decline_RejectedInResignedGame proves the
+// terminal-status half of the guard still applies to declines: unlike the
+// derivation-error half (see
+// TestRespondToDrawOffer_Decline_SucceedsWhenDerivationIncomplete above),
+// a DERIVABLE terminal status refuses both accept and decline, since there
+// is nothing meaningful to decline on a game that has already ended.
+func TestRespondToDrawOffer_Decline_RejectedInResignedGame(t *testing.T) {
+	mock := newDeriveTestPDS(t)
+	srv := mock.server()
+	defer srv.Close()
+
+	gameURI := mock.seedActiveGame(t, time.Now().Add(-time.Hour), nil)
+
+	offerURI, _ := mock.seed(whiteDID, "app.atchess.drawOffer", "offer1", map[string]interface{}{
+		"$type":     "app.atchess.drawOffer",
+		"createdAt": time.Now().Format(time.RFC3339),
+		"game":      map[string]interface{}{"uri": gameURI, "cid": "cid-game1"},
+		"offeredBy": whiteDID,
+		"status":    "pending",
+	})
+
+	// White resigns after making the offer -- the game is now terminal
+	// (black_won) even though the drawOffer record itself still says
+	// "pending".
+	mock.seed(whiteDID, "app.atchess.resignation", "resign1", map[string]interface{}{
+		"$type":           "app.atchess.resignation",
+		"createdAt":       time.Now().Format(time.RFC3339),
+		"game":            map[string]interface{}{"uri": gameURI},
+		"resigningPlayer": whiteDID,
+	})
+
+	client := newDeriveTestClient(t, mock)
+	err := client.RespondToDrawOffer(context.Background(), offerURI, false)
+	if err == nil {
+		t.Fatalf("expected RespondToDrawOffer to reject a decline in a resigned (terminal) game, got nil error")
+	}
+	if got := mock.writeCallCount(); got != 0 {
+		t.Errorf("expected ZERO createRecord/putRecord writes when the decline is rejected, got %d", got)
+	}
+}
