@@ -13,6 +13,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -1128,8 +1129,15 @@ type moveRecord struct {
 	// recordKey/moveIsAfter). CreatedAt (an RFC3339 timestamp, second
 	// resolution) is not fine-grained enough to order two moves recorded
 	// within the same second -- which cross-repo moves routinely are, once
-	// atchess-1c9.10 makes it possible to read them at all -- so rkey
-	// breaks ties.
+	// atchess-1c9.10 makes it possible to read them at all. rkey is kept as
+	// a last-resort fallback tiebreak (see moveIsAfter), but the PRIMARY
+	// cross-repo tiebreak for two move records is now FEN, via
+	// moveRecordIsAfter/plyFromFEN -- see atchess-1c9.100. rkey comparison
+	// across repos is NOT chronologically meaningful (AT Protocol TIDs are
+	// only monotonic per-repo; their low-order bits are a random
+	// per-process tiebreak, not a synchronized clock), which is exactly why
+	// this codebase had a deterministic-but-WRONG answer that could
+	// permanently wedge a real cross-PDS game.
 	rkey string
 }
 
@@ -1154,12 +1162,38 @@ func recordRepo(atURI string) string {
 	return parts[2]
 }
 
-// moveIsAfter reports whether the move record identified by (t, rkey)
-// should be considered strictly more recent than (otherT, otherRkey). AT
-// Protocol TIDs are, by design, lexicographically sortable by creation time
-// (base32-sortable, monotonic per repo) -- see
-// https://atproto.com/specs/tid -- so comparing rkey strings resolves a
-// CreatedAt tie (same second) far more precisely than CreatedAt alone.
+// moveIsAfter reports whether the event identified by (t, rkey) should be
+// considered strictly more recent than (otherT, otherRkey), breaking a
+// CreatedAt tie (same second -- RFC3339 is only second-resolution, and
+// cross-repo ties are ordinary, not exotic) by comparing rkey strings.
+//
+// atchess-1c9.100 CORRECTION: this rkey comparison is NOT, and never was,
+// a sound chronological tiebreak across repos. AT Protocol TIDs are only
+// "monotonic per repo" (https://atproto.com/specs/tid) -- their low-order
+// clock-identifier bits are a random-per-process tiebreak, not a
+// synchronized counter, so comparing TIDs minted by two DIFFERENT PDS
+// processes carries no chronological guarantee whatsoever. A prior version
+// of this doc comment incorrectly claimed otherwise, and that mistake is
+// exactly what let a real cross-PDS move (Ke7, played later) lose a
+// same-second tie to an earlier move (Qh5) and wedge the game permanently
+// -- see atchess-1c9.100's measured evidence.
+//
+// For MOVE records specifically, callers must use moveRecordIsAfter
+// instead: a move's own resultant FEN gives a domain-correct, cross-repo-
+// comparable ply count (plyFromFEN), which is what actually fixes that
+// bug. This function remains the tiebreak for every OTHER terminalEvent
+// source (resignation, timeViolation, drawAccept) and for merging
+// heterogeneous terminal-event candidates in latestTerminalEvent: none of
+// those record types carries a board position, so there is no domain-
+// correct answer to "which of two same-second claims came first" the way
+// there is for a chess move -- rkey comparison here is retained ONLY for
+// its one remaining true property, full determinism (the same two records
+// compare the same way on every call, forever), not for any claim of
+// chronological accuracy. These are also lower-stakes than the move case:
+// in a well-behaved client at most one terminal-event source is ever
+// non-nil for a given game, so a same-second tie among them is already a
+// pathological/adversarial situation, not the ordinary gameplay this bug
+// was about.
 func moveIsAfter(t time.Time, rkey string, otherT time.Time, otherRkey string) bool {
 	if t.After(otherT) {
 		return true
@@ -1168,6 +1202,88 @@ func moveIsAfter(t time.Time, rkey string, otherT time.Time, otherRkey string) b
 		return false
 	}
 	return rkey > otherRkey
+}
+
+// plyFromFEN returns the number of half-moves (plies) that had been played
+// to reach the position described by fen -- e.g. 1 after White's first
+// move, 2 after Black's reply, 3 after White's second move, and so on.
+// Standard FEN's active-color and fullmove-number fields (the 2nd and 6th
+// of its 6 space-separated fields) make this a cheap, pure parse -- no
+// chess-legality simulation is needed:
+//
+//	ply = 2*(fullmove-1) + (1 if Black is to move next i.e. White just
+//	      moved, else 0 if White is to move next i.e. Black just moved or
+//	      the game hasn't started)
+//
+// ok is false if fen does not have enough fields, or its active-color or
+// fullmove-number fields are not well-formed ("w"/"b" and a positive
+// integer respectively) -- callers must fall back to a different ordering
+// signal rather than trust a zero value in that case.
+func plyFromFEN(fen string) (ply int, ok bool) {
+	fields := strings.Fields(fen)
+	if len(fields) < 6 {
+		return 0, false
+	}
+	activeColor := fields[1]
+	if activeColor != "w" && activeColor != "b" {
+		return 0, false
+	}
+	fullmove, err := strconv.Atoi(fields[5])
+	if err != nil || fullmove < 1 {
+		return 0, false
+	}
+	ply = 2 * (fullmove - 1)
+	if activeColor == "b" {
+		ply++
+	}
+	return ply, true
+}
+
+// moveRecordIsAfter reports whether the move record (fen, t, rkey) should
+// be considered strictly more recent than (otherFEN, otherT, otherRkey).
+// This is the atchess-1c9.100 fix: unlike moveIsAfter's generic tiebreak
+// (see its doc comment), a MOVE record's own resultant FEN encodes exactly
+// how many plies of the game had been played to reach it (plyFromFEN) -- a
+// value that is domain-correct and safely comparable across repos
+// regardless of which repo wrote the record or when its TID was minted,
+// because a legal chess game has exactly one move at each ply. This is
+// what actually resolves the bug's concrete example: alice's Qh5 (ply 5)
+// and bob's later Ke7 (ply 8), rkeys "3mtkgxtb22726"/"3mtkgxt76jn2y" --
+// lexicographically the WRONG way round -- now order correctly by ply
+// regardless of TID or which repo each was read from.
+//
+// Every app.atchess.move record ever written has always carried a "fen"
+// field (it predates this fix, and nothing about it changes what gets
+// written), so this applies immediately to LEGACY records with no
+// migration needed: a game wedged by this bug before the fix is unwedged
+// by this function alone, the next time its moves are read.
+//
+// If either FEN cannot be parsed (plyFromFEN fails -- not expected for any
+// record this codebase itself wrote, but a defensive fallback for
+// malformed/legacy data) or the two plies are equal (e.g. a duplicate or
+// forged claim at the same ply -- not the bug this exists to fix, since a
+// legitimate game never produces two distinct move records at one ply),
+// this falls back to moveIsAfter's createdAt+TID tiebreak, so behaviour
+// for whatever residual case reaches it stays exactly as deterministic as
+// before.
+//
+// TRUST NOTE: a malicious repo owner still fully controls what FEN they
+// write into their OWN move record, exactly as today -- deriving ply from
+// that FEN adds NO new trust beyond what getLatestMoveForGame already
+// placed in that same FEN field to determine the game's visible board
+// position (game.FEN = latestMove.FEN). It is not, and does not claim to
+// be, a defense against a malicious PDS operator fabricating an entire
+// fake game history -- nothing in this package validates a full move
+// chain's legality, and doing so would be a separate, larger piece of
+// work (see atchess-1c9.100's report). This only fixes the proven,
+// non-malicious same-second cross-repo tie.
+func moveRecordIsAfter(fen string, t time.Time, rkey string, otherFEN string, otherT time.Time, otherRkey string) bool {
+	ply, ok := plyFromFEN(fen)
+	otherPly, otherOK := plyFromFEN(otherFEN)
+	if ok && otherOK && ply != otherPly {
+		return ply > otherPly
+	}
+	return moveIsAfter(t, rkey, otherT, otherRkey)
 }
 
 // StoredMove represents a move record retrieved from a player's PDS repository.
@@ -1302,7 +1418,7 @@ func (c *Client) getLatestMoveForGame(ctx context.Context, gameURI string, white
 				continue
 			}
 			rkey := recordKey(record.URI)
-			if latest == nil || moveIsAfter(t, rkey, latest.CreatedAt, latest.rkey) {
+			if latest == nil || moveRecordIsAfter(record.Value.FEN, t, rkey, latest.FEN, latest.CreatedAt, latest.rkey) {
 				latest = &moveRecord{
 					FEN:       record.Value.FEN,
 					Checkmate: record.Value.Checkmate,
@@ -1324,8 +1440,15 @@ func (c *Client) getLatestMoveForGame(ctx context.Context, gameURI string, white
 // event is always written into the triggering player's own repo, which may
 // not be the repo that owns the shared (and otherwise possibly stale)
 // app.atchess.game record -- and applies whichever is most recent. at/rkey
-// use the same (createdAt, TID) ordering as moveIsAfter for the same
-// reason moveRecord does: createdAt alone is only second-resolution.
+// feed moveIsAfter's (createdAt, TID) tiebreak, since createdAt alone is
+// only second-resolution: for a checkmate/draw event this constructor
+// value is populated from a moveRecord that was ALREADY correctly ordered
+// by moveRecordIsAfter (see getLatestMoveForGame), so it carries the
+// domain-correct outcome forward even though this struct itself has no
+// FEN to re-derive ply from; for resignation/timeViolation/drawAccept
+// events (which have no board position) moveIsAfter's TID tiebreak is the
+// best available signal -- see its doc comment for exactly what that
+// tiebreak does and does not guarantee (atchess-1c9.100).
 type terminalEvent struct {
 	status chess.GameStatus
 	at     time.Time
