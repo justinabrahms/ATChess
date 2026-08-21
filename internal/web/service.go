@@ -110,7 +110,7 @@ func (s *Service) backfillChallengesOnLogin(ctx context.Context, userDID string)
 	result := s.backfiller.BackfillChallengesForUser(bctx, userDID, s.backfillHostURLs)
 	logEvt := log.Info()
 	for _, h := range result.Hosts {
-		if h.Err != nil || h.Capped {
+		if h.Err != nil || h.Capped || h.IndexErrors > 0 {
 			logEvt = log.Warn()
 		}
 	}
@@ -131,8 +131,18 @@ type loggableHostResult struct {
 	Host            string `json:"host"`
 	ReposScanned    int    `json:"reposScanned"`
 	ChallengesFound int    `json:"challengesFound"`
-	Capped          bool   `json:"capped"`
-	Err             string `json:"err,omitempty"`
+	// IndexErrors mirrors backfill.HostResult.IndexErrors: how many
+	// matching challenges were found on this host but failed to index
+	// into the shared challenge.Store (a nonzero value here means the
+	// backfill's enumeration completed but silently dropped some
+	// challenges at the write step -- see that field's doc comment). This
+	// is the field atchess-1c9.60 exists to surface: without it, an
+	// operator reading this log line cannot distinguish a clean backfill
+	// from one that dropped records, since the only prior signal was a
+	// per-record Warn line that never rolled up into this summary.
+	IndexErrors int    `json:"indexErrors"`
+	Capped      bool   `json:"capped"`
+	Err         string `json:"err,omitempty"`
 }
 
 // loggableHostResults converts hosts into their loggable (string-erred)
@@ -144,6 +154,7 @@ func loggableHostResults(hosts []backfill.HostResult) []loggableHostResult {
 			Host:            h.Host,
 			ReposScanned:    h.ReposScanned,
 			ChallengesFound: h.ChallengesFound,
+			IndexErrors:     h.IndexErrors,
 			Capped:          h.Capped,
 		}
 		if h.Err != nil {

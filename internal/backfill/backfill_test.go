@@ -545,3 +545,88 @@ func TestListChallengesForRepo_PageCapEnforced(t *testing.T) {
 		t.Errorf("listChallengesForRepo: expected an error wrapping errChallengeListPageCapExceeded, got: %v", err)
 	}
 }
+
+// TestBackfillChallengesForUser_IndexErrorsField_ZeroOnCleanBackfill pins
+// the "clean" half of atchess-1c9.60: a backfill that indexes everything
+// successfully must leave IndexErrors at zero, so that field actually
+// distinguishes "indexed everything" from "indexed most of it" (the
+// following test, TestBackfillChallengesForUser_ForcedAddFailure_IncrementsIndexErrorsAndStillCompletes,
+// pins the other half).
+func TestBackfillChallengesForUser_IndexErrorsField_ZeroOnCleanBackfill(t *testing.T) {
+	server := newMockPDS(t, map[string]map[string]map[string]interface{}{
+		aliceDID: {"c1": challengeRecord(aliceDID, bobDID)},
+		carolDID: {"c2": challengeRecord(carolDID, bobDID)},
+	})
+	defer server.Close()
+
+	store := newTestChallengeStore(t)
+	b := New(store, zerolog.Nop())
+
+	result := b.BackfillChallengesForUser(context.Background(), bobDID, []string{wsURLFor(server.URL)})
+
+	if len(result.Hosts) != 1 {
+		t.Fatalf("expected 1 HostResult, got %d", len(result.Hosts))
+	}
+	hr := result.Hosts[0]
+	if hr.ChallengesFound != 2 {
+		t.Fatalf("expected 2 challenges found, got %d (hosts: %+v)", hr.ChallengesFound, result.Hosts)
+	}
+	if hr.IndexErrors != 0 {
+		t.Errorf("IndexErrors = %d, want 0 on a clean backfill", hr.IndexErrors)
+	}
+}
+
+// TestBackfillChallengesForUser_ForcedAddFailure_IncrementsIndexErrorsAndStillCompletes
+// is the forced-failure half of atchess-1c9.60. It forces a REAL
+// challenge.Store.Add failure -- not a hand-rolled double -- by closing
+// the store's underlying *sql.DB before the backfill runs, so every Add
+// call hits database/sql's genuine "sql: database is closed"
+// (sql.ErrConnDone) error, mirroring the store's own
+// TestStore_AddErrorSurfaces/TestStore_QueryErrorSurfaces pattern of
+// forcing an actual SQLite-layer failure rather than simulating one.
+//
+// Two repos are seeded so the test can prove BOTH halves the bead calls
+// out: the count increments (IndexErrors == 2, one per repo's matching
+// challenge) AND the backfill still completes rather than aborting after
+// the first failure (ReposScanned == 2: the second repo was scanned too,
+// not skipped because the first repo's Add call failed).
+func TestBackfillChallengesForUser_ForcedAddFailure_IncrementsIndexErrorsAndStillCompletes(t *testing.T) {
+	server := newMockPDS(t, map[string]map[string]map[string]interface{}{
+		aliceDID: {"c1": challengeRecord(aliceDID, bobDID)},
+		carolDID: {"c2": challengeRecord(carolDID, bobDID)},
+	})
+	defer server.Close()
+
+	store := newTestChallengeStore(t)
+	if err := store.Close(); err != nil {
+		t.Fatalf("Close (forcing subsequent Add calls to fail): %v", err)
+	}
+
+	b := New(store, zerolog.Nop())
+	result := b.BackfillChallengesForUser(context.Background(), bobDID, []string{wsURLFor(server.URL)})
+
+	if len(result.Hosts) != 1 {
+		t.Fatalf("expected 1 HostResult, got %d", len(result.Hosts))
+	}
+	hr := result.Hosts[0]
+
+	// Completion: the enumeration was not aborted by the first Add
+	// failure -- both repos on this host were scanned.
+	if hr.ReposScanned != 2 {
+		t.Fatalf("ReposScanned = %d, want 2 (a per-record Add failure must not abort scanning the rest of the host)", hr.ReposScanned)
+	}
+	if hr.Err != nil {
+		t.Errorf("hr.Err = %v, want nil (a per-record Add failure must not be promoted to a host-level error)", hr.Err)
+	}
+
+	// The count: both matching challenges failed to index.
+	if hr.IndexErrors != 2 {
+		t.Errorf("IndexErrors = %d, want 2", hr.IndexErrors)
+	}
+	if hr.ChallengesFound != 0 {
+		t.Errorf("ChallengesFound = %d, want 0 (nothing actually indexed)", hr.ChallengesFound)
+	}
+	if result.TotalFound() != 0 {
+		t.Errorf("TotalFound() = %d, want 0", result.TotalFound())
+	}
+}

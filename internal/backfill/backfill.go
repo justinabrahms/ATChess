@@ -161,6 +161,20 @@ type HostResult struct {
 	// challenge.Store) challenges addressed to the target user were
 	// discovered on this host.
 	ChallengesFound int
+	// IndexErrors is how many matching challenges were found on this host
+	// but FAILED to index into the shared challenge.Store (the
+	// b.store.Add failure path in backfillHost) -- distinct from
+	// ChallengesFound, which only counts successful inserts. This does
+	// NOT abort the enumeration (see backfillHost's Add-failure comment:
+	// one bad record must not kill an otherwise good backfill) and does
+	// NOT set Err -- a nonzero IndexErrors can coexist with a nil Err and
+	// Capped=false, i.e. a host whose repo scan and enumeration completed
+	// cleanly can still have silently dropped some challenges at the
+	// store-write step. Like ReposScanned and ChallengesFound, it counts
+	// only what was actually attempted before this host's scan stopped,
+	// so when Err is set or Capped is true it undercounts the failures a
+	// host WOULD have hit had scanning continued.
+	IndexErrors int
 	// Capped is true if Host had more repos than defaultMaxReposPerHost
 	// and enumeration was stopped early -- see the package doc comment.
 	// ReposScanned in that case is the (partial) number actually checked,
@@ -328,6 +342,7 @@ func (b *Backfiller) backfillHost(ctx context.Context, base, userDID string) Hos
 				// ingestion paths (firehose, a future backfill run) can
 				// still repair.
 				b.logger.Warn().Err(err).Str("host", base).Str("repo", repoDID).Str("uri", pc.ChallengeURI).Msg("login backfill: failed to index challenge into store")
+				hr.IndexErrors++
 				continue
 			}
 			if added {
