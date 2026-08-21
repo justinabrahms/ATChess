@@ -181,6 +181,11 @@ func (m *raceMockPDS) seed(repo, collection, rkey string, value map[string]inter
 func (m *raceMockPDS) newRkey() string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	return m.newRkeyLocked()
+}
+
+// newRkeyLocked is newRkey's body, for callers that already hold m.mu.
+func (m *raceMockPDS) newRkeyLocked() string {
 	m.rkeyN++
 	return fmt.Sprintf("rkey%d", m.rkeyN)
 }
@@ -245,8 +250,36 @@ func (m *raceMockPDS) handle(w http.ResponseWriter, r *http.Request) {
 		repo, _ := req["repo"].(string)
 		collection, _ := req["collection"].(string)
 		record, _ := req["record"].(map[string]interface{})
-		rkey := m.newRkey()
+		// Honor an explicit rkey if the caller supplied one (RecordMove's
+		// deterministic move rkey, atchess-1c9.113); otherwise mint one,
+		// exactly as a real PDS assigns a TID when rkey is omitted.
+		explicitRkey, hasExplicitRkey := req["rkey"].(string)
+
+		if m.gate != nil && collection == m.gateCollection {
+			m.gate.arrive()
+		}
+
 		m.mu.Lock()
+		defer m.mu.Unlock()
+
+		rkey := explicitRkey
+		if !hasExplicitRkey || rkey == "" {
+			rkey = m.newRkeyLocked()
+		} else if m.records[repo] != nil && m.records[repo][collection] != nil && m.records[repo][collection][rkey] != nil {
+			// A real PDS was verified live (atchess-1c9.113) to reject a
+			// createRecord whose explicit rkey already exists with a bare,
+			// non-distinguishing HTTP 500 -- no structured "already
+			// exists" error, and the existing record is NOT overwritten.
+			// Reproduce that exactly, rather than silently overwriting.
+			// Deliberately NOT prefixed "createRecord" -- callers count
+			// successful writes via strings.HasPrefix(c, "createRecord"),
+			// and a rejected collision must never be miscounted as one.
+			m.writeCalls = append(m.writeCalls, fmt.Sprintf("rejectedCreateRecord(rkey collision) repo=%s collection=%s rkey=%s", repo, collection, rkey))
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(map[string]string{"error": "InternalServerError", "message": "Internal Server Error"})
+			return
+		}
+
 		if m.records[repo] == nil {
 			m.records[repo] = map[string]map[string]*raceRecord{}
 		}
@@ -257,7 +290,6 @@ func (m *raceMockPDS) handle(w http.ResponseWriter, r *http.Request) {
 		cid := fmt.Sprintf("cid-%s-v%d", rkey, m.verN)
 		m.records[repo][collection][rkey] = &raceRecord{cid: cid, value: record}
 		m.writeCalls = append(m.writeCalls, fmt.Sprintf("createRecord repo=%s collection=%s rkey=%s", repo, collection, rkey))
-		m.mu.Unlock()
 		_ = json.NewEncoder(w).Encode(map[string]interface{}{
 			"uri": fmt.Sprintf("at://%s/%s/%s", repo, collection, rkey),
 			"cid": cid,
@@ -506,6 +538,161 @@ func TestMakeMoveHandler_ConcurrentMove_SamePlayerTwice_ExactlyOneSucceeds(t *te
 	mock.mu.Unlock()
 	if moveCreates != 1 {
 		t.Errorf("expected exactly 1 move record created despite both submissions reaching RecordMove, got %d (writeCalls=%v)", moveCreates, writeCalls)
+	}
+}
+
+// TestMakeMoveHandler_ConcurrentMove_SamePlayerTwice_NonOwner_ExactlyOneSucceeds
+// is the atchess-1c9.113 headline regression test, and the reviewer's exact
+// repro during atchess-1c9.112: TestMakeMoveHandler_ConcurrentMove_
+// SamePlayerTwice_ExactlyOneSucceeds above seeds the game record in the
+// MOVER's own repo (playerDID), so it only ever exercises the OWNER side of
+// RecordMove -- the CAS-protected "if repo == c.did" block. This test seeds
+// the identical scenario (same player, two different moves for one turn,
+// submitted concurrently) but with the game record living in the
+// OPPONENT's repo instead, so playerDID never owns it and RecordMove's CAS
+// never runs at all. Before atchess-1c9.113's deterministic move rkey, this
+// produced codes=[200 200] and two move records for one turn.
+func TestMakeMoveHandler_ConcurrentMove_SamePlayerTwice_NonOwner_ExactlyOneSucceeds(t *testing.T) {
+	const playerDID = "did:plc:player"
+	const opponentDID = "did:plc:opponent"
+
+	mock := newRaceMockPDS(t)
+	srv := mock.server()
+	defer srv.Close()
+	mock.setBaseURL(srv.URL)
+	mock.gate = newRoundGate(t, 2)
+	mock.gateCollection = "app.atchess.game"
+
+	const gameRkey = "game1"
+	// Seeded under opponentDID, NOT playerDID: playerDID (the mover) is
+	// the non-owner of this game record.
+	mock.seed(opponentDID, "app.atchess.game", gameRkey, map[string]interface{}{
+		"$type":     "app.atchess.game",
+		"createdAt": time.Now().Format(time.RFC3339),
+		"white":     playerDID,
+		"black":     opponentDID,
+		"status":    "active",
+		"fen":       "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+		"pgn":       "",
+	})
+	gameURI := fmt.Sprintf("at://%s/app.atchess.game/%s", opponentDID, gameRkey)
+
+	svc := &Service{
+		config:         &config.Config{ATProto: config.ATProtoConfig{PLCDirectoryURL: srv.URL}},
+		challengeStore: newTestChallengeStore(t),
+	}
+
+	session := newRaceSession(playerDID, "player.test", srv.URL)
+
+	var wg sync.WaitGroup
+	codes := make([]int, 2)
+	bodies := make([]string, 2)
+	wg.Add(2)
+	go func() { defer wg.Done(); codes[0], bodies[0] = doMakeMove(svc, session, gameURI, "e2", "e4") }()
+	go func() { defer wg.Done(); codes[1], bodies[1] = doMakeMove(svc, session, gameURI, "d2", "d4") }()
+	wg.Wait()
+
+	var successes, failures int
+	for i, c := range codes {
+		switch c {
+		case http.StatusOK:
+			successes++
+		case http.StatusConflict:
+			// atchess-1c9.113: the move record's deterministic (game, ply)
+			// rkey collided with a DIFFERENT move at the same ply --
+			// ErrMoveRecordConflict, mapped to 409 exactly like
+			// ErrGameRecordConflict.
+			failures++
+			if !strings.Contains(bodies[i], "Failed to record move") {
+				t.Errorf("expected failure body to say 'Failed to record move', got: %s", bodies[i])
+			}
+		default:
+			t.Errorf("unexpected status %d: %s", c, bodies[i])
+		}
+	}
+	if successes != 1 || failures != 1 {
+		t.Fatalf("expected exactly 1 success and 1 failure (move-record conflict), got codes=%v bodies=%v", codes, bodies)
+	}
+
+	mock.mu.Lock()
+	var moveCreates int
+	for _, c := range mock.writeCalls {
+		if strings.HasPrefix(c, "createRecord") && strings.Contains(c, "collection=app.atchess.move") {
+			moveCreates++
+			if !strings.Contains(c, "repo="+playerDID) {
+				t.Errorf("expected the sole move record to be in the mover's (playerDID's) repo, got: %s", c)
+			}
+		}
+	}
+	writeCalls := append([]string(nil), mock.writeCalls...)
+	mock.mu.Unlock()
+	if moveCreates != 1 {
+		t.Errorf("expected exactly 1 move record created for the non-owner despite both submissions reaching RecordMove, got %d (writeCalls=%v)", moveCreates, writeCalls)
+	}
+}
+
+// TestMakeMoveHandler_ConcurrentMove_SamePlayerTwice_NonOwner_IdenticalRetry_Idempotent
+// covers the OTHER half of atchess-1c9.113's fix: a double-click or a
+// client retrying a request whose response was dropped submits the SAME
+// move twice, not two different ones. Unlike the "two different moves"
+// case above (which must yield exactly one success and one 409 conflict),
+// an identical resubmission must be treated as an idempotent success --
+// both requests report success, and still exactly one move record exists.
+func TestMakeMoveHandler_ConcurrentMove_SamePlayerTwice_NonOwner_IdenticalRetry_Idempotent(t *testing.T) {
+	const playerDID = "did:plc:player"
+	const opponentDID = "did:plc:opponent"
+
+	mock := newRaceMockPDS(t)
+	srv := mock.server()
+	defer srv.Close()
+	mock.setBaseURL(srv.URL)
+	mock.gate = newRoundGate(t, 2)
+	mock.gateCollection = "app.atchess.game"
+
+	const gameRkey = "game1"
+	mock.seed(opponentDID, "app.atchess.game", gameRkey, map[string]interface{}{
+		"$type":     "app.atchess.game",
+		"createdAt": time.Now().Format(time.RFC3339),
+		"white":     playerDID,
+		"black":     opponentDID,
+		"status":    "active",
+		"fen":       "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+		"pgn":       "",
+	})
+	gameURI := fmt.Sprintf("at://%s/app.atchess.game/%s", opponentDID, gameRkey)
+
+	svc := &Service{
+		config:         &config.Config{ATProto: config.ATProtoConfig{PLCDirectoryURL: srv.URL}},
+		challengeStore: newTestChallengeStore(t),
+	}
+
+	session := newRaceSession(playerDID, "player.test", srv.URL)
+
+	var wg sync.WaitGroup
+	codes := make([]int, 2)
+	bodies := make([]string, 2)
+	wg.Add(2)
+	go func() { defer wg.Done(); codes[0], bodies[0] = doMakeMove(svc, session, gameURI, "e2", "e4") }()
+	go func() { defer wg.Done(); codes[1], bodies[1] = doMakeMove(svc, session, gameURI, "e2", "e4") }()
+	wg.Wait()
+
+	for i, c := range codes {
+		if c != http.StatusOK {
+			t.Errorf("expected an identical-move retry to be idempotently accepted with HTTP 200, got %d: %s", c, bodies[i])
+		}
+	}
+
+	mock.mu.Lock()
+	var moveCreates int
+	for _, c := range mock.writeCalls {
+		if strings.HasPrefix(c, "createRecord") && strings.Contains(c, "collection=app.atchess.move") {
+			moveCreates++
+		}
+	}
+	writeCalls := append([]string(nil), mock.writeCalls...)
+	mock.mu.Unlock()
+	if moveCreates != 1 {
+		t.Errorf("expected exactly 1 move record created for two identical concurrent submissions, got %d (writeCalls=%v)", moveCreates, writeCalls)
 	}
 }
 

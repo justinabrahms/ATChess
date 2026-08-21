@@ -386,6 +386,18 @@ func (s *Service) MakeMoveHandler(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Failed to record move: conflicts with a concurrent update, refresh and retry", http.StatusConflict)
 			return
 		}
+		if errors.Is(err, atproto.ErrMoveRecordConflict) {
+			// The move record's deterministic (game, ply) rkey collided
+			// with a DIFFERENT move already recorded at that ply -- the
+			// same player double-submitted two different moves for the
+			// one turn they were entitled to make, and this one lost
+			// (atchess-1c9.113). Same client-facing treatment as
+			// ErrGameRecordConflict above: a conflict to retry against
+			// fresh state, not a server fault.
+			log.Warn().Err(err).Str("gameID", gameID).Msg("Move record conflict: a different move already exists at this game's next ply")
+			http.Error(w, "Failed to record move: conflicts with a concurrent update, refresh and retry", http.StatusConflict)
+			return
+		}
 		log.Error().Err(err).Str("gameID", gameID).Msg("Failed to record move")
 		http.Error(w, "Failed to record move", http.StatusInternalServerError)
 		return

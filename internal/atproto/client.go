@@ -13,6 +13,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -134,6 +135,25 @@ var ErrChallengeChallengerForged = errors.New("challenge record's challenger fie
 // failure fails closed toward "server error" rather than toward "just
 // retry" and silently swallowing a genuine outage.
 var ErrGameRecordConflict = errors.New("game record update conflict: the game record was updated by another write first")
+
+// ErrMoveRecordConflict indicates RecordMove's move-record createRecord
+// (see moveRkeyForPly) collided at its deterministic (game, ply) rkey with
+// an EXISTING move record whose content genuinely differs from the move
+// being written now (see moveRecordContentEqual) -- i.e. two different
+// legal moves computed the same ply, which only happens when the same
+// player double-submits two different moves for the one turn they are
+// entitled to make (atchess-1c9.113). This is deliberately distinct from
+// the ordinary "identical retry" case (a double-click / dropped-response
+// retry of the SAME move), which RecordMove treats as an idempotent
+// success and never surfaces as an error at all -- see RecordMove's doc
+// comment. A live PDS probe (atchess-1c9.113) found that a colliding
+// createRecord with an explicit rkey returns a bare, non-distinguishing
+// HTTP 500 ({"error":"InternalServerError"}) rather than any structured
+// "already exists" signal, so this is detected by a read-back
+// (getRecordByURI) after the failure, NOT from the createRecord response
+// body itself -- unlike ErrGameRecordConflict's isInvalidSwapBody, which
+// can trust the PDS's own error shape.
+var ErrMoveRecordConflict = errors.New("move record conflict: a different move already exists at this game's next ply")
 
 // isInvalidSwapBody reports whether an AT Protocol error response body
 // carries a structured "error" field indicating a failed
@@ -939,7 +959,29 @@ func (c *Client) RecordMove(ctx context.Context, gameURI string, move *chess.Mov
 		}
 	}
 
-	// CAS succeeded (or game is in opponent's repo) — now create the move record.
+	// CAS succeeded (or game is in opponent's repo) — now create the move
+	// record. Its rkey is DETERMINISTIC, derived from (gameURI, ply) via
+	// moveRkeyForPly rather than left to the PDS's server-generated TID --
+	// this is what actually protects a same-player double-submit when the
+	// game record above was NOT CAS-protected (repo != c.did, i.e. the
+	// mover does not own the game record; atchess-1c9.113). A legal chess
+	// game has exactly one move at each ply, so two createRecord calls for
+	// the SAME move collide at the SAME rkey, while every other move in
+	// the same game gets a distinct rkey (see moveRkeyForPly's doc
+	// comment). See the collision-handling block below for what happens
+	// when that collision actually occurs.
+	ply, plyOK := plyFromFEN(move.FEN)
+	if !plyOK {
+		// Not expected in practice: move.FEN is always the notnil/chess
+		// engine's own freshly-rendered Position.String(), which is
+		// always a well-formed 6-field FEN (see internal/chess.Engine.
+		// MakeMove). Fail closed rather than fall back to a
+		// server-generated rkey, which would silently reintroduce the
+		// exact bug this exists to fix.
+		return fmt.Errorf("failed to derive ply from move's resultant FEN %q for game %s: cannot compute a deterministic move rkey", move.FEN, gameURI)
+	}
+	moveRkey := moveRkeyForPly(gameURI, ply)
+
 	moveRecord := map[string]interface{}{
 		"$type":     "app.atchess.move",
 		"createdAt": time.Now().Format(time.RFC3339),
@@ -967,6 +1009,7 @@ func (c *Client) RecordMove(ctx context.Context, gameURI string, move *chess.Mov
 	createReq := map[string]interface{}{
 		"repo":       c.did,
 		"collection": "app.atchess.move",
+		"rkey":       moveRkey,
 		"record":     moveRecord,
 	}
 
@@ -978,7 +1021,40 @@ func (c *Client) RecordMove(ctx context.Context, gameURI string, move *chess.Mov
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("failed to create move record: HTTP %d", resp.StatusCode)
+		body, _ := io.ReadAll(resp.Body)
+
+		// A colliding createRecord at an already-occupied rkey was
+		// verified live (atchess-1c9.113) to return a bare, non-
+		// distinguishing HTTP 500 with no structured "already exists"
+		// signal in the body -- unlike putRecord's InvalidSwap, there is
+		// no response-body shape to trust here. So instead of trying to
+		// classify the failure from this response, read back whatever
+		// record actually landed at moveRkey in OUR OWN repo (c.did is
+		// always where this create just targeted) and compare it against
+		// the move being written now:
+		//
+		//   - matches (ignoring createdAt, which legitimately differs
+		//     between two submissions of the same logical move) => this
+		//     was a double-click / retried-request resubmission of the
+		//     SAME move that already succeeded once; treat it as an
+		//     idempotent success rather than an error.
+		//   - present but does NOT match => two DIFFERENT moves computed
+		//     the same ply, which only happens when the same player
+		//     double-submits two different moves for one turn; exactly
+		//     one of them may stand, and this one lost -- ErrMoveRecordConflict.
+		//   - the read-back itself fails (network error, genuinely absent
+		//     despite the create failing, etc.) => cannot tell what
+		//     happened; fail closed with the original ambiguous failure
+		//     rather than guess.
+		moveURI := fmt.Sprintf("at://%s/app.atchess.move/%s", c.did, moveRkey)
+		if _, existing, rerr := c.getRecordByURI(ctx, moveURI); rerr == nil {
+			if moveRecordContentEqual(existing, moveRecord) {
+				return nil
+			}
+			return fmt.Errorf("%w: game %s ply %d: HTTP %d, body: %s", ErrMoveRecordConflict, gameURI, ply, resp.StatusCode, string(body))
+		}
+
+		return fmt.Errorf("failed to create move record: HTTP %d, body: %s", resp.StatusCode, string(body))
 	}
 
 	return nil
@@ -1322,6 +1398,84 @@ func plyFromFEN(fen string) (ply int, ok bool) {
 		ply++
 	}
 	return ply, true
+}
+
+// moveRkeyForPly derives a deterministic rkey for a move record from the
+// game it belongs to (gameURI) and the ply it represents (plyFromFEN),
+// exactly mirroring generateGameID's own hash-then-base32 construction
+// above (see its doc comment). Two properties this must hold, both of
+// which the hash gives for free:
+//
+//   - DETERMINISTIC for the SAME move: two createRecord calls writing the
+//     same logical move (a double-click, or a client retrying a request
+//     whose response was dropped) always hash the same (gameURI, ply)
+//     input and land on the same rkey, so the second collides at the PDS
+//     instead of minting a second, independent move record. This is what
+//     actually closes atchess-1c9.113: the game record's CAS
+//     (RecordMove's "if repo == c.did" block above) only ever protects
+//     the game OWNER's writes, but every move -- owner or not -- goes
+//     through this rkey.
+//   - DISTINCT across different moves in the same game: gameURI is fixed
+//     per game and a legal chess game has exactly one move at each ply
+//     (see moveRecordIsAfter's doc comment for the same fact used
+//     elsewhere), so hashing in ply gives every move its own rkey. The
+//     one case where two DIFFERENT moves hash to the SAME rkey is exactly
+//     the other half of atchess-1c9.113's bug: the same player
+//     double-submitting two DIFFERENT moves for the one ply they are
+//     entitled to play -- that collision is deliberate, not a defect (see
+//     RecordMove's post-failure read-back and ErrMoveRecordConflict).
+//
+// The input hashed is the full gameURI (not just its rkey) so that two
+// games which happen to share an rkey on different repos -- or a
+// malformed/adversarial gameURI, see atchess-1c9.92's note that
+// proposedGameId is not syntax-checked -- can never collide with each
+// other; hashing also means the OUTPUT is always drawn from a fixed,
+// syntactically-safe alphabet regardless of what characters gameURI
+// itself contains, exactly as generateGameID already relies on for game
+// rkeys.
+//
+// The output is always valid AT Protocol record-key syntax
+// ([a-zA-Z0-9._:~-]{1,512}, never "." or ".."): "mv" followed by 11
+// lowercase base32 characters (alphabet "a-z2-7"), all of which are
+// within that set.
+func moveRkeyForPly(gameURI string, ply int) string {
+	input := fmt.Sprintf("%s:%d", gameURI, ply)
+	hash := sha256.Sum256([]byte(input))
+	encoder := base32.StdEncoding.WithPadding(base32.NoPadding)
+	encoded := strings.ToLower(encoder.EncodeToString(hash[:8]))
+	return "mv" + encoded[:11]
+}
+
+// moveRecordContentEqual reports whether two app.atchess.move record
+// values describe the SAME logical move, ignoring "createdAt" -- the one
+// field that legitimately differs between two createRecord submissions of
+// what is otherwise the identical move (a double-click, or a client retry
+// after a dropped response, each stamps its own request-time timestamp).
+// Used by RecordMove's post-collision read-back to tell an idempotent
+// resubmission of the SAME move (safe to treat as success) apart from a
+// genuine collision between two DIFFERENT moves at the same ply
+// (ErrMoveRecordConflict) -- see moveRkeyForPly's doc comment for why that
+// second case can happen at all.
+//
+// Every OTHER field is compared for exact equality, deliberately including
+// the nested "game" strongRef (uri+cid): if the game record's cid embedded
+// in the two submissions differs, they were not actually resubmissions of
+// the same request against the same observed game state, and must not be
+// folded together silently.
+func moveRecordContentEqual(a, b map[string]interface{}) bool {
+	fields := []string{"$type", "player", "from", "to", "san", "fen", "check", "checkmate", "draw"}
+	for _, f := range fields {
+		if !reflect.DeepEqual(a[f], b[f]) {
+			return false
+		}
+	}
+
+	aGame, _ := a["game"].(map[string]interface{})
+	bGame, _ := b["game"].(map[string]interface{})
+	if aGame == nil || bGame == nil {
+		return aGame == nil && bGame == nil
+	}
+	return reflect.DeepEqual(aGame["uri"], bGame["uri"]) && reflect.DeepEqual(aGame["cid"], bGame["cid"])
 }
 
 // moveRecordIsAfter reports whether the move record (fen, t, rkey) should
