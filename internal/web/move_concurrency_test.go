@@ -340,6 +340,54 @@ func (m *raceMockPDS) handle(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// TestRaceMockPDS_SwapRecordMismatch_EmitsExactInvalidSwapString is
+// atchess-1c9.114 item 4/atchess-1c9.112's minor follow-up: pin
+// raceMockPDS's own swapRecord-mismatch error string to be EXACTLY
+// "InvalidSwap" (not merely something isInvalidSwapBody's prefix match
+// happens to accept, e.g. the fictional "InvalidSwapError" this mock used
+// to emit before atchess-1c9.112 fixed it -- see internal/atproto's
+// invalid_swap_body_test.go, whose "InvalidSwapError" case exists ONLY to
+// document that historical drift, not because any real server or mock
+// still emits it). This is checked directly against raceMockPDS's raw HTTP
+// response, independent of isInvalidSwapBody's leniency, so the mock
+// cannot silently drift back to that fiction and still pass every other
+// test here (which only ever exercises it through isInvalidSwapBody's
+// prefix match).
+func TestRaceMockPDS_SwapRecordMismatch_EmitsExactInvalidSwapString(t *testing.T) {
+	mock := newRaceMockPDS(t)
+	srv := mock.server()
+	defer srv.Close()
+	mock.setBaseURL(srv.URL)
+
+	const repo = "did:plc:swapstringtest"
+	const rkey = "rkey1"
+	mock.seed(repo, "app.atchess.game", rkey, map[string]interface{}{"$type": "app.atchess.game"})
+
+	body, _ := json.Marshal(map[string]interface{}{
+		"repo":       repo,
+		"collection": "app.atchess.game",
+		"rkey":       rkey,
+		"record":     map[string]interface{}{"$type": "app.atchess.game"},
+		"swapRecord": "definitely-not-the-current-cid",
+	})
+	resp, err := http.Post(srv.URL+"/xrpc/com.atproto.repo.putRecord", "application/json", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("putRecord request to raceMockPDS failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var decoded struct {
+		Error   string `json:"error"`
+		Message string `json:"message"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&decoded); err != nil {
+		t.Fatalf("failed to decode raceMockPDS's swapRecord-mismatch response: %v", err)
+	}
+	if decoded.Error != "InvalidSwap" {
+		t.Errorf("raceMockPDS's swapRecord-mismatch error field = %q, want exactly %q (a live PDS's verified wire format, atchess-1c9.112) -- not merely something isInvalidSwapBody's prefix match happens to accept", decoded.Error, "InvalidSwap")
+	}
+}
+
 func newRaceSession(did, handle, pdsURL string) *oauth.Session {
 	return &oauth.Session{
 		DID:                  did,
@@ -365,22 +413,37 @@ func doMakeMove(svc *Service, session *oauth.Session, gameURI, from, to string) 
 	return w.Code, w.Body.String()
 }
 
-// TestMakeMoveHandler_ConcurrentMove_TwoPlayers_ExactlyOneSucceeds is a
-// regression test for atchess-1c9.74 item 2: when white and black submit
-// moves to the SAME game simultaneously, only whoever's turn it actually
-// is may succeed; the other must be rejected, and only one move record
-// may be written. Both players submit the identical from/to ("e2"->"e4")
-// deliberately: it is a legal move for white, so if the "is it your
-// turn" gate were ever bypassed, black's identical request would also
-// succeed (the notnil/chess engine has no notion of which HTTP caller is
-// asking) -- making the guard's absence unambiguous rather than merely
-// producing a different error class.
+// TestMakeMoveHandler_ConcurrentMove_TwoPlayers_GuardedByTurnGateNotCAS_ExactlyOneSucceeds
+// is a regression test for atchess-1c9.74 item 2: when white and black
+// submit moves to the SAME game simultaneously, only whoever's turn it
+// actually is may succeed; the other must be rejected, and only one move
+// record may be written. Both players submit the identical from/to
+// ("e2"->"e4") deliberately: it is a legal move for white, so if the "is
+// it your turn" gate were ever bypassed, black's identical request would
+// also succeed (the notnil/chess engine has no notion of which HTTP
+// caller is asking) -- making the guard's absence unambiguous rather than
+// merely producing a different error class.
+//
+// atchess-1c9.114 (this test's NAME, previously just
+// "...TwoPlayers_ExactlyOneSucceeds", did not say so): what actually makes
+// "exactly one move record" true here is MakeMoveHandler's "is it your
+// turn" GATE (internal/web/service.go), evaluated BEFORE RecordMove is
+// ever called -- NOT internal/atproto/client.go's RecordMove
+// compare-and-swap (swapRecord). Black's request is rejected with 403 at
+// the turn gate and never reaches RecordMove at all, so this test can
+// never observe a CAS regression: atchess-1c9.112's review proved this by
+// mutation -- deleting RecordMove's "swapRecord" entirely still leaves
+// this test green. The test that actually exercises and would catch a CAS
+// regression is TestMakeMoveHandler_ConcurrentMove_SamePlayerTwice_
+// ExactlyOneSucceeds below (same player, same simultaneously-read
+// snapshot, so BOTH requests pass the turn gate and the game record's CAS
+// is the only thing left to decide the winner).
 //
 // A callGate forces both goroutines' initial game-record reads (inside
 // MakeMoveHandler's client.GetGame call) to happen simultaneously, so
 // this is deterministic on every run: neither goroutine can ever observe
 // the other's already-applied move before making its own turn decision.
-func TestMakeMoveHandler_ConcurrentMove_TwoPlayers_ExactlyOneSucceeds(t *testing.T) {
+func TestMakeMoveHandler_ConcurrentMove_TwoPlayers_GuardedByTurnGateNotCAS_ExactlyOneSucceeds(t *testing.T) {
 	const whiteDID = "did:plc:white"
 	const blackDID = "did:plc:black"
 

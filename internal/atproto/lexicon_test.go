@@ -423,6 +423,20 @@ func writeJSON(w http.ResponseWriter, v interface{}) {
 // write is left intact, not silently overwritten. This fake used to
 // overwrite unconditionally regardless of isCreate, diverging from that
 // (atchess-1c9.115 item 3, the fourth such divergence found this run).
+//
+// putRecord additionally enforces "swapRecord" -- a real PDS's compare-
+// and-swap parameter -- for real: a putRecord that supplies swapRecord and
+// whose value does not match the record's CURRENT cid (including the case
+// where no record exists there yet at all) is rejected with the same
+// "InvalidSwap"-prefixed error body internal/atproto/client.go's
+// isInvalidSwapBody looks for, exactly as a live PDS was verified
+// (atchess-1c9.112) to respond. Before atchess-1c9.114, this fake accepted
+// every putRecord unconditionally regardless of swapRecord, which is the
+// same class of divergence atchess-1c9.112 found in raceMockPDS
+// (internal/web/move_concurrency_test.go) before that bead fixed it: a test
+// double silently implementing a laxer contract than the real server,
+// which could hide a missing/broken CAS in the client exactly the way
+// raceMockPDS's now-fixed swapCid defect once did.
 func (p *fakePDS) handleWrite(w http.ResponseWriter, r *http.Request, isCreate bool) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
@@ -434,6 +448,7 @@ func (p *fakePDS) handleWrite(w http.ResponseWriter, r *http.Request, isCreate b
 		Collection string                 `json:"collection"`
 		RKey       string                 `json:"rkey"`
 		Record     map[string]interface{} `json:"record"`
+		SwapRecord *string                `json:"swapRecord"`
 	}
 	if err := json.Unmarshal(body, &req); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
@@ -455,6 +470,19 @@ func (p *fakePDS) handleWrite(w http.ResponseWriter, r *http.Request, isCreate b
 			p.mu.Unlock()
 			w.WriteHeader(http.StatusInternalServerError)
 			writeJSON(w, map[string]interface{}{"error": "InternalServerError", "message": "Internal Server Error"})
+			return
+		}
+	} else if req.SwapRecord != nil {
+		// putRecord's real compare-and-swap: the caller's swapRecord must
+		// match the record's CURRENT cid, whether or not one already
+		// exists at rkey. A stale (or altogether absent) cid is rejected,
+		// and -- critically -- the existing record is left untouched, not
+		// overwritten.
+		cur := p.records[req.Collection][rkey]
+		if cur == nil || cur.cid != *req.SwapRecord {
+			p.mu.Unlock()
+			w.WriteHeader(http.StatusBadRequest)
+			writeJSON(w, map[string]interface{}{"error": "InvalidSwap", "message": "record was concurrently updated"})
 			return
 		}
 	}
