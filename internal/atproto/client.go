@@ -3003,7 +3003,17 @@ func (c *Client) getLastMove(ctx context.Context, gameID string, excludePlayerDI
 
 		// Find the most recent move for this game
 		for _, record := range listResp.Records {
-			if record.Value.Game.URI == gameID && record.Value.Player != excludePlayerDID {
+			if record.Value.Game.URI != gameID {
+				continue
+			}
+			if record.Value.Player != playerDID {
+				log.Warn().Str("gameURI", gameID).Str("repo", playerDID).
+					Str("claimedPlayer", record.Value.Player).
+					Str("recordURI", record.URI).
+					Msg("ignoring forged move record: repo owner is not the player it names as mover")
+				continue
+			}
+			if record.Value.Player != excludePlayerDID {
 				moveTime, err := time.Parse(time.RFC3339, record.Value.CreatedAt)
 				if err != nil {
 					continue
