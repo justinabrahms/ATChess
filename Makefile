@@ -86,16 +86,19 @@ test-local-down:
 #   local mode -- only PDS_DID_PLC_URL differs.
 #
 # Both modes below also call scripts/check-dual-pds-mode.sh (atchess-1c9.22)
-# before bringing anything up, and again to stamp a marker right after:
-# switching modes with volumes intact would otherwise let
-# create-dual-pds-accounts.sh's idempotent re-use path silently carry one
-# mode's DIDs into the other mode's account file. See that script's header
-# comment for the full rationale, including why the marker lives inside the
-# pds-alice-data volume rather than in the repo or a container label.
+# as their very first step -- before ensure-dual-pds-hosts.sh, before
+# `mkdir -p certs/dual-pds`, before bringing anything up -- and again to
+# stamp a marker on both PDS volumes right after (atchess-1c9.79): switching
+# modes with volumes intact would otherwise let create-dual-pds-accounts.
+# sh's idempotent re-use path silently carry one mode's DIDs into the other
+# mode's account file. Running the check first means a refusal touches
+# nothing at all. See that script's header comment for the full rationale,
+# including why the markers live inside the pds-alice-data/pds-bob-data
+# volumes rather than in the repo or a container label.
 test-federation-up:
+	./scripts/check-dual-pds-mode.sh local check
 	./scripts/ensure-dual-pds-hosts.sh
 	mkdir -p certs/dual-pds
-	./scripts/check-dual-pds-mode.sh local check
 	docker compose -f docker-compose.dual-pds.yml up -d
 	# Local mode never wants the CI-only hermetic did:plc service running
 	# (atchess-1c9.22): if volumes/containers from a prior CI-mode run are
@@ -108,9 +111,9 @@ test-federation-up:
 	./scripts/create-dual-pds-accounts.sh
 
 test-federation-up-ci:
+	./scripts/check-dual-pds-mode.sh ci check
 	./scripts/ensure-dual-pds-hosts.sh
 	mkdir -p certs/dual-pds
-	./scripts/check-dual-pds-mode.sh ci check
 	docker compose -f docker-compose.dual-pds.yml --profile ci up -d --wait local-plc
 	ATCHESS_PLC_URL=http://local-plc:2582 docker compose -f docker-compose.dual-pds.yml --profile ci up -d
 	./scripts/check-dual-pds-mode.sh ci stamp
