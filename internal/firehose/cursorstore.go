@@ -92,24 +92,44 @@ func NewCursorStore(stateDir string, logger zerolog.Logger) (*CursorStore, error
 		return nil, fmt.Errorf("reading firehose cursor state file %s: %w", s.path, err)
 	}
 
-	// NOTE (atchess-1c9.49): the on-disk format changed from
-	// map[string]int64 to map[string]cursorEntry (transport-tagged) when
-	// the Jetstream transport was added. A pre-existing cursors.json
-	// written by the older, untagged format will fail this Unmarshal (a
-	// bare JSON number where a {"transport","seq"} object is expected) and
-	// fall into the same "corrupt/unparseable" handling below: preserved
-	// as .corrupt, store starts empty. That is a one-time, graceful
-	// degradation on upgrade -- equivalent to a first run, NOT a crash --
-	// consistent with this function's existing corrupt-file handling, and
-	// is why that handling was designed to be non-fatal in the first
-	// place. Losing a persisted cursor only means resubscribing from the
-	// live tip; it never causes duplicate/incorrect processing (see this
-	// type's doc comment and challenge.Store.Add's dedup).
+	// NOTE (atchess-1c9.49, revised by atchess-1c9.57): the on-disk format
+	// changed from map[string]int64 to map[string]cursorEntry
+	// (transport-tagged) when the Jetstream transport was added. A
+	// pre-existing cursors.json written by the older, untagged format
+	// fails this first Unmarshal (a bare JSON number where a
+	// {"transport","seq"} object is expected). Rather than treat that as
+	// corruption, the fallback below re-parses the same bytes as the old
+	// map[string]int64 format and, on success, tags every entry as
+	// TransportSubscribeRepos -- the only transport that could have
+	// written it, since Jetstream support did not exist when that format
+	// was in use. Only a file that fails BOTH decodes (neither tagged nor
+	// bare) is genuinely corrupt and falls into the handling further
+	// below: preserved as .corrupt, store starts empty. Losing a
+	// persisted cursor -- whether via that corrupt-file path or simply
+	// never having one -- only means resubscribing from the live tip; it
+	// never causes duplicate/incorrect processing (see this type's doc
+	// comment and challenge.Store.Add's dedup).
 	var loaded map[string]cursorEntry
-	if err := json.Unmarshal(data, &loaded); err != nil {
+	unmarshalErr := json.Unmarshal(data, &loaded)
+	if unmarshalErr != nil {
+		var legacy map[string]int64
+		if legacyErr := json.Unmarshal(data, &legacy); legacyErr == nil {
+			loaded = make(map[string]cursorEntry, len(legacy))
+			for host, seq := range legacy {
+				loaded[host] = cursorEntry{Transport: TransportSubscribeRepos, Seq: seq}
+			}
+			logger.Info().
+				Str("path", s.path).
+				Int("hosts", len(loaded)).
+				Str("transport", string(TransportSubscribeRepos)).
+				Msg("firehose cursor state file used the pre-Jetstream on-disk format (bare host->seq numbers); upgraded in memory by tagging every entry as subscribeRepos, the only transport that existed when it was written; will be rewritten in the current format on the next Store")
+			s.cursors = loaded
+			return s, nil
+		}
+
 		corruptPath := s.path + ".corrupt"
 		logger.Warn().
-			Err(err).
+			Err(unmarshalErr).
 			Str("path", s.path).
 			Str("preservedAs", corruptPath).
 			Msg("firehose cursor state file is corrupt/unparseable; starting with no stored cursors (equivalent to first run) rather than crashing")

@@ -125,6 +125,86 @@ func TestCursorStore_NegativeSequence_ClearsStoredCursor(t *testing.T) {
 	}
 }
 
+// TestCursorStore_OldFormatFile_UpgradesInsteadOfCorrupting is the
+// atchess-1c9.57 regression guard: a genuine pre-atchess-1c9.49
+// cursors.json (bare map[string]int64, no transport tag) must survive
+// loading -- tagged as TransportSubscribeRepos, since Jetstream support
+// did not exist when that format was written -- rather than being
+// misdiagnosed as corrupt and thrown away.
+func TestCursorStore_OldFormatFile_UpgradesInsteadOfCorrupting(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, cursorStoreFileName)
+
+	oldFormat := `{"` + testHost + `": 12345}`
+	if err := os.WriteFile(path, []byte(oldFormat), 0o644); err != nil {
+		t.Fatalf("failed to seed old-format cursor file: %v", err)
+	}
+
+	store, err := NewCursorStore(dir, zerolog.Nop())
+	if err != nil {
+		t.Fatalf("NewCursorStore on an old-format file returned an error: %v", err)
+	}
+
+	seq, ok := store.Get(testHost, TransportSubscribeRepos)
+	if !ok {
+		t.Fatalf("expected the old-format cursor to survive as a subscribeRepos cursor, found none")
+	}
+	if seq != 12345 {
+		t.Errorf("surviving cursor = %d, want 12345", seq)
+	}
+
+	// Must NOT have been tagged as (or usable as) a Jetstream cursor.
+	if _, ok := store.Get(testHost, TransportJetstream); ok {
+		t.Errorf("expected the upgraded old-format cursor to be tagged subscribeRepos, but it was usable as a Jetstream cursor")
+	}
+
+	// The old-format file is legitimate, not corrupt: it must NOT be
+	// renamed aside.
+	corruptPath := path + ".corrupt"
+	if _, err := os.Stat(corruptPath); err == nil {
+		t.Errorf("old-format file was renamed to %s, but a legitimate old-format file must not be treated as corrupt", corruptPath)
+	} else if !os.IsNotExist(err) {
+		t.Errorf("unexpected error checking for absence of %s: %v", corruptPath, err)
+	}
+}
+
+// TestCursorStore_NeitherFormat_StillPreservedAsCorrupt is the point-2
+// regression guard: a file that decodes as neither the current
+// transport-tagged format nor the old bare-int format is genuine
+// corruption and must still be preserved as .corrupt with the store
+// starting empty -- the old-format fallback must not swallow real
+// corruption.
+func TestCursorStore_NeitherFormat_StillPreservedAsCorrupt(t *testing.T) {
+	for name, contents := range map[string]string{
+		"wrong value type":  `{"a": "notanumber"}`,
+		"truncated json":    `{"a": {"transport":"subscribeRepos","seq":1`,
+		"mixed tagged/bare": `{"a": {"transport":"subscribeRepos","seq":1}, "b": 2}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, cursorStoreFileName)
+
+			if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
+				t.Fatalf("failed to seed corrupt cursor file: %v", err)
+			}
+
+			store, err := NewCursorStore(dir, zerolog.Nop())
+			if err != nil {
+				t.Fatalf("NewCursorStore returned an error for a corrupt file; want graceful recovery, got: %v", err)
+			}
+
+			if seq, ok := store.Get(testHost, TransportSubscribeRepos); ok {
+				t.Fatalf("expected a corrupt file to be treated as no-stored-cursor, got seq=%d ok=%v", seq, ok)
+			}
+
+			corruptPath := path + ".corrupt"
+			if _, err := os.Stat(corruptPath); err != nil {
+				t.Errorf("expected the original corrupt file to be preserved at %s, but it is missing: %v", corruptPath, err)
+			}
+		})
+	}
+}
+
 func TestCursorStore_MultipleHosts_TrackedIndependently(t *testing.T) {
 	dir := t.TempDir()
 	store, err := NewCursorStore(dir, zerolog.Nop())
