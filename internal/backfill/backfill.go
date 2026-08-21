@@ -51,6 +51,7 @@ package backfill
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -102,10 +103,21 @@ const (
 
 	// listRecordsPageLimit is the page size requested per
 	// com.atproto.repo.listRecords call for a single repo's
-	// app.atchess.challenge collection. A repo accumulating more than this
-	// many OPEN challenges addressed to anyone is not a scenario this
-	// bounded backfill is trying to solve; one page is enough for the
-	// deployments this package targets (see the package doc comment).
+	// app.atchess.challenge collection.
+	//
+	// atchess-1c9.119 fix-pass correction: this used to be documented as
+	// "one page is enough" on the theory that a repo would only ever
+	// accumulate a bounded number of OPEN challenges. That is wrong --
+	// nothing in this codebase ever issues com.atproto.repo.deleteRecord
+	// (verified: zero call sites outside tests), so app.atchess.challenge
+	// records are NEVER deleted once responded to/expired. A repo's
+	// challenge collection therefore grows monotonically with EVERY
+	// challenge that repo's owner has ever issued to anyone, for the life
+	// of the account, not just currently-open ones. A single-page read
+	// silently goes blind to older challenges past page one -- exactly
+	// atchess-1c9.119's defect, applied to this collection -- so
+	// listChallengesForRepo now follows the cursor (see
+	// maxChallengeListPagesPerRepo) instead of trusting one page.
 	listRecordsPageLimit = 100
 
 	// challengeCollection is the NSID of the challenge record type,
@@ -117,6 +129,25 @@ const (
 	// the PDS-URL-splitting helper.
 	challengeCollection = "app.atchess.challenge"
 )
+
+// maxChallengeListPagesPerRepo bounds how many pages listChallengesForRepo
+// will fetch for a single repo's app.atchess.challenge collection before
+// giving up on that repo (returning an error, which backfillHost already
+// treats as best-effort -- logged and skipped, not fatal to the rest of
+// the host's scan; see backfillHost's per-repo error handling). This is a
+// secondary, defense-in-depth bound: defaultPerHostTimeout already caps
+// the wall-clock budget for an entire host's scan via ctx, but an explicit
+// page cap means one pathological repo cannot consume that entire budget
+// by itself before any OTHER repo on the same host gets a turn. 50 pages
+// (5,000 records) is comfortably above any real player's lifetime
+// challenge count for the deployments this bounded backfill targets (see
+// the package doc comment).
+//
+// A var, not a const, solely so tests can shrink it (mirroring
+// internal/atproto.maxListRecordsPages) without needing to seed 5,000
+// records to exercise the cap-exceeded path. Production code never
+// assigns to this.
+var maxChallengeListPagesPerRepo = 50
 
 // HostResult records the outcome of backfilling one PDS host.
 type HostResult struct {
@@ -373,46 +404,74 @@ func (b *Backfiller) listRepoDIDs(ctx context.Context, base string) (dids []stri
 	}
 }
 
-// listChallengesForRepo fetches repoDID's app.atchess.challenge collection
-// from base and returns the (decoded) records whose "challenged" field is
+// errChallengeListPageCapExceeded is returned by listChallengesForRepo
+// when a single repo's app.atchess.challenge collection is not exhausted
+// within maxChallengeListPagesPerRepo pages. backfillHost's caller already
+// treats any listChallengesForRepo error as best-effort (logged and
+// skipped, not fatal to the rest of the host's scan -- see its doc
+// comment), so this never blocks discovery on OTHER repos; it only means
+// this one repo's older challenges were not (all) checked this run.
+var errChallengeListPageCapExceeded = errors.New("listChallengesForRepo: page cap exceeded")
+
+// listChallengesForRepo fetches ALL of repoDID's app.atchess.challenge
+// records from base (following the listRecords cursor across pages -- see
+// listRecordsPageLimit's doc comment for why one page is not provably
+// sufficient here) and returns the ones whose "challenged" field is
 // userDID.
 func (b *Backfiller) listChallengesForRepo(ctx context.Context, base, repoDID, userDID string) ([]*challenge.PendingChallenge, error) {
-	params := url.Values{
-		"repo":       {repoDID},
-		"collection": {challengeCollection},
-		"limit":      {strconv.Itoa(listRecordsPageLimit)},
-	}
-
-	var page struct {
-		Records []struct {
-			URI   string                 `json:"uri"`
-			CID   string                 `json:"cid"`
-			Value map[string]interface{} `json:"value"`
-		} `json:"records"`
-	}
-	if err := b.getXRPC(ctx, base, "com.atproto.repo.listRecords", params, &page); err != nil {
-		return nil, err
-	}
-
 	var out []*challenge.PendingChallenge
-	for _, rec := range page.Records {
-		challenged, _ := rec.Value["challenged"].(string)
-		if challenged != userDID {
-			continue
+	cursor := ""
+
+	for pageNum := 0; ; pageNum++ {
+		if pageNum >= maxChallengeListPagesPerRepo {
+			return nil, fmt.Errorf("%w: repo=%s after %d pages (%d matching challenges found so far)",
+				errChallengeListPageCapExceeded, repoDID, maxChallengeListPagesPerRepo, len(out))
 		}
-		rkey := rkeyFromURI(rec.URI)
-		if rkey == "" {
-			continue
+
+		params := url.Values{
+			"repo":       {repoDID},
+			"collection": {challengeCollection},
+			"limit":      {strconv.Itoa(listRecordsPageLimit)},
 		}
-		pending := challenge.FromChallengeRecord(repoDID, rkey, rec.CID, rec.Value)
-		if pending == nil {
-			// FromChallengeRecord already logged the forged-challenger
-			// mismatch; refuse to surface it during backfill either.
-			continue
+		if cursor != "" {
+			params.Set("cursor", cursor)
 		}
-		out = append(out, pending)
+
+		var page struct {
+			Records []struct {
+				URI   string                 `json:"uri"`
+				CID   string                 `json:"cid"`
+				Value map[string]interface{} `json:"value"`
+			} `json:"records"`
+			Cursor string `json:"cursor"`
+		}
+		if err := b.getXRPC(ctx, base, "com.atproto.repo.listRecords", params, &page); err != nil {
+			return nil, err
+		}
+
+		for _, rec := range page.Records {
+			challenged, _ := rec.Value["challenged"].(string)
+			if challenged != userDID {
+				continue
+			}
+			rkey := rkeyFromURI(rec.URI)
+			if rkey == "" {
+				continue
+			}
+			pending := challenge.FromChallengeRecord(repoDID, rkey, rec.CID, rec.Value)
+			if pending == nil {
+				// FromChallengeRecord already logged the forged-challenger
+				// mismatch; refuse to surface it during backfill either.
+				continue
+			}
+			out = append(out, pending)
+		}
+
+		if page.Cursor == "" {
+			return out, nil
+		}
+		cursor = page.Cursor
 	}
-	return out, nil
 }
 
 // rkeyFromURI extracts the trailing record key from an at:// URI

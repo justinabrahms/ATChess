@@ -3,11 +3,14 @@ package backfill
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -71,23 +74,65 @@ func newMockPDS(t *testing.T, repos map[string]map[string]map[string]interface{}
 	mux.HandleFunc("/xrpc/com.atproto.repo.listRecords", func(w http.ResponseWriter, r *http.Request) {
 		repo := r.URL.Query().Get("repo")
 		collection := r.URL.Query().Get("collection")
+		cursor := r.URL.Query().Get("cursor")
+		limit := 100
+		if l := r.URL.Query().Get("limit"); l != "" {
+			if parsed, err := strconv.Atoi(l); err == nil && parsed > 0 {
+				limit = parsed
+			}
+		}
 		type recordEntry struct {
 			URI   string                 `json:"uri"`
 			CID   string                 `json:"cid"`
 			Value map[string]interface{} `json:"value"`
 		}
 		var out []recordEntry
+		var respCursor string
 		if collection == "app.atchess.challenge" {
-			for rkey, val := range repos[repo] {
+			// Real listRecords pagination: records ordered by rkey,
+			// DESCENDING (newest first) by default -- see
+			// derive_status_test.go's deriveTestPDS.handle in
+			// internal/atproto for the identical shape and the empirical
+			// confirmation against the live local dual-PDS harness
+			// (atchess-1c9.119 fix-pass). A page's cursor (when present) is
+			// "resume immediately after this rkey" in that same descending
+			// sequence, i.e. the next STRICTLY SMALLER rkey.
+			var rkeys []string
+			for rkey := range repos[repo] {
+				rkeys = append(rkeys, rkey)
+			}
+			sort.Sort(sort.Reverse(sort.StringSlice(rkeys)))
+			start := 0
+			if cursor != "" {
+				for i, rkey := range rkeys {
+					if rkey < cursor {
+						start = i
+						break
+					}
+					start = i + 1
+				}
+			}
+			end := start + limit
+			if end > len(rkeys) {
+				end = len(rkeys)
+			}
+			for _, rkey := range rkeys[start:end] {
 				out = append(out, recordEntry{
 					URI:   fmt.Sprintf("at://%s/app.atchess.challenge/%s", repo, rkey),
 					CID:   "cid-" + rkey,
-					Value: val,
+					Value: repos[repo][rkey],
 				})
+			}
+			if end < len(rkeys) {
+				respCursor = rkeys[end-1]
 			}
 		}
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{"records": out})
+		resp := map[string]interface{}{"records": out}
+		if respCursor != "" {
+			resp["cursor"] = respCursor
+		}
+		_ = json.NewEncoder(w).Encode(resp)
 	})
 
 	return httptest.NewServer(mux)
@@ -422,5 +467,81 @@ func TestBackfillChallengesForUser_ContextDeadlineExceeded_ReturnsPartialResults
 	// host to be skipped (or at least not crash).
 	if len(result.Hosts) != 1 {
 		t.Fatalf("expected 1 HostResult even for an expired context, got %d", len(result.Hosts))
+	}
+}
+
+// TestBackfillChallengesForUser_ChallengeFoundPastPageOne pins the
+// atchess-1c9.119 fix-pass finding: app.atchess.challenge records are
+// never deleted (no com.atproto.repo.deleteRecord call site exists in
+// this codebase), so a repo's challenge collection grows monotonically
+// and a single page is not provably sufficient. This seeds more than 100
+// filler challenge records (addressed to someone else, so they can never
+// match) into alice's repo, sorted (by rkey) before the real challenge
+// addressed to bob, and asserts it is still found.
+func TestBackfillChallengesForUser_ChallengeFoundPastPageOne(t *testing.T) {
+	repoRecords := map[string]map[string]interface{}{}
+	for i := 0; i < 150; i++ {
+		rkey := fmt.Sprintf("filler-%05d", i)
+		repoRecords[rkey] = challengeRecord(aliceDID, carolDID) // addressed to carol, never matches bob
+	}
+	// The mock orders listRecords results by rkey DESCENDING (newest-first
+	// -- matches the real PDS's default; see newMockPDS's listRecords
+	// handler doc comment), so this rkey -- lexicographically SMALLER than
+	// every "filler-*" key above ("a" < "f") -- sorts LAST, landing it
+	// past page one of a 151-record collection.
+	repoRecords["aaa-real-challenge"] = challengeRecord(aliceDID, bobDID)
+
+	server := newMockPDS(t, map[string]map[string]map[string]interface{}{
+		aliceDID: repoRecords,
+	})
+	defer server.Close()
+
+	store := newTestChallengeStore(t)
+	b := New(store, zerolog.Nop())
+
+	result := b.BackfillChallengesForUser(context.Background(), bobDID, []string{wsURLFor(server.URL)})
+
+	if result.TotalFound() != 1 {
+		t.Fatalf("expected 1 challenge found past page one of a 151-record repo, got %d (hosts: %+v)", result.TotalFound(), result.Hosts)
+	}
+	pending, err := store.ForPlayer(bobDID)
+	if err != nil {
+		t.Fatalf("ForPlayer: %v", err)
+	}
+	if len(pending) != 1 {
+		t.Fatalf("expected 1 pending challenge indexed for bob, got %d", len(pending))
+	}
+}
+
+// TestListChallengesForRepo_PageCapEnforced pins listChallengesForRepo's
+// own fail-closed safety valve: a repo not exhausted within
+// maxChallengeListPagesPerRepo pages must return an error (which
+// backfillHost's caller already treats as best-effort: logged and
+// skipped), never a silently truncated result.
+func TestListChallengesForRepo_PageCapEnforced(t *testing.T) {
+	origCap := maxChallengeListPagesPerRepo
+	maxChallengeListPagesPerRepo = 1
+	t.Cleanup(func() { maxChallengeListPagesPerRepo = origCap })
+
+	repoRecords := map[string]map[string]interface{}{}
+	for i := 0; i < 150; i++ {
+		rkey := fmt.Sprintf("filler-%05d", i)
+		repoRecords[rkey] = challengeRecord(aliceDID, bobDID)
+	}
+
+	server := newMockPDS(t, map[string]map[string]map[string]interface{}{
+		aliceDID: repoRecords,
+	})
+	defer server.Close()
+
+	store := newTestChallengeStore(t)
+	b := New(store, zerolog.Nop())
+
+	_, err := b.listChallengesForRepo(context.Background(), server.URL, aliceDID, bobDID)
+	if err == nil {
+		t.Fatalf("listChallengesForRepo: expected an error once the page cap was exceeded, got nil (a truncated result was silently returned)")
+	}
+	if !errors.Is(err, errChallengeListPageCapExceeded) {
+		t.Errorf("listChallengesForRepo: expected an error wrapping errChallengeListPageCapExceeded, got: %v", err)
 	}
 }

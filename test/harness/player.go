@@ -191,38 +191,77 @@ type repoListRecordsResponse struct {
 	Cursor string `json:"cursor,omitempty"`
 }
 
-// RepoListRecords lists records in the given collection directly from this
-// player's OWN PDS (com.atproto.repo.listRecords against p.PDSURL) -- NOT
-// through the protocol service. See RepoGetRecord for why this matters.
+// repoListRecordsPageCap bounds how many pages RepoListRecords will follow
+// for a single collection before failing closed (atchess-1c9.119
+// fix-pass): this harness helper used to request a single page
+// (limit=100), decode the response's Cursor field, and then never follow
+// it -- exactly the same defect that produced this bead, just in test
+// code instead of internal/atproto/client.go. Several e2e assertions
+// (challenge_delivery_test.go, ownership_test.go) count RepoListRecords'
+// result to prove "exactly one [record exists]"; on a repo that has
+// accumulated more than 100 records in the collection being checked,
+// those counts would silently be wrong -- the harness would go blind past
+// page one exactly like the production bug it exists to catch. 50 pages
+// (5,000 records) is far more than any e2e run in this repo accumulates
+// per collection per account; exceeding it is treated as a hard test
+// failure (returned error) rather than a silently truncated count.
+const repoListRecordsPageCap = 50
+
+// RepoListRecords lists ALL records in the given collection directly from
+// this player's OWN PDS (com.atproto.repo.listRecords against p.PDSURL,
+// following the response cursor across pages until the collection is
+// exhausted -- see repoListRecordsPageCap) -- NOT through the protocol
+// service. See RepoGetRecord for why this matters.
 func (p *Player) RepoListRecords(collection string) ([]map[string]interface{}, error) {
-	u := fmt.Sprintf("%s/xrpc/com.atproto.repo.listRecords?repo=%s&collection=%s&limit=100",
-		p.PDSURL, url.QueryEscape(p.DID), url.QueryEscape(collection))
-
 	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Get(u)
-	if err != nil {
-		return nil, fmt.Errorf("listRecords request to %s failed: %w", p.PDSURL, err)
-	}
-	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read listRecords response body from %s: %w", p.PDSURL, err)
+	var values []map[string]interface{}
+	cursor := ""
+	for page := 0; ; page++ {
+		if page >= repoListRecordsPageCap {
+			return nil, fmt.Errorf("listRecords(%s) against %s (repo %s): exceeded %d pages (%d records read so far) without exhausting the collection",
+				collection, p.PDSURL, p.DID, repoListRecordsPageCap, len(values))
+		}
+
+		u := fmt.Sprintf("%s/xrpc/com.atproto.repo.listRecords?repo=%s&collection=%s&limit=100",
+			p.PDSURL, url.QueryEscape(p.DID), url.QueryEscape(collection))
+		if cursor != "" {
+			u += "&cursor=" + url.QueryEscape(cursor)
+		}
+
+		resp, err := client.Get(u)
+		if err != nil {
+			return nil, fmt.Errorf("listRecords request to %s failed: %w", p.PDSURL, err)
+		}
+
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			return nil, fmt.Errorf("failed to read listRecords response body from %s: %w", p.PDSURL, err)
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("listRecords(%s) against %s (repo %s) returned HTTP %d: %s",
+				collection, p.PDSURL, p.DID, resp.StatusCode, string(body))
+		}
+
+		var listResp repoListRecordsResponse
+		if err := json.Unmarshal(body, &listResp); err != nil {
+			return nil, fmt.Errorf("failed to decode listRecords response from %s: %w (body: %s)", p.PDSURL, err, string(body))
+		}
+
+		for _, r := range listResp.Records {
+			values = append(values, r.Value)
+		}
+
+		if listResp.Cursor == "" {
+			break
+		}
+		cursor = listResp.Cursor
 	}
 
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("listRecords(%s) against %s (repo %s) returned HTTP %d: %s",
-			collection, p.PDSURL, p.DID, resp.StatusCode, string(body))
-	}
-
-	var listResp repoListRecordsResponse
-	if err := json.Unmarshal(body, &listResp); err != nil {
-		return nil, fmt.Errorf("failed to decode listRecords response from %s: %w (body: %s)", p.PDSURL, err, string(body))
-	}
-
-	values := make([]map[string]interface{}, 0, len(listResp.Records))
-	for _, r := range listResp.Records {
-		values = append(values, r.Value)
+	if values == nil {
+		values = []map[string]interface{}{}
 	}
 	return values, nil
 }

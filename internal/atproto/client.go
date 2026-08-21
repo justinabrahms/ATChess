@@ -1630,58 +1630,54 @@ type StoredMove struct {
 // ListMovesForGame fetches all app.atchess.move records from this client's
 // repository that belong to the given game URI.
 func (c *Client) ListMovesForGame(ctx context.Context, gameURI string) ([]StoredMove, error) {
-	params := url.Values{"repo": {c.did}, "collection": {"app.atchess.move"}, "limit": {"100"}}
-	resp, err := c.getXRPC(ctx, c.pdsURL, true, "com.atproto.repo.listRecords", params)
+	records, err := c.listAllRecords(ctx, c.pdsURL, true, c.did, "app.atchess.move")
 	if err != nil {
 		return nil, fmt.Errorf("failed to list move records: %w", err)
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("failed to list move records: HTTP %d", resp.StatusCode)
-	}
-
-	var listResp struct {
-		Records []struct {
-			Value struct {
-				Game struct {
-					URI string `json:"uri"`
-				} `json:"game"`
-				From      string `json:"from"`
-				To        string `json:"to"`
-				SAN       string `json:"san"`
-				FEN       string `json:"fen"`
-				Player    string `json:"player"`
-				Check     bool   `json:"check"`
-				Checkmate bool   `json:"checkmate"`
-				Draw      bool   `json:"draw"`
-				CreatedAt string `json:"createdAt"`
-			} `json:"value"`
-		} `json:"records"`
-	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&listResp); err != nil {
-		return nil, fmt.Errorf("failed to decode move records: %w", err)
-	}
 
 	var moves []StoredMove
-	for _, record := range listResp.Records {
-		if record.Value.Game.URI != gameURI {
+	for _, record := range records {
+		var value struct {
+			Game struct {
+				URI string `json:"uri"`
+			} `json:"game"`
+			From      string `json:"from"`
+			To        string `json:"to"`
+			SAN       string `json:"san"`
+			FEN       string `json:"fen"`
+			Player    string `json:"player"`
+			Check     bool   `json:"check"`
+			Checkmate bool   `json:"checkmate"`
+			Draw      bool   `json:"draw"`
+			CreatedAt string `json:"createdAt"`
+		}
+		if err := json.Unmarshal(record.Value, &value); err != nil {
+			// atchess-1c9.119 fix-pass: deliberately skip-and-log a single
+			// malformed record instead of failing this whole scan closed (a
+			// whole-page decode failure used to do exactly that, before
+			// pagination). This is a granularity improvement -- one malformed
+			// record can no longer deny service to this entire read -- but it
+			// must never be silent, so it is logged rather than just dropped.
+			log.Warn().Str("repo", c.did).Str("collection", "app.atchess.move").Str("recordURI", record.URI).Err(err).
+				Msg("skipping malformed move record: value did not decode into the expected shape")
 			continue
 		}
-		t, err := time.Parse(time.RFC3339, record.Value.CreatedAt)
+		if value.Game.URI != gameURI {
+			continue
+		}
+		t, err := time.Parse(time.RFC3339, value.CreatedAt)
 		if err != nil {
 			continue
 		}
 		moves = append(moves, StoredMove{
-			From:      record.Value.From,
-			To:        record.Value.To,
-			SAN:       record.Value.SAN,
-			FEN:       record.Value.FEN,
-			Player:    record.Value.Player,
-			Check:     record.Value.Check,
-			Checkmate: record.Value.Checkmate,
-			Draw:      record.Value.Draw,
+			From:      value.From,
+			To:        value.To,
+			SAN:       value.SAN,
+			FEN:       value.FEN,
+			Player:    value.Player,
+			Check:     value.Check,
+			Checkmate: value.Checkmate,
+			Draw:      value.Draw,
 			CreatedAt: t,
 		})
 	}
@@ -1745,42 +1741,33 @@ func (c *Client) getLatestMoveForGame(ctx context.Context, gameURI string, white
 			errs = append(errs, fmt.Errorf("resolve read endpoint for %s: %w: %v", playerDID, ErrIncompleteDerivation, err))
 			continue
 		}
-		params := url.Values{"repo": {playerDID}, "collection": {"app.atchess.move"}, "limit": {"100"}}
-		resp, err := c.getXRPC(ctx, base, ownRepo, "com.atproto.repo.listRecords", params)
+		records, err := c.listAllRecords(ctx, base, ownRepo, playerDID, "app.atchess.move")
 		if err != nil {
 			errs = append(errs, fmt.Errorf("list moves for %s: %w: %v", playerDID, ErrIncompleteDerivation, err))
 			continue
 		}
-		defer resp.Body.Close()
 
-		if resp.StatusCode != http.StatusOK {
-			errs = append(errs, fmt.Errorf("list moves for %s: HTTP %d: %w", playerDID, resp.StatusCode, ErrIncompleteDerivation))
-			continue
-		}
-
-		var listResp struct {
-			Records []struct {
-				URI   string `json:"uri"`
-				Value struct {
-					Game struct {
-						URI string `json:"uri"`
-					} `json:"game"`
-					FEN       string `json:"fen"`
-					Player    string `json:"player"`
-					Checkmate bool   `json:"checkmate"`
-					Draw      bool   `json:"draw"`
-					CreatedAt string `json:"createdAt"`
-				} `json:"value"`
-			} `json:"records"`
-		}
-
-		if err := json.NewDecoder(resp.Body).Decode(&listResp); err != nil {
-			errs = append(errs, fmt.Errorf("decode moves list for %s: %w: %v", playerDID, ErrIncompleteDerivation, err))
-			continue
-		}
-
-		for _, record := range listResp.Records {
-			if record.Value.Game.URI != gameURI {
+		for _, record := range records {
+			var value struct {
+				Game struct {
+					URI string `json:"uri"`
+				} `json:"game"`
+				FEN       string `json:"fen"`
+				Player    string `json:"player"`
+				Checkmate bool   `json:"checkmate"`
+				Draw      bool   `json:"draw"`
+				CreatedAt string `json:"createdAt"`
+			}
+			if err := json.Unmarshal(record.Value, &value); err != nil {
+				// atchess-1c9.119 fix-pass: skip-and-log this one malformed
+				// record rather than failing the whole scan closed -- see
+				// ListMovesForGame's identical comment for the full
+				// rationale.
+				log.Warn().Str("repo", playerDID).Str("collection", "app.atchess.move").Str("recordURI", record.URI).Err(err).
+					Msg("skipping malformed move record: value did not decode into the expected shape")
+				continue
+			}
+			if value.Game.URI != gameURI {
 				continue
 			}
 			// atchess-1c9.108: the hosting repo IS the authorship proof --
@@ -1792,28 +1779,28 @@ func (c *Client) getLatestMoveForGame(ctx context.Context, gameURI string, white
 			// fixed DID -- comparing against the wrong side here would
 			// silently drop every legitimate move instead of only forged
 			// ones.
-			if record.Value.Player != playerDID {
+			if value.Player != playerDID {
 				log.Warn().Str("gameURI", gameURI).Str("repo", playerDID).
-					Str("claimedPlayer", record.Value.Player).
+					Str("claimedPlayer", value.Player).
 					Str("recordURI", record.URI).
 					Msg("ignoring forged move record: repo owner is not the player it names as mover")
 				continue
 			}
-			t, err := time.Parse(time.RFC3339, record.Value.CreatedAt)
+			t, err := time.Parse(time.RFC3339, value.CreatedAt)
 			if err != nil {
 				continue
 			}
 			rkey := recordKey(record.URI)
-			if latest == nil || moveRecordIsAfter(record.Value.FEN, t, rkey, latest.FEN, latest.CreatedAt, latest.rkey) {
+			if latest == nil || moveRecordIsAfter(value.FEN, t, rkey, latest.FEN, latest.CreatedAt, latest.rkey) {
 				// atchess-1c9.108: derive checkmate/draw from the FEN
 				// itself rather than trusting the record's self-reported
 				// flags -- see deriveTerminalFlagsFromFEN's doc comment.
 				// atchess-1c9.100 already established the FEN as the
 				// trusted board state (game.FEN = latestMove.FEN), so this
 				// adds no new trust surface; it removes one.
-				checkmate, draw := deriveTerminalFlagsFromFEN(record.Value.FEN)
+				checkmate, draw := deriveTerminalFlagsFromFEN(value.FEN)
 				latest = &moveRecord{
-					FEN:       record.Value.FEN,
+					FEN:       value.FEN,
 					Checkmate: checkmate,
 					rkey:      rkey,
 					Draw:      draw,
@@ -1986,62 +1973,50 @@ func (c *Client) getResignationOutcome(ctx context.Context, gameURI, whiteDID, b
 			errs = append(errs, fmt.Errorf("resolve read endpoint for %s: %w: %v", playerDID, ErrIncompleteDerivation, err))
 			continue
 		}
-		params := url.Values{"repo": {playerDID}, "collection": {"app.atchess.resignation"}, "limit": {"100"}}
-		resp, err := c.getXRPC(ctx, base, ownRepo, "com.atproto.repo.listRecords", params)
+		records, err := c.listAllRecords(ctx, base, ownRepo, playerDID, "app.atchess.resignation")
 		if err != nil {
 			errs = append(errs, fmt.Errorf("list resignations for %s: %w: %v", playerDID, ErrIncompleteDerivation, err))
 			continue
 		}
 
-		func() {
-			defer resp.Body.Close()
-			if resp.StatusCode != http.StatusOK {
-				errs = append(errs, fmt.Errorf("list resignations for %s: HTTP %d: %w", playerDID, resp.StatusCode, ErrIncompleteDerivation))
-				return
+		for _, record := range records {
+			var value struct {
+				Game struct {
+					URI string `json:"uri"`
+				} `json:"game"`
+				ResigningPlayer string `json:"resigningPlayer"`
+				CreatedAt       string `json:"createdAt"`
 			}
-
-			var listResp struct {
-				Records []struct {
-					URI   string `json:"uri"`
-					Value struct {
-						Game struct {
-							URI string `json:"uri"`
-						} `json:"game"`
-						ResigningPlayer string `json:"resigningPlayer"`
-						CreatedAt       string `json:"createdAt"`
-					} `json:"value"`
-				} `json:"records"`
+			if err := json.Unmarshal(record.Value, &value); err != nil {
+				// atchess-1c9.119 fix-pass: skip-and-log -- see
+				// ListMovesForGame's comment for the full rationale.
+				log.Warn().Str("repo", playerDID).Str("collection", "app.atchess.resignation").Str("recordURI", record.URI).Err(err).
+					Msg("skipping malformed resignation record: value did not decode into the expected shape")
+				continue
 			}
-			if err := json.NewDecoder(resp.Body).Decode(&listResp); err != nil {
-				errs = append(errs, fmt.Errorf("decode resignations list for %s: %w: %v", playerDID, ErrIncompleteDerivation, err))
-				return
+			if value.Game.URI != gameURI {
+				continue
 			}
-
-			for _, record := range listResp.Records {
-				if record.Value.Game.URI != gameURI {
-					continue
-				}
-				if record.Value.ResigningPlayer != playerDID {
-					log.Warn().Str("gameURI", gameURI).Str("repo", playerDID).
-						Str("claimedResigningPlayer", record.Value.ResigningPlayer).
-						Str("recordURI", record.URI).
-						Msg("ignoring forged resignation record: repo owner is not the player it names as resigning")
-					continue
-				}
-				t, err := time.Parse(time.RFC3339, record.Value.CreatedAt)
-				if err != nil {
-					continue
-				}
-				status := chess.StatusWhiteWon
-				if record.Value.ResigningPlayer == whiteDID {
-					status = chess.StatusBlackWon
-				}
-				candidate := &terminalEvent{status: status, at: t, rkey: recordKey(record.URI), kind: terminalEventFromResignation}
-				if latest == nil || moveIsAfter(candidate.at, candidate.rkey, latest.at, latest.rkey) {
-					latest = candidate
-				}
+			if value.ResigningPlayer != playerDID {
+				log.Warn().Str("gameURI", gameURI).Str("repo", playerDID).
+					Str("claimedResigningPlayer", value.ResigningPlayer).
+					Str("recordURI", record.URI).
+					Msg("ignoring forged resignation record: repo owner is not the player it names as resigning")
+				continue
 			}
-		}()
+			t, err := time.Parse(time.RFC3339, value.CreatedAt)
+			if err != nil {
+				continue
+			}
+			status := chess.StatusWhiteWon
+			if value.ResigningPlayer == whiteDID {
+				status = chess.StatusBlackWon
+			}
+			candidate := &terminalEvent{status: status, at: t, rkey: recordKey(record.URI), kind: terminalEventFromResignation}
+			if latest == nil || moveIsAfter(candidate.at, candidate.rkey, latest.at, latest.rkey) {
+				latest = candidate
+			}
+		}
 	}
 
 	return latest, errors.Join(errs...)
@@ -2148,122 +2123,110 @@ func (c *Client) getTimeViolationOutcome(ctx context.Context, gameURI, whiteDID,
 			errs = append(errs, fmt.Errorf("resolve read endpoint for %s: %w: %v", playerDID, ErrIncompleteDerivation, err))
 			continue
 		}
-		params := url.Values{"repo": {playerDID}, "collection": {"app.atchess.timeViolation"}, "limit": {"100"}}
-		resp, err := c.getXRPC(ctx, base, ownRepo, "com.atproto.repo.listRecords", params)
+		records, err := c.listAllRecords(ctx, base, ownRepo, playerDID, "app.atchess.timeViolation")
 		if err != nil {
 			errs = append(errs, fmt.Errorf("list timeViolations for %s: %w: %v", playerDID, ErrIncompleteDerivation, err))
 			continue
 		}
 
-		func() {
-			defer resp.Body.Close()
-			if resp.StatusCode != http.StatusOK {
-				errs = append(errs, fmt.Errorf("list timeViolations for %s: HTTP %d: %w", playerDID, resp.StatusCode, ErrIncompleteDerivation))
-				return
+		for _, record := range records {
+			var value struct {
+				Game struct {
+					URI string `json:"uri"`
+				} `json:"game"`
+				ClaimingPlayer  string `json:"claimingPlayer"`
+				ViolatingPlayer string `json:"violatingPlayer"`
+				CreatedAt       string `json:"createdAt"`
+			}
+			if err := json.Unmarshal(record.Value, &value); err != nil {
+				// atchess-1c9.119 fix-pass: skip-and-log -- see
+				// ListMovesForGame's comment for the full rationale.
+				log.Warn().Str("repo", playerDID).Str("collection", "app.atchess.timeViolation").Str("recordURI", record.URI).Err(err).
+					Msg("skipping malformed timeViolation record: value did not decode into the expected shape")
+				continue
+			}
+			if value.Game.URI != gameURI {
+				continue
 			}
 
-			var listResp struct {
-				Records []struct {
-					URI   string `json:"uri"`
-					Value struct {
-						Game struct {
-							URI string `json:"uri"`
-						} `json:"game"`
-						ClaimingPlayer  string `json:"claimingPlayer"`
-						ViolatingPlayer string `json:"violatingPlayer"`
-						CreatedAt       string `json:"createdAt"`
-					} `json:"value"`
-				} `json:"records"`
+			if value.ClaimingPlayer != playerDID {
+				log.Warn().Str("gameURI", gameURI).Str("repo", playerDID).
+					Str("claimedClaimingPlayer", value.ClaimingPlayer).
+					Str("recordURI", record.URI).
+					Msg("ignoring forged timeViolation record: repo owner is not the player it names as claiming")
+				continue
 			}
-			if err := json.NewDecoder(resp.Body).Decode(&listResp); err != nil {
-				errs = append(errs, fmt.Errorf("decode timeViolations list for %s: %w: %v", playerDID, ErrIncompleteDerivation, err))
-				return
+			if value.ViolatingPlayer != whiteDID && value.ViolatingPlayer != blackDID {
+				continue
+			}
+			if value.ViolatingPlayer == playerDID {
+				log.Warn().Str("gameURI", gameURI).Str("repo", playerDID).Str("recordURI", record.URI).
+					Msg("ignoring nonsensical timeViolation record: claimant named themselves as the violator")
+				continue
 			}
 
-			for _, record := range listResp.Records {
-				if record.Value.Game.URI != gameURI {
-					continue
-				}
-
-				if record.Value.ClaimingPlayer != playerDID {
-					log.Warn().Str("gameURI", gameURI).Str("repo", playerDID).
-						Str("claimedClaimingPlayer", record.Value.ClaimingPlayer).
-						Str("recordURI", record.URI).
-						Msg("ignoring forged timeViolation record: repo owner is not the player it names as claiming")
-					continue
-				}
-				if record.Value.ViolatingPlayer != whiteDID && record.Value.ViolatingPlayer != blackDID {
-					continue
-				}
-				if record.Value.ViolatingPlayer == playerDID {
-					log.Warn().Str("gameURI", gameURI).Str("repo", playerDID).Str("recordURI", record.URI).
-						Msg("ignoring nonsensical timeViolation record: claimant named themselves as the violator")
-					continue
-				}
-
-				t, err := time.Parse(time.RFC3339, record.Value.CreatedAt)
-				if err != nil {
-					continue
-				}
-
-				if timeControlType != "correspondence" {
-					// Cannot be soundly verified -- advisory only, never
-					// authoritative. See doc comment above.
-					log.Warn().Str("gameURI", gameURI).Str("recordURI", record.URI).Str("timeControlType", timeControlType).
-						Msg("timeViolation record for a non-correspondence time control cannot be verified server-side; treating as advisory and excluding it from derived game status")
-					continue
-				}
-				if !lastActivityKnown {
-					log.Warn().Str("gameURI", gameURI).Str("recordURI", record.URI).
-						Msg("timeViolation record cannot be verified without a known last-activity timestamp; treating as advisory and excluding it from derived game status")
-					continue
-				}
-				// daysPerMove is expected to already be
-				// resolveTimeControl's EFFECTIVE value by the time it
-				// reaches here -- GetGame resolves the game's raw
-				// timeControl through resolveTimeControl before calling
-				// this function, so for a "correspondence" record (the
-				// only kind that reaches this point; see the type check
-				// above) it should never legitimately be <= 0. This is no
-				// longer where "absent/zero means no timeout is possible"
-				// is decided -- that policy lives solely in
-				// resolveTimeControl now (atchess-1c9.88). What's left
-				// here is a defensive fallback: if daysPerMove somehow
-				// still is <= 0, timeLimit would be zero/negative and
-				// every claim would trivially satisfy "elapsed", turning
-				// a bad value into an automatic win for the claimant --
-				// the opposite of safe -- so it fails closed rather than
-				// trusting its caller unconditionally.
-				if daysPerMove <= 0 {
-					log.Warn().Str("gameURI", gameURI).Str("recordURI", record.URI).Int("daysPerMove", daysPerMove).
-						Msg("ignoring timeViolation record: daysPerMove is not positive even after resolution -- refusing to treat a non-positive limit as an automatic violation")
-					continue
-				}
-				// Reject a claim made before its own deadline had
-				// actually elapsed -- this is the check that verifies
-				// TIMING (see doc comment above); it is unrelated to the
-				// defaulting concern above it and must be preserved
-				// exactly as-is.
-				timeLimit := time.Duration(daysPerMove) * 24 * time.Hour
-				if t.Sub(lastActivityAt) < timeLimit {
-					log.Warn().Str("gameURI", gameURI).Str("recordURI", record.URI).
-						Time("lastActivityAt", lastActivityAt).Time("claimedAt", t).Int("daysPerMove", daysPerMove).
-						Msg("ignoring premature/forged timeViolation record: claimed before its own deadline had actually elapsed")
-					continue
-				}
-
-				// Mirrors ClaimTimeVictory's own winner determination:
-				// the violating player loses.
-				status := chess.StatusWhiteWon
-				if record.Value.ViolatingPlayer == whiteDID {
-					status = chess.StatusBlackWon
-				}
-				candidate := &terminalEvent{status: status, at: t, rkey: recordKey(record.URI), kind: terminalEventFromTimeViolation}
-				if latest == nil || moveIsAfter(candidate.at, candidate.rkey, latest.at, latest.rkey) {
-					latest = candidate
-				}
+			t, err := time.Parse(time.RFC3339, value.CreatedAt)
+			if err != nil {
+				continue
 			}
-		}()
+
+			if timeControlType != "correspondence" {
+				// Cannot be soundly verified -- advisory only, never
+				// authoritative. See doc comment above.
+				log.Warn().Str("gameURI", gameURI).Str("recordURI", record.URI).Str("timeControlType", timeControlType).
+					Msg("timeViolation record for a non-correspondence time control cannot be verified server-side; treating as advisory and excluding it from derived game status")
+				continue
+			}
+			if !lastActivityKnown {
+				log.Warn().Str("gameURI", gameURI).Str("recordURI", record.URI).
+					Msg("timeViolation record cannot be verified without a known last-activity timestamp; treating as advisory and excluding it from derived game status")
+				continue
+			}
+			// daysPerMove is expected to already be
+			// resolveTimeControl's EFFECTIVE value by the time it
+			// reaches here -- GetGame resolves the game's raw
+			// timeControl through resolveTimeControl before calling
+			// this function, so for a "correspondence" record (the
+			// only kind that reaches this point; see the type check
+			// above) it should never legitimately be <= 0. This is no
+			// longer where "absent/zero means no timeout is possible"
+			// is decided -- that policy lives solely in
+			// resolveTimeControl now (atchess-1c9.88). What's left
+			// here is a defensive fallback: if daysPerMove somehow
+			// still is <= 0, timeLimit would be zero/negative and
+			// every claim would trivially satisfy "elapsed", turning
+			// a bad value into an automatic win for the claimant --
+			// the opposite of safe -- so it fails closed rather than
+			// trusting its caller unconditionally.
+			if daysPerMove <= 0 {
+				log.Warn().Str("gameURI", gameURI).Str("recordURI", record.URI).Int("daysPerMove", daysPerMove).
+					Msg("ignoring timeViolation record: daysPerMove is not positive even after resolution -- refusing to treat a non-positive limit as an automatic violation")
+				continue
+			}
+			// Reject a claim made before its own deadline had
+			// actually elapsed -- this is the check that verifies
+			// TIMING (see doc comment above); it is unrelated to the
+			// defaulting concern above it and must be preserved
+			// exactly as-is.
+			timeLimit := time.Duration(daysPerMove) * 24 * time.Hour
+			if t.Sub(lastActivityAt) < timeLimit {
+				log.Warn().Str("gameURI", gameURI).Str("recordURI", record.URI).
+					Time("lastActivityAt", lastActivityAt).Time("claimedAt", t).Int("daysPerMove", daysPerMove).
+					Msg("ignoring premature/forged timeViolation record: claimed before its own deadline had actually elapsed")
+				continue
+			}
+
+			// Mirrors ClaimTimeVictory's own winner determination:
+			// the violating player loses.
+			status := chess.StatusWhiteWon
+			if value.ViolatingPlayer == whiteDID {
+				status = chess.StatusBlackWon
+			}
+			candidate := &terminalEvent{status: status, at: t, rkey: recordKey(record.URI), kind: terminalEventFromTimeViolation}
+			if latest == nil || moveIsAfter(candidate.at, candidate.rkey, latest.at, latest.rkey) {
+				latest = candidate
+			}
+		}
 	}
 
 	return latest, errors.Join(errs...)
@@ -2301,100 +2264,88 @@ func (c *Client) getDrawAcceptOutcome(ctx context.Context, gameURI, whiteDID, bl
 			errs = append(errs, fmt.Errorf("resolve read endpoint for %s: %w: %v", playerDID, ErrIncompleteDerivation, err))
 			continue
 		}
-		params := url.Values{"repo": {playerDID}, "collection": {"app.atchess.drawResponse"}, "limit": {"100"}}
-		resp, err := c.getXRPC(ctx, base, ownRepo, "com.atproto.repo.listRecords", params)
+		records, err := c.listAllRecords(ctx, base, ownRepo, playerDID, "app.atchess.drawResponse")
 		if err != nil {
 			errs = append(errs, fmt.Errorf("list drawResponses for %s: %w: %v", playerDID, ErrIncompleteDerivation, err))
 			continue
 		}
 
-		func() {
-			defer resp.Body.Close()
-			if resp.StatusCode != http.StatusOK {
-				errs = append(errs, fmt.Errorf("list drawResponses for %s: HTTP %d: %w", playerDID, resp.StatusCode, ErrIncompleteDerivation))
-				return
+		for _, record := range records {
+			var value struct {
+				Game struct {
+					URI string `json:"uri"`
+				} `json:"game"`
+				DrawOffer struct {
+					URI string `json:"uri"`
+					CID string `json:"cid"`
+				} `json:"drawOffer"`
+				RespondedBy string `json:"respondedBy"`
+				Response    string `json:"response"`
+				CreatedAt   string `json:"createdAt"`
+			}
+			if err := json.Unmarshal(record.Value, &value); err != nil {
+				// atchess-1c9.119 fix-pass: skip-and-log -- see
+				// ListMovesForGame's comment for the full rationale.
+				log.Warn().Str("repo", playerDID).Str("collection", "app.atchess.drawResponse").Str("recordURI", record.URI).Err(err).
+					Msg("skipping malformed drawResponse record: value did not decode into the expected shape")
+				continue
+			}
+			if value.Game.URI != gameURI || value.Response != "accepted" {
+				continue
+			}
+			if value.RespondedBy != playerDID {
+				log.Warn().Str("gameURI", gameURI).Str("repo", playerDID).
+					Str("claimedRespondedBy", value.RespondedBy).Str("recordURI", record.URI).
+					Msg("ignoring forged drawResponse record: repo owner is not the player it names as responding")
+				continue
 			}
 
-			var listResp struct {
-				Records []struct {
-					URI   string `json:"uri"`
-					Value struct {
-						Game struct {
-							URI string `json:"uri"`
-						} `json:"game"`
-						DrawOffer struct {
-							URI string `json:"uri"`
-							CID string `json:"cid"`
-						} `json:"drawOffer"`
-						RespondedBy string `json:"respondedBy"`
-						Response    string `json:"response"`
-						CreatedAt   string `json:"createdAt"`
-					} `json:"value"`
-				} `json:"records"`
+			offerURI := value.DrawOffer.URI
+			offerRepo := recordRepo(offerURI)
+			if offerRepo == "" || offerRepo == playerDID {
+				log.Warn().Str("gameURI", gameURI).Str("repo", playerDID).Str("recordURI", record.URI).Str("offerURI", offerURI).
+					Msg("ignoring drawResponse record: its drawOffer strongRef does not point at the other player's repo")
+				continue
 			}
-			if err := json.NewDecoder(resp.Body).Decode(&listResp); err != nil {
-				errs = append(errs, fmt.Errorf("decode drawResponses list for %s: %w: %v", playerDID, ErrIncompleteDerivation, err))
-				return
+			if offerRepo != whiteDID && offerRepo != blackDID {
+				continue
 			}
 
-			for _, record := range listResp.Records {
-				if record.Value.Game.URI != gameURI || record.Value.Response != "accepted" {
-					continue
-				}
-				if record.Value.RespondedBy != playerDID {
-					log.Warn().Str("gameURI", gameURI).Str("repo", playerDID).
-						Str("claimedRespondedBy", record.Value.RespondedBy).Str("recordURI", record.URI).
-						Msg("ignoring forged drawResponse record: repo owner is not the player it names as responding")
-					continue
-				}
-
-				offerURI := record.Value.DrawOffer.URI
-				offerRepo := recordRepo(offerURI)
-				if offerRepo == "" || offerRepo == playerDID {
-					log.Warn().Str("gameURI", gameURI).Str("repo", playerDID).Str("recordURI", record.URI).Str("offerURI", offerURI).
-						Msg("ignoring drawResponse record: its drawOffer strongRef does not point at the other player's repo")
-					continue
-				}
-				if offerRepo != whiteDID && offerRepo != blackDID {
-					continue
-				}
-
-				offerCID, offerValue, err := c.getRecordByURI(ctx, offerURI)
-				if err != nil {
-					log.Warn().Err(err).Str("gameURI", gameURI).Str("recordURI", record.URI).Str("offerURI", offerURI).
-						Msg("ignoring drawResponse record: its referenced drawOffer could not be read (no offer, no draw)")
-					continue
-				}
-				if offerCID != record.Value.DrawOffer.CID {
-					log.Warn().Str("gameURI", gameURI).Str("recordURI", record.URI).Str("offerURI", offerURI).
-						Str("wantCID", record.Value.DrawOffer.CID).Str("gotCID", offerCID).
-						Msg("ignoring drawResponse record: its drawOffer strongRef CID does not match the current offer record")
-					continue
-				}
-				offerGameRef, _ := offerValue["game"].(map[string]interface{})
-				offerGameURI, _ := offerGameRef["uri"].(string)
-				if offerGameURI != gameURI {
-					log.Warn().Str("gameURI", gameURI).Str("recordURI", record.URI).Str("offerGameURI", offerGameURI).
-						Msg("ignoring drawResponse record: its drawOffer belongs to a different game")
-					continue
-				}
-				offeredBy, _ := offerValue["offeredBy"].(string)
-				if offeredBy != offerRepo {
-					log.Warn().Str("gameURI", gameURI).Str("recordURI", record.URI).Str("offerURI", offerURI).
-						Msg("ignoring drawResponse record: its drawOffer's offeredBy does not match the repo it was found in")
-					continue
-				}
-
-				t, err := time.Parse(time.RFC3339, record.Value.CreatedAt)
-				if err != nil {
-					continue
-				}
-				candidate := &terminalEvent{status: chess.StatusDraw, at: t, rkey: recordKey(record.URI), kind: terminalEventFromDrawAccept}
-				if latest == nil || moveIsAfter(candidate.at, candidate.rkey, latest.at, latest.rkey) {
-					latest = candidate
-				}
+			offerCID, offerValue, err := c.getRecordByURI(ctx, offerURI)
+			if err != nil {
+				log.Warn().Err(err).Str("gameURI", gameURI).Str("recordURI", record.URI).Str("offerURI", offerURI).
+					Msg("ignoring drawResponse record: its referenced drawOffer could not be read (no offer, no draw)")
+				continue
 			}
-		}()
+			if offerCID != value.DrawOffer.CID {
+				log.Warn().Str("gameURI", gameURI).Str("recordURI", record.URI).Str("offerURI", offerURI).
+					Str("wantCID", value.DrawOffer.CID).Str("gotCID", offerCID).
+					Msg("ignoring drawResponse record: its drawOffer strongRef CID does not match the current offer record")
+				continue
+			}
+			offerGameRef, _ := offerValue["game"].(map[string]interface{})
+			offerGameURI, _ := offerGameRef["uri"].(string)
+			if offerGameURI != gameURI {
+				log.Warn().Str("gameURI", gameURI).Str("recordURI", record.URI).Str("offerGameURI", offerGameURI).
+					Msg("ignoring drawResponse record: its drawOffer belongs to a different game")
+				continue
+			}
+			offeredBy, _ := offerValue["offeredBy"].(string)
+			if offeredBy != offerRepo {
+				log.Warn().Str("gameURI", gameURI).Str("recordURI", record.URI).Str("offerURI", offerURI).
+					Msg("ignoring drawResponse record: its drawOffer's offeredBy does not match the repo it was found in")
+				continue
+			}
+
+			t, err := time.Parse(time.RFC3339, value.CreatedAt)
+			if err != nil {
+				continue
+			}
+			candidate := &terminalEvent{status: chess.StatusDraw, at: t, rkey: recordKey(record.URI), kind: terminalEventFromDrawAccept}
+			if latest == nil || moveIsAfter(candidate.at, candidate.rkey, latest.at, latest.rkey) {
+				latest = candidate
+			}
+		}
 	}
 
 	return latest, errors.Join(errs...)
@@ -2444,44 +2395,35 @@ func (c *Client) getChallengeDeclineOutcome(ctx context.Context, challengeURI, c
 	if err != nil {
 		return false, fmt.Errorf("resolve read endpoint for %s: %w", challengedDID, err)
 	}
-	params := url.Values{"repo": {challengedDID}, "collection": {"app.atchess.challengeResponse"}, "limit": {"100"}}
-	resp, err := c.getXRPC(ctx, base, ownRepo, "com.atproto.repo.listRecords", params)
+	records, err := c.listAllRecords(ctx, base, ownRepo, challengedDID, "app.atchess.challengeResponse")
 	if err != nil {
 		return false, fmt.Errorf("list challengeResponses for %s: %w", challengedDID, err)
 	}
-	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return false, fmt.Errorf("list challengeResponses for %s: HTTP %d - %s", challengedDID, resp.StatusCode, string(body))
-	}
-
-	var listResp struct {
-		Records []struct {
-			URI   string `json:"uri"`
-			Value struct {
-				Challenge struct {
-					URI string `json:"uri"`
-					CID string `json:"cid"`
-				} `json:"challenge"`
-				Response string `json:"response"`
-			} `json:"value"`
-		} `json:"records"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&listResp); err != nil {
-		return false, fmt.Errorf("decode challengeResponses list for %s: %w", challengedDID, err)
-	}
-
-	for _, record := range listResp.Records {
-		if record.Value.Response != "declined" {
+	for _, record := range records {
+		var value struct {
+			Challenge struct {
+				URI string `json:"uri"`
+				CID string `json:"cid"`
+			} `json:"challenge"`
+			Response string `json:"response"`
+		}
+		if err := json.Unmarshal(record.Value, &value); err != nil {
+			// atchess-1c9.119 fix-pass: skip-and-log -- see
+			// ListMovesForGame's comment for the full rationale.
+			log.Warn().Str("repo", challengedDID).Str("collection", "app.atchess.challengeResponse").Str("recordURI", record.URI).Err(err).
+				Msg("skipping malformed challengeResponse record: value did not decode into the expected shape")
 			continue
 		}
-		if record.Value.Challenge.URI != challengeURI {
+		if value.Response != "declined" {
 			continue
 		}
-		if record.Value.Challenge.CID != challengeCID {
+		if value.Challenge.URI != challengeURI {
+			continue
+		}
+		if value.Challenge.CID != challengeCID {
 			log.Warn().Str("challengeURI", challengeURI).Str("repo", challengedDID).Str("recordURI", record.URI).
-				Str("wantCID", challengeCID).Str("gotCID", record.Value.Challenge.CID).
+				Str("wantCID", challengeCID).Str("gotCID", value.Challenge.CID).
 				Msg("ignoring challengeResponse record: its challenge strongRef CID does not match the current challenge record")
 			continue
 		}
@@ -2740,6 +2682,133 @@ func (c *Client) getXRPC(ctx context.Context, base string, ownRepo bool, method 
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 	return c.httpClient.Do(req)
+}
+
+// listRecordsPageLimit is the page size requested from
+// com.atproto.repo.listRecords. 100 is the PDS's own maximum page size;
+// requesting it explicitly (rather than omitting "limit" and taking
+// whatever default the PDS chooses) keeps page count, and therefore
+// round-trip count, predictable.
+const listRecordsPageLimit = "100"
+
+// maxListRecordsPages bounds how many pages listAllRecords will fetch for
+// a single repo/collection scan before failing closed (atchess-1c9.119).
+// At 100 records/page (listRecordsPageLimit) this allows scanning up to
+// 20,000 records per call. That is comfortably above any real player's
+// per-collection record count today -- the bug this constant guards
+// against was first observed in the hundreds of records -- while still
+// giving every listAllRecords call a fixed, reviewable worst case instead
+// of "however many records the repo happens to hold." A repo that
+// legitimately exceeds this is treated as an error condition to raise
+// the cap deliberately, not as a truncation to paper over silently: see
+// listAllRecords's doc comment for why silent truncation is exactly the
+// bug this exists to prevent.
+//
+// A var, not a const, solely so tests can shrink it (see
+// TestListAllRecords_PageCapEnforced) to exercise the cap-exceeded path
+// without needing to seed the tens of thousands of records the real
+// default requires. Production code never assigns to this.
+var maxListRecordsPages = 200
+
+// errListRecordsPageCapExceeded is returned by listAllRecords when a
+// repo/collection scan is not exhausted within maxListRecordsPages pages.
+var errListRecordsPageCapExceeded = errors.New("listRecords: page cap exceeded")
+
+// pdsListRecord is the per-record envelope shared by every
+// com.atproto.repo.listRecords response, with Value left as raw JSON so
+// each caller can decode it into its own collection-specific struct.
+type pdsListRecord struct {
+	URI   string          `json:"uri"`
+	CID   string          `json:"cid"`
+	Value json.RawMessage `json:"value"`
+}
+
+// listAllRecords fully paginates com.atproto.repo.listRecords for
+// repo/collection against base, following the response's cursor until
+// the collection is exhausted, and returns every record found across all
+// pages.
+//
+// THIS IS THE SHARED PAGINATION HELPER for atchess-1c9.119: every call
+// site in this package that lists a collection and then reasons about
+// "the latest" record or "does a matching record exist" MUST route
+// through this function rather than issuing its own single-page
+// listRecords call. com.atproto.repo.listRecords caps each response at
+// listRecordsPageLimit records; a caller that reads only the first page
+// and stops is silently blind to everything past it.
+//
+// Do not assume page order correlates with recency for ANY collection
+// this package reads. As of atchess-1c9.113, app.atchess.move record
+// keys are deterministic hashes of (gameURI, ply) rather than
+// PDS-assigned TIDs, so listRecords order carries no chronological
+// information at all for that collection -- "read the newest page and
+// stop" is not a valid shortcut there even in principle. The other
+// collections this package reads (app.atchess.resignation,
+// app.atchess.timeViolation, app.atchess.drawResponse,
+// app.atchess.challengeResponse, app.atchess.drawOffer) still use
+// PDS-assigned TID rkeys, but atchess-1c9.100 already established that a
+// TID minted by one repo's PDS is not a trustworthy recency signal
+// against a TID minted by ANOTHER repo's PDS either -- and every one of
+// these scans reads across (or targets) repos whose TID clocks are not
+// mutually ordered. So for every collection here, full pagination is the
+// only correct option; there is no page to stop early on.
+//
+// Fails closed: if the collection is not exhausted within
+// maxListRecordsPages pages, this returns errListRecordsPageCapExceeded
+// wrapped with context, instead of silently returning the partial result
+// gathered so far. A truncated scan is exactly the atchess-1c9.119 bug --
+// a caller reasoning about "the latest" or "does X exist" over a partial
+// view can silently reach the wrong answer -- so raising the cap only
+// moves the cliff; it must never be papered over by truncating quietly.
+func (c *Client) listAllRecords(ctx context.Context, base string, ownRepo bool, repo, collection string) ([]pdsListRecord, error) {
+	var all []pdsListRecord
+	cursor := ""
+	for pageNum := 0; ; pageNum++ {
+		if pageNum >= maxListRecordsPages {
+			return nil, fmt.Errorf("%w: repo=%s collection=%s after %d pages (%d records read)",
+				errListRecordsPageCapExceeded, repo, collection, maxListRecordsPages, len(all))
+		}
+
+		params := url.Values{"repo": {repo}, "collection": {collection}, "limit": {listRecordsPageLimit}}
+		if cursor != "" {
+			params.Set("cursor", cursor)
+		}
+
+		resp, err := c.getXRPC(ctx, base, ownRepo, "com.atproto.repo.listRecords", params)
+		if err != nil {
+			return nil, fmt.Errorf("list %s for %s: %w", collection, repo, err)
+		}
+
+		var page struct {
+			Records []pdsListRecord `json:"records"`
+			Cursor  string          `json:"cursor"`
+		}
+		decodeErr := func() error {
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusOK {
+				body, _ := io.ReadAll(resp.Body)
+				return fmt.Errorf("list %s for %s: HTTP %d: %s", collection, repo, resp.StatusCode, string(body))
+			}
+			return json.NewDecoder(resp.Body).Decode(&page)
+		}()
+		if decodeErr != nil {
+			return nil, decodeErr
+		}
+
+		all = append(all, page.Records...)
+
+		// No cursor means the PDS has no further pages. An empty page
+		// with a cursor still present is treated as "keep following it"
+		// rather than "done", since a PDS is free to return a page
+		// narrower than the requested limit for reasons unrelated to
+		// exhaustion (e.g. a page's records straddling an internal
+		// boundary) -- only an EMPTY cursor is the documented
+		// end-of-collection signal.
+		if page.Cursor == "" {
+			break
+		}
+		cursor = page.Cursor
+	}
+	return all, nil
 }
 
 // ResolveHandle resolves a handle to a DID. A handle can be hosted on any
@@ -3247,59 +3316,48 @@ func (c *Client) ResignGame(ctx context.Context, gameID string, reason string) e
 // GetDrawOffers retrieves pending draw offers for a game
 func (c *Client) GetDrawOffers(ctx context.Context, gameID string) ([]*DrawOffer, error) {
 	// List draw offer records
-	params := url.Values{"repo": {c.did}, "collection": {"app.atchess.drawOffer"}, "limit": {"100"}}
-	resp, err := c.getXRPC(ctx, c.pdsURL, true, "com.atproto.repo.listRecords", params)
+	records, err := c.listAllRecords(ctx, c.pdsURL, true, c.did, "app.atchess.drawOffer")
 	if err != nil {
 		return nil, fmt.Errorf("failed to list draw offers: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("failed to list draw offers: HTTP %d - %s", resp.StatusCode, string(body))
-	}
-
-	var listResp struct {
-		Records []struct {
-			URI   string `json:"uri"`
-			CID   string `json:"cid"`
-			Value struct {
-				Type      string `json:"$type"`
-				CreatedAt string `json:"createdAt"`
-				Game      struct {
-					URI string `json:"uri"`
-					CID string `json:"cid"`
-				} `json:"game"`
-				OfferedBy   string `json:"offeredBy"`
-				MoveNumber  int    `json:"moveNumber"`
-				Message     string `json:"message"`
-				Status      string `json:"status"`
-				RespondedAt string `json:"respondedAt"`
-				RespondedBy string `json:"respondedBy"`
-			} `json:"value"`
-		} `json:"records"`
-	}
-
-	if err := json.NewDecoder(resp.Body).Decode(&listResp); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %w", err)
 	}
 
 	// Filter for the specific game and pending status
 	var offers []*DrawOffer
-	for _, record := range listResp.Records {
-		if record.Value.Game.URI == gameID && record.Value.Status == "pending" {
+	for _, record := range records {
+		var value struct {
+			Type      string `json:"$type"`
+			CreatedAt string `json:"createdAt"`
+			Game      struct {
+				URI string `json:"uri"`
+				CID string `json:"cid"`
+			} `json:"game"`
+			OfferedBy   string `json:"offeredBy"`
+			MoveNumber  int    `json:"moveNumber"`
+			Message     string `json:"message"`
+			Status      string `json:"status"`
+			RespondedAt string `json:"respondedAt"`
+			RespondedBy string `json:"respondedBy"`
+		}
+		if err := json.Unmarshal(record.Value, &value); err != nil {
+			// atchess-1c9.119 fix-pass: skip-and-log -- see
+			// ListMovesForGame's comment for the full rationale.
+			log.Warn().Str("repo", c.did).Str("collection", "app.atchess.drawOffer").Str("recordURI", record.URI).Err(err).
+				Msg("skipping malformed drawOffer record: value did not decode into the expected shape")
+			continue
+		}
+		if value.Game.URI == gameID && value.Status == "pending" {
 			offer := &DrawOffer{
 				URI:         record.URI,
 				CID:         record.CID,
-				CreatedAt:   record.Value.CreatedAt,
-				GameURI:     record.Value.Game.URI,
-				GameCID:     record.Value.Game.CID,
-				OfferedBy:   record.Value.OfferedBy,
-				MoveNumber:  record.Value.MoveNumber,
-				Message:     record.Value.Message,
-				Status:      record.Value.Status,
-				RespondedAt: record.Value.RespondedAt,
-				RespondedBy: record.Value.RespondedBy,
+				CreatedAt:   value.CreatedAt,
+				GameURI:     value.Game.URI,
+				GameCID:     value.Game.CID,
+				OfferedBy:   value.OfferedBy,
+				MoveNumber:  value.MoveNumber,
+				Message:     value.Message,
+				Status:      value.Status,
+				RespondedAt: value.RespondedAt,
+				RespondedBy: value.RespondedBy,
 			}
 			offers = append(offers, offer)
 		}
@@ -3538,62 +3596,70 @@ func (c *Client) getLastMove(ctx context.Context, gameID string, excludePlayerDI
 		rkey      string
 	}
 	var lastMoveTime time.Time
+	var errs []error
 
-	// Check moves from all players
+	// Check moves from all players. atchess-1c9.119 fix-pass: a per-player
+	// read failure here used to be silently skipped ("continue"), which
+	// made this function indistinguishable from "this player genuinely has
+	// no moves" -- and BOTH of this function's callers (CheckTimeViolation,
+	// GetTimeRemaining) treat a nil lastMove as "use the game's createdAt
+	// as last-activity". A skipped repo (e.g. one that now legitimately
+	// trips listAllRecords's page cap, or is merely unreachable) could
+	// therefore silently fall back to a stale createdAt timestamp and
+	// fabricate a time-violation forfeit against a player whose real,
+	// unreadable last move would have reset the clock. This mirrors
+	// getLatestMoveForGame's fail-closed contract instead: every read
+	// failure is accumulated and returned via errors.Join, and BOTH
+	// callers already check this function's error return before trusting
+	// a nil lastMove (see CheckTimeViolation/GetTimeRemaining), so no
+	// caller-side change was needed to make them fail closed too.
 	for _, playerDID := range players {
 		base, ownRepo, err := c.resolveReadEndpoint(ctx, playerDID)
 		if err != nil {
-			continue // Skip if we can't resolve this player's PDS
-		}
-		params := url.Values{"repo": {playerDID}, "collection": {"app.atchess.move"}, "limit": {"100"}}
-		resp, err := c.getXRPC(ctx, base, ownRepo, "com.atproto.repo.listRecords", params)
-		if err != nil {
-			continue // Skip if we can't access this player's moves
-		}
-		defer resp.Body.Close()
-
-		if resp.StatusCode != http.StatusOK {
+			errs = append(errs, fmt.Errorf("resolve read endpoint for %s: %w: %v", playerDID, ErrIncompleteDerivation, err))
 			continue
 		}
-
-		var listResp struct {
-			Records []struct {
-				URI   string `json:"uri"`
-				Value struct {
-					CreatedAt string `json:"createdAt"`
-					Game      struct {
-						URI string `json:"uri"`
-					} `json:"game"`
-					Player string `json:"player"`
-					FEN    string `json:"fen"`
-				} `json:"value"`
-			} `json:"records"`
-		}
-
-		if err := json.NewDecoder(resp.Body).Decode(&listResp); err != nil {
+		records, err := c.listAllRecords(ctx, base, ownRepo, playerDID, "app.atchess.move")
+		if err != nil {
+			errs = append(errs, fmt.Errorf("list moves for %s: %w: %v", playerDID, ErrIncompleteDerivation, err))
 			continue
 		}
 
 		// Find the most recent move for this game
-		for _, record := range listResp.Records {
-			if record.Value.Game.URI != gameID {
+		for _, record := range records {
+			var value struct {
+				CreatedAt string `json:"createdAt"`
+				Game      struct {
+					URI string `json:"uri"`
+				} `json:"game"`
+				Player string `json:"player"`
+				FEN    string `json:"fen"`
+			}
+			if err := json.Unmarshal(record.Value, &value); err != nil {
+				// atchess-1c9.119 fix-pass: skip-and-log -- see
+				// ListMovesForGame's comment for the full rationale.
+				log.Warn().Str("repo", playerDID).Str("collection", "app.atchess.move").Str("recordURI", record.URI).Err(err).
+					Msg("skipping malformed move record: value did not decode into the expected shape")
 				continue
 			}
-			if record.Value.Player != playerDID {
+			if value.Game.URI != gameID {
+				continue
+			}
+			if value.Player != playerDID {
 				log.Warn().Str("gameURI", gameID).Str("repo", playerDID).
-					Str("claimedPlayer", record.Value.Player).
+					Str("claimedPlayer", value.Player).
 					Str("recordURI", record.URI).
 					Msg("ignoring forged move record: repo owner is not the player it names as mover")
 				continue
 			}
-			if record.Value.Player != excludePlayerDID {
-				moveTime, err := time.Parse(time.RFC3339, record.Value.CreatedAt)
+			if value.Player != excludePlayerDID {
+				moveTime, err := time.Parse(time.RFC3339, value.CreatedAt)
 				if err != nil {
 					continue
 				}
 				rkey := recordKey(record.URI)
 
-				if lastMove == nil || moveRecordIsAfter(record.Value.FEN, moveTime, rkey, lastMove.FEN, lastMoveTime, lastMove.rkey) {
+				if lastMove == nil || moveRecordIsAfter(value.FEN, moveTime, rkey, lastMove.FEN, lastMoveTime, lastMove.rkey) {
 					lastMoveTime = moveTime
 					lastMove = &struct {
 						CreatedAt string
@@ -3601,9 +3667,9 @@ func (c *Client) getLastMove(ctx context.Context, gameID string, excludePlayerDI
 						FEN       string
 						rkey      string
 					}{
-						CreatedAt: record.Value.CreatedAt,
-						Player:    record.Value.Player,
-						FEN:       record.Value.FEN,
+						CreatedAt: value.CreatedAt,
+						Player:    value.Player,
+						FEN:       value.FEN,
 						rkey:      rkey,
 					}
 				}
@@ -3611,7 +3677,7 @@ func (c *Client) getLastMove(ctx context.Context, gameID string, excludePlayerDI
 		}
 	}
 
-	return lastMove, nil
+	return lastMove, errors.Join(errs...)
 }
 
 // ClaimTimeVictory claims victory due to opponent's time violation

@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -163,6 +165,13 @@ func (m *deriveTestPDS) handle(w http.ResponseWriter, r *http.Request) {
 	case "/xrpc/com.atproto.repo.listRecords":
 		q := r.URL.Query()
 		repo, collection := q.Get("repo"), q.Get("collection")
+		cursor := q.Get("cursor")
+		limit := 100
+		if l := q.Get("limit"); l != "" {
+			if parsed, err := strconv.Atoi(l); err == nil && parsed > 0 {
+				limit = parsed
+			}
+		}
 		m.mu.Lock()
 		fail := m.listFail[repo]
 		coll := m.records[repo][collection]
@@ -181,11 +190,54 @@ func (m *deriveTestPDS) handle(w http.ResponseWriter, r *http.Request) {
 			CID   string      `json:"cid"`
 			Value interface{} `json:"value"`
 		}
-		var recs []rec
-		for rkey, val := range coll {
-			recs = append(recs, rec{URI: fmt.Sprintf("at://%s/%s/%s", repo, collection, rkey), CID: "cid-" + rkey, Value: val})
+		// Real AT Protocol listRecords pagination: records are ordered by
+		// rkey (DESCENDING -- newest first -- by default; a "reverse" query
+		// param would flip that, but nothing in this codebase sends one).
+		// Confirmed empirically against the live local dual-PDS test
+		// harness's real PDS implementation (atchess-1c9.119 fix-pass: both
+		// a hash-rkey app.atchess.move collection and a TID-rkey
+		// app.atchess.game collection came back newest-rkey-first with no
+		// query parameters beyond repo/collection/limit). A page's
+		// "cursor" (when present) is the rkey to resume immediately AFTER
+		// in that same descending sequence, i.e. the next STRICTLY SMALLER
+		// rkey. This mock reproduces that shape -- rather than always
+		// returning every record on one page -- specifically so
+		// atchess-1c9.119's tests (a repo with more than one page of
+		// records) can exercise real multi-page traversal, not just a
+		// single oversized page, AND so a double that returns the WRONG
+		// order can't hide a client bug that only manifests when order
+		// doesn't match production (this package's client code is
+		// deliberately order-agnostic -- see listAllRecords's doc comment
+		// -- but the double should still tell the truth about what the
+		// real server actually does).
+		var rkeys []string
+		for rkey := range coll {
+			rkeys = append(rkeys, rkey)
 		}
-		_ = json.NewEncoder(w).Encode(map[string]interface{}{"records": recs})
+		sort.Sort(sort.Reverse(sort.StringSlice(rkeys)))
+		start := 0
+		if cursor != "" {
+			for i, rkey := range rkeys {
+				if rkey < cursor {
+					start = i
+					break
+				}
+				start = i + 1
+			}
+		}
+		end := start + limit
+		if end > len(rkeys) {
+			end = len(rkeys)
+		}
+		var recs []rec
+		for _, rkey := range rkeys[start:end] {
+			recs = append(recs, rec{URI: fmt.Sprintf("at://%s/%s/%s", repo, collection, rkey), CID: "cid-" + rkey, Value: coll[rkey]})
+		}
+		respBody := map[string]interface{}{"records": recs}
+		if end < len(rkeys) {
+			respBody["cursor"] = rkeys[end-1]
+		}
+		_ = json.NewEncoder(w).Encode(respBody)
 		return
 
 	case "/xrpc/com.atproto.repo.createRecord", "/xrpc/com.atproto.repo.putRecord":
