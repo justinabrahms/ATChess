@@ -162,8 +162,16 @@ func (s *Service) CheckAbandonmentHandler(w http.ResponseWriter, r *http.Request
 		if errors.Is(err, atproto.ErrIncompleteDerivation) && game != nil {
 			log.Warn().Err(err).Str("gameID", gameID).Msg("Game status derivation incomplete for abandonment check; withholding verdict")
 			w.Header().Set("Content-Type", "application/json")
+			// Deliberately omit "abandoned" rather than reporting `false`
+			// (atchess-1c9.66): a scan that could not complete cannot
+			// distinguish "not abandoned" from "abandoned, but the
+			// evidence for it lives in the unreachable repo". Reporting
+			// `false` here would be exactly the false reassurance this
+			// bead exists to remove -- an unverified negative dressed up
+			// as a verified one. Callers must key off
+			// "derivationIncomplete" (and the absence of "abandoned") to
+			// know the abandonment state is unknown, not "no".
 			_ = json.NewEncoder(w).Encode(map[string]interface{}{
-				"abandoned":            false,
 				"canClaim":             false,
 				"derivationIncomplete": true,
 				"reason":               "Game status could not be verified (one or more repos unreachable); try again",

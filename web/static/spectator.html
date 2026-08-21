@@ -240,7 +240,31 @@
             background: #f0f0f0;
             border-radius: 4px;
         }
-        
+
+        /* Shown when the spectator API could not fully verify this game's
+           status (nested game.derivationIncomplete in the
+           GetSpectatorGameHandler response body -- see
+           internal/web/spectator.go and chess.Game.DerivationIncomplete).
+           Not an error state -- the board/material shown is partial or
+           possibly stale, not wrong -- so it's a cautionary color with
+           plain-language copy, not a red error banner or a tooltip. See
+           atchess-1c9.66. */
+        .derivation-warning {
+            display: none;
+            text-align: center;
+            font-size: 13px;
+            margin: 0 0 15px 0;
+            padding: 10px;
+            background: #fff3cd;
+            color: #856404;
+            border: 1px solid #ffeeba;
+            border-radius: 4px;
+        }
+
+        .derivation-warning.visible {
+            display: block;
+        }
+
         .sidebar {
             background: white;
             padding: 20px;
@@ -448,6 +472,9 @@
             
             <div class="game-layout">
                 <div class="board-section">
+                    <div class="derivation-warning" id="derivationWarning">
+                        &#9888; Status not fully verified &mdash; we could not confirm the latest game state from all servers. What's shown below may be out of date.
+                    </div>
                     <div class="turn-indicator" id="turnIndicator">
                         White to move
                     </div>
@@ -674,15 +701,32 @@
                 const game = data.game;
                 this.currentFEN = game.fen || game.FEN;
                 this.moves = data.moves || [];
-                
+
                 this.updateBoardFromFEN();
                 this.updateTurnIndicator();
                 this.updateMaterialCount(data.materialCount);
                 this.updateMoveHistory();
-                
+                this.updateDerivationWarning(game);
+
                 if (data.lastMove) {
                     this.highlightLastMove(data.lastMove);
                 }
+            }
+
+            // game.derivationIncomplete is only present (and true) when the
+            // server could not fully verify this game's status -- see
+            // GetSpectatorGameHandler (internal/web/spectator.go) and
+            // chess.Game.DerivationIncomplete. It is omitted entirely when
+            // false, so an absent/undefined value must be treated as
+            // "verified", not as "unknown" -- hence the strict `=== true`
+            // check rather than a truthiness check on mere presence.
+            updateDerivationWarning(game) {
+                const el = document.getElementById('derivationWarning');
+                if (!el) {
+                    return;
+                }
+                const derivationIncomplete = !!game && game.derivationIncomplete === true;
+                el.classList.toggle('visible', derivationIncomplete);
             }
             
             updateBoardFromFEN() {

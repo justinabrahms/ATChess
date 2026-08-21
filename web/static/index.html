@@ -319,7 +319,29 @@
             background: #f8d7da;
             color: #721c24;
         }
-        
+
+        /* Shown when the server could not fully verify the game's status
+           (chess.Game.DerivationIncomplete / JSON "derivationIncomplete").
+           This is not an error -- the game data is partial/possibly-stale,
+           not wrong or broken -- so it uses a cautionary (not red/error)
+           color and plain-language copy a non-technical player can read
+           without hovering over anything. See atchess-1c9.66. */
+        .derivation-warning {
+            display: none;
+            padding: 10px;
+            border-radius: 4px;
+            margin-bottom: 15px;
+            background: #fff3cd;
+            color: #856404;
+            border: 1px solid #ffeeba;
+            font-size: 13px;
+            text-align: center;
+        }
+
+        .derivation-warning.visible {
+            display: block;
+        }
+
         .game-info-row {
             display: flex;
             justify-content: space-between;
@@ -613,6 +635,9 @@
                 <div class="sidebar-card">
                     <h3>Game Info</h3>
                     <div class="game-status active" id="gameStatus">Ready to play</div>
+                    <div class="derivation-warning" id="derivationWarning">
+                        &#9888; Status not fully verified &mdash; we could not confirm the latest game state from all servers. What's shown below may be out of date.
+                    </div>
                     <div class="game-info-row">
                         <span class="game-info-label">Current Turn:</span>
                         <span class="game-info-value" id="currentTurn">-</span>
@@ -1240,6 +1265,8 @@
         
         // Update game status display
         function updateGameStatus() {
+            const derivationWarningEl = document.getElementById('derivationWarning');
+
             if (!currentGame) {
                 document.getElementById('gameStatus').textContent = 'No active game';
                 document.getElementById('gameStatus').className = 'game-status waiting';
@@ -1247,14 +1274,29 @@
                 document.getElementById('playingAs').textContent = '-';
                 document.getElementById('opponent').textContent = '-';
                 document.getElementById('gameActions').style.display = 'none';
+                derivationWarningEl.classList.remove('visible');
                 return;
             }
-            
+
+            // currentGame.derivationIncomplete is only present (and true)
+            // when the server could not fully verify this game's status
+            // (see internal/chess/types.go's DerivationIncomplete doc
+            // comment). The field is omitted entirely when false, so an
+            // absent/undefined value here must be treated as "verified",
+            // not as "unknown" -- hence the strict `=== true` check rather
+            // than a truthiness check on the property's mere presence.
+            const derivationIncomplete = currentGame.derivationIncomplete === true;
+            derivationWarningEl.classList.toggle('visible', derivationIncomplete);
+
             const myColor = getMyColor();
             const [, turn] = currentFEN.split(' ');
             const isMyTurn = (turn === 'w' && myColor === 'white') || (turn === 'b' && myColor === 'black');
             
-            document.getElementById('gameStatus').textContent = isMyTurn ? 'Your turn' : "Opponent's turn";
+            let statusText = isMyTurn ? 'Your turn' : "Opponent's turn";
+            if (derivationIncomplete) {
+                statusText += ' (unverified)';
+            }
+            document.getElementById('gameStatus').textContent = statusText;
             document.getElementById('gameStatus').className = 'game-status ' + (isMyTurn ? 'active' : 'waiting');
             document.getElementById('currentTurn').textContent = turn === 'w' ? 'White' : 'Black';
             document.getElementById('playingAs').textContent = myColor.charAt(0).toUpperCase() + myColor.slice(1);

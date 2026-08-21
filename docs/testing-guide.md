@@ -295,6 +295,52 @@ curl -X POST http://localhost:3003/xrpc/com.atproto.server.createSession \
 # with the respective access tokens from each PDS
 ```
 
+#### 3. Manual Check: Unverified Status Banner (derivationIncomplete)
+
+This verifies atchess-1c9.66: when the server can't fully verify a game's
+status (e.g. one player's PDS is unreachable while scanning for terminal
+events), the API returns HTTP 200 with the partial game plus
+`"derivationIncomplete": true` instead of a misleading 404 -- and the web
+UI must visibly mark that status as unverified rather than showing it as
+authoritative.
+
+1. Start the dual-PDS environment and create a cross-PDS game between
+   `user3.test` (on the `pds-alice` container) and `user4.test` (on
+   `pds-bob`), per scenario 1 above. Note the game's ID/URL from the
+   address bar after opening it in the web UI (`http://localhost:8081`).
+2. Make the *opponent's* PDS unreachable while leaving the game owner's PDS
+   running, e.g.:
+   ```bash
+   docker compose -f docker-compose.dual-pds.yml stop pds-bob
+   ```
+   (Use whichever of `pds-alice`/`pds-bob` is NOT the account you're
+   viewing the game as -- the read handlers only report
+   `derivationIncomplete` when the scan needs data from a repo it can't
+   reach.)
+3. Reload the game page (`index.html`) as the player whose own PDS is
+   still up. Expected: a yellow/amber banner reading "Status not fully
+   verified -- we could not confirm the latest game state from all
+   servers. What's shown below may be out of date." appears above the
+   game info, and the turn/status line itself gets an "(unverified)"
+   suffix (e.g. "Your turn (unverified)"). The board and other game data
+   still render normally -- this is not an error page.
+4. Repeat via the spectator view (`spectator.html`) for the same game:
+   expected is the same banner text above the turn indicator.
+5. Restart the stopped PDS and reload both pages again:
+   ```bash
+   docker compose -f docker-compose.dual-pds.yml start pds-bob
+   ```
+   Expected: the banner disappears and the status text no longer has the
+   "(unverified)" suffix, since `derivationIncomplete` is now absent from
+   the response.
+6. Optional: hit `GET /api/games/{id}/abandoned` for the same game while
+   the opponent's PDS is still down (step 2). Expected: the JSON body has
+   `"derivationIncomplete": true` and `"canClaim": false`, and
+   deliberately has **no** `"abandoned"` key -- the handler withholds that
+   verdict rather than reporting a possibly-false `"abandoned": false"`
+   (neither `index.html` nor `spectator.html` surfaces abandonment in the
+   UI today, so there's no visual step for this one).
+
 ### What Cross-PDS Testing Identifies
 
 1. **Federation Issues**: Problems with AT Protocol record synchronization across PDSes
