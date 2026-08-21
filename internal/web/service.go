@@ -453,8 +453,26 @@ func (s *Service) GetGameHandler(w http.ResponseWriter, r *http.Request) {
 			_ = json.NewEncoder(w).Encode(game)
 			return
 		}
-		log.Error().Err(err).Str("gameID", gameID).Msg("Failed to fetch game")
-		http.Error(w, "Game not found", http.StatusNotFound)
+		// atchess-1c9.67: the case above is GetGame failing AFTER reading the
+		// game record (a per-repo derivation scan hiccup, with a partial game
+		// to show for it). Below is GetGame failing BEFORE ever reading the
+		// record -- there is no partial game here, so there is nothing
+		// truthful to render; the three outcomes below are the ones GetGame's
+		// doc comment enumerates. Absence must be proven (ErrRecordNotFound,
+		// the PDS affirmatively said so), never inferred from "could not
+		// tell" (ErrRecordUnavailable) or from a malformed request
+		// (ErrInvalidGameURI, the caller's fault, not the game's).
+		switch {
+		case errors.Is(err, atproto.ErrRecordNotFound):
+			log.Warn().Err(err).Str("gameID", gameID).Msg("Game record not found")
+			http.Error(w, "Game not found", http.StatusNotFound)
+		case errors.Is(err, atproto.ErrInvalidGameURI):
+			log.Warn().Err(err).Str("gameID", gameID).Msg("Malformed game URI")
+			http.Error(w, "Invalid game ID", http.StatusBadRequest)
+		default:
+			log.Error().Err(err).Str("gameID", gameID).Msg("Failed to fetch game")
+			http.Error(w, "Game status could not be retrieved; try again", http.StatusBadGateway)
+		}
 		return
 	}
 

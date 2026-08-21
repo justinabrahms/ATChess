@@ -65,6 +65,15 @@ var ErrRecordNotFound = errors.New("record not found")
 // a verdict about what exists).
 var ErrRecordUnavailable = errors.New("record temporarily unavailable")
 
+// ErrInvalidGameURI indicates a caller-supplied game URI is not a
+// well-formed "at://DID/app.atchess.game/RKEY" string. This is always the
+// caller's fault -- a malformed request, never anything the PDS could have
+// told us -- so it must be kept out of both ErrRecordNotFound (which
+// claims the PDS affirmatively said the record is absent) and
+// ErrRecordUnavailable (which claims a transient upstream failure): see
+// GetGame's doc comment and atchess-1c9.67.
+var ErrInvalidGameURI = errors.New("invalid game URI")
+
 // ErrNotChallengeParticipant indicates the authenticated caller is
 // neither the challenger nor the challenged party named in a challenge
 // record -- see AcceptChallenge.
@@ -2548,6 +2557,29 @@ func (c *Client) getChallengeDeclineOutcome(ctx context.Context, challengeURI, c
 	return false, nil
 }
 
+// GetGame's initial record fetch (down to the getResp decode below) makes
+// the SAME three-way distinction as AcceptChallenge/getGameRecord, and for
+// the same reason (atchess-1c9.67, following atchess-1c9.53's precedent on
+// the sibling code path where the game record itself is readable but a
+// per-repo derivation scan fails):
+//
+//   - A malformed gameURI wraps ErrInvalidGameURI -- the caller's fault,
+//     never anything the PDS said; callers should treat this as 400.
+//   - The PDS affirmatively reporting the record absent (RecordNotFound,
+//     detected via isRecordNotFoundBody -- see ErrRecordNotFound's doc
+//     comment for why the status code alone is not trustworthy) wraps
+//     ErrRecordNotFound; callers should treat this as 404 -- the only case
+//     that may claim the game does not exist.
+//   - Everything else that can happen before a record is ever in hand --
+//     DID/endpoint resolution failure, a transport error reaching the PDS,
+//     a non-200/non-RecordNotFound HTTP response, or a response body that
+//     fails to decode -- wraps ErrRecordUnavailable; callers should treat
+//     this as a transient upstream problem (502), NOT absence. Unlike
+//     atchess-1c9.53's fix for the post-fetch derivation-incomplete case,
+//     there is no partial *chess.Game to hand back here: the record itself
+//     was never read, so there is nothing truthful to render. A 200-with-
+//     flag response is therefore not an option on this path -- the honest
+//     answer is "we don't know, try again," not a fabricated game.
 func (c *Client) GetGame(ctx context.Context, gameURI string) (*chess.Game, error) {
 	// Parse the AT Protocol URI to extract repo and rkey
 	// Example URI: at://did:plc:example/app.atchess.game/3k2uv5...
@@ -2556,8 +2588,13 @@ func (c *Client) GetGame(ctx context.Context, gameURI string) (*chess.Game, erro
 	// Parse the URI to extract components
 	// Format: at://did:plc:USER/app.atchess.game/RKEY
 	parts := strings.Split(gameURI, "/")
-	if len(parts) < 4 || !strings.HasPrefix(gameURI, "at://") {
-		return nil, fmt.Errorf("invalid AT Protocol URI format: %s", gameURI)
+	// len(parts) < 5, not < 4: parts[4] is read below, and a URI with no
+	// rkey segment at all (e.g. "at://did:plc:x/app.atchess.game", 4 parts)
+	// must not slip past this guard -- getGameRecord's sibling parse
+	// (~line 1294) already gets this right; this copy previously diverged
+	// and panicked on exactly that input (atchess-1c9.67 review fix).
+	if len(parts) < 5 || !strings.HasPrefix(gameURI, "at://") {
+		return nil, fmt.Errorf("%w: %s", ErrInvalidGameURI, gameURI)
 	}
 
 	repo := parts[2] // The DID
@@ -2565,17 +2602,21 @@ func (c *Client) GetGame(ctx context.Context, gameURI string) (*chess.Game, erro
 
 	base, ownRepo, err := c.resolveReadEndpoint(ctx, repo)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get game record: %w", err)
+		return nil, fmt.Errorf("game %s: %w: %v", gameURI, ErrRecordUnavailable, err)
 	}
 	params := url.Values{"repo": {repo}, "collection": {"app.atchess.game"}, "rkey": {rkey}}
 	resp, err := c.getXRPC(ctx, base, ownRepo, "com.atproto.repo.getRecord", params)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get game record: %w", err)
+		return nil, fmt.Errorf("game %s: %w: %v", gameURI, ErrRecordUnavailable, err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("failed to get game record: HTTP %d", resp.StatusCode)
+		body, _ := io.ReadAll(resp.Body)
+		if isRecordNotFoundBody(body) {
+			return nil, fmt.Errorf("game %s: %w", gameURI, ErrRecordNotFound)
+		}
+		return nil, fmt.Errorf("game %s: %w: HTTP %d - %s", gameURI, ErrRecordUnavailable, resp.StatusCode, string(body))
 	}
 
 	var getResp struct {
@@ -2597,7 +2638,7 @@ func (c *Client) GetGame(ctx context.Context, gameURI string) (*chess.Game, erro
 	}
 
 	if err := json.NewDecoder(resp.Body).Decode(&getResp); err != nil {
-		return nil, fmt.Errorf("failed to decode response: %w", err)
+		return nil, fmt.Errorf("game %s: %w: failed to decode response: %v", gameURI, ErrRecordUnavailable, err)
 	}
 
 	var timeControl *chess.TimeControl

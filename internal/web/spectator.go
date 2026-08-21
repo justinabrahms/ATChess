@@ -73,8 +73,24 @@ func (s *Service) GetSpectatorGameHandler(w http.ResponseWriter, r *http.Request
 	// game) means the record genuinely could not be found.
 	game, err := s.serverClient.GetGame(context.Background(), gameID)
 	if err != nil && !(errors.Is(err, atproto.ErrIncompleteDerivation) && game != nil) {
-		log.Error().Err(err).Str("gameID", gameID).Msg("Failed to fetch game for spectator")
-		http.Error(w, "Game not found", http.StatusNotFound)
+		// atchess-1c9.67: GetGame failing before ever reading the record --
+		// see GetGame's doc comment and GetGameHandler's fuller rationale in
+		// service.go. There is no partial game to render on this path, so
+		// (unlike the ErrIncompleteDerivation case above) absence must be
+		// proven via ErrRecordNotFound, never inferred from a transient
+		// upstream failure (ErrRecordUnavailable) or a malformed request
+		// (ErrInvalidGameURI).
+		switch {
+		case errors.Is(err, atproto.ErrRecordNotFound):
+			log.Warn().Err(err).Str("gameID", gameID).Msg("Game record not found for spectator")
+			http.Error(w, "Game not found", http.StatusNotFound)
+		case errors.Is(err, atproto.ErrInvalidGameURI):
+			log.Warn().Err(err).Str("gameID", gameID).Msg("Malformed game URI for spectator")
+			http.Error(w, "Invalid game ID", http.StatusBadRequest)
+		default:
+			log.Error().Err(err).Str("gameID", gameID).Msg("Failed to fetch game for spectator")
+			http.Error(w, "Game status could not be retrieved; try again", http.StatusBadGateway)
+		}
 		return
 	}
 	if err != nil {
@@ -178,7 +194,23 @@ func (s *Service) CheckAbandonmentHandler(w http.ResponseWriter, r *http.Request
 			})
 			return
 		}
-		http.Error(w, "Game not found", http.StatusNotFound)
+		// atchess-1c9.67: GetGame failing before ever reading the record --
+		// see GetGame's doc comment. There is no partial game here, so
+		// (unlike the ErrIncompleteDerivation branch above) absence must be
+		// proven via ErrRecordNotFound, never inferred from a transient
+		// upstream failure (ErrRecordUnavailable) or a malformed request
+		// (ErrInvalidGameURI).
+		switch {
+		case errors.Is(err, atproto.ErrRecordNotFound):
+			log.Warn().Err(err).Str("gameID", gameID).Msg("Game record not found for abandonment check")
+			http.Error(w, "Game not found", http.StatusNotFound)
+		case errors.Is(err, atproto.ErrInvalidGameURI):
+			log.Warn().Err(err).Str("gameID", gameID).Msg("Malformed game URI for abandonment check")
+			http.Error(w, "Invalid game ID", http.StatusBadRequest)
+		default:
+			log.Error().Err(err).Str("gameID", gameID).Msg("Failed to fetch game for abandonment check")
+			http.Error(w, "Game status could not be retrieved; try again", http.StatusBadGateway)
+		}
 		return
 	}
 
