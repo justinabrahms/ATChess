@@ -41,6 +41,14 @@ type acceptTestPDS struct {
 	mu      sync.Mutex
 	records map[string]map[string]map[string]*storedRecord // repo -> collection -> rkey -> record
 	seq     int
+
+	// listFail, when set for a repo DID, makes every
+	// com.atproto.repo.listRecords call against that repo misbehave in the
+	// given way ("http500" -- a bare HTTP 500). Used to pin
+	// getChallengeDeclineOutcome's fail-open policy (atchess-1c9.91): an
+	// unreachable challengeResponse listing must not block a legitimate
+	// accept.
+	listFail map[string]string
 }
 
 func newAcceptTestPDS(t *testing.T) *acceptTestPDS {
@@ -90,6 +98,8 @@ func (p *acceptTestPDS) handle(w http.ResponseWriter, r *http.Request) {
 		p.handleCreate(w, r)
 	case "/xrpc/com.atproto.repo.getRecord":
 		p.handleGet(w, r)
+	case "/xrpc/com.atproto.repo.listRecords":
+		p.handleList(w, r)
 	default:
 		w.WriteHeader(http.StatusNotFound)
 	}
@@ -156,6 +166,76 @@ func (p *acceptTestPDS) handleGet(w http.ResponseWriter, r *http.Request) {
 		"cid":   rec.cid,
 		"value": rec.value,
 	})
+}
+
+// handleList serves com.atproto.repo.listRecords, needed by
+// getChallengeDeclineOutcome's cross-repo (from the accepting client's own
+// perspective: same-repo) read for a durable decline.
+func (p *acceptTestPDS) handleList(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	repo, collection := q.Get("repo"), q.Get("collection")
+
+	p.mu.Lock()
+	fail := p.listFail[repo]
+	var coll map[string]*storedRecord
+	if byColl := p.records[repo]; byColl != nil {
+		coll = byColl[collection]
+	}
+	p.mu.Unlock()
+
+	if fail == "http500" {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
+	type rec struct {
+		URI   string      `json:"uri"`
+		CID   string      `json:"cid"`
+		Value interface{} `json:"value"`
+	}
+	var recs []rec
+	for rkey, stored := range coll {
+		recs = append(recs, rec{URI: fmt.Sprintf("at://%s/%s/%s", repo, collection, rkey), CID: stored.cid, Value: stored.value})
+	}
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{"records": recs})
+}
+
+// setListFail makes every com.atproto.repo.listRecords call against did's
+// repo return a bare HTTP 500 -- see acceptTestPDS.listFail.
+func (p *acceptTestPDS) setListFail(did, mode string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.listFail == nil {
+		p.listFail = map[string]string{}
+	}
+	p.listFail[did] = mode
+}
+
+// putChallengeResponse seeds an app.atchess.challengeResponse record
+// directly into repo's simulated collection -- mirroring RespondToChallenge's
+// own shape (a "challenge" strongRef of uri+cid, plus "response") -- so
+// tests can plant a durable decline (or a forged one, in the WRONG repo)
+// without going through the full DeclineChallengeHandler/RespondToChallenge
+// path.
+func (p *acceptTestPDS) putChallengeResponse(repo, rkey, challengeURI, challengeCID, response string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.records[repo] == nil {
+		p.records[repo] = map[string]map[string]*storedRecord{}
+	}
+	if p.records[repo]["app.atchess.challengeResponse"] == nil {
+		p.records[repo]["app.atchess.challengeResponse"] = map[string]*storedRecord{}
+	}
+	cid := p.nextID("cid")
+	p.records[repo]["app.atchess.challengeResponse"][rkey] = &storedRecord{cid: cid, value: map[string]interface{}{
+		"$type":     "app.atchess.challengeResponse",
+		"createdAt": time.Now().Format(time.RFC3339),
+		"challenge": map[string]interface{}{
+			"uri": challengeURI,
+			"cid": challengeCID,
+		},
+		"response": response,
+	}}
 }
 
 // putChallenge seeds an app.atchess.challenge record directly into repo's
@@ -597,10 +677,10 @@ func TestAcceptChallenge_Expired_Rejected(t *testing.T) {
 
 // TestAcceptChallenge_DeclinedStatus_Rejected and
 // TestAcceptChallenge_AcceptedStatus_Rejected cover the challenge
-// record's own "status" field. See AcceptChallenge's doc comment for the
-// known limitation this does NOT cover (a decline recorded as a separate
-// app.atchess.challengeResponse record, which this method cannot see
-// without a cross-repo read it deliberately does not perform).
+// record's own "status" field. See the tests below
+// (TestAcceptChallenge_DurablyDeclined_Rejected and friends,
+// atchess-1c9.91) for the SEPARATE app.atchess.challengeResponse-record
+// case this field check alone cannot see.
 func TestAcceptChallenge_DeclinedStatus_Rejected(t *testing.T) {
 	pds := newAcceptTestPDS(t)
 	challengeURI, _ := seedChallengeWith(pds, testChallengerDID, testChallengedDID, "declchal", "declgame", "declined", time.Now().Add(24*time.Hour))
@@ -632,5 +712,120 @@ func TestAcceptChallenge_AcceptedStatus_Rejected(t *testing.T) {
 	}
 	if n := pds.gameCount(testChallengedDID); n != 0 {
 		t.Errorf("expected no game record to have been created, got %d", n)
+	}
+}
+
+// ---------------------------------------------------------------------
+// atchess-1c9.91: durable decline detection (getChallengeDeclineOutcome).
+// ---------------------------------------------------------------------
+
+// TestAcceptChallenge_DurablyDeclined_Rejected is the core regression this
+// bead exists for: the challenge record's OWN "status" field still says
+// "pending" (RespondToChallenge never touches it -- AT Protocol forbids
+// writing into the challenger's repo), but the challenged player already
+// declined via a SEPARATE app.atchess.challengeResponse record in their
+// own repo. Per atchess-1c9.91's step-zero finding, the same player who
+// declined is the only one who could ever call accept -- this is the
+// stale-tab/double-submit self-override case, not a cross-party attack --
+// but it must still be refused: a declined challenge must not be
+// acceptable.
+func TestAcceptChallenge_DurablyDeclined_Rejected(t *testing.T) {
+	pds := newAcceptTestPDS(t)
+	challengeURI, challengeCID := seedBasicChallenge(pds)
+
+	// The challenged player's own honest decline, written into THEIR OWN
+	// repo (exactly what RespondToChallenge does), referencing the real
+	// challenge by its real strongRef.
+	pds.putChallengeResponse(testChallengedDID, "declresp1", challengeURI, challengeCID, "declined")
+
+	challenged := acceptTestClient(t, pds, testChallengedDID)
+	game, err := challenged.AcceptChallenge(context.Background(), challengeURI)
+	if err == nil {
+		t.Fatalf("expected AcceptChallenge to refuse a durably declined challenge, but it SUCCEEDED and returned game %+v", game)
+	}
+	if !errors.Is(err, ErrChallengeNotAcceptable) {
+		t.Errorf("expected an error wrapping ErrChallengeNotAcceptable, got: %v", err)
+	}
+	if n := pds.gameCount(testChallengedDID); n != 0 {
+		t.Errorf("expected no game record to have been created for a durably declined challenge, got %d", n)
+	}
+}
+
+// TestAcceptChallenge_ForgedDeclineWrongRepo_DoesNotBlock proves the
+// corroboration half of the fix: a challengeResponse record does NOT
+// count unless it lives in the CHALLENGED player's own repo -- the only
+// repo RespondToChallenge could ever have written it into. A record
+// planted in the CHALLENGER's own repo (or any other repo) claiming to
+// decline must never block a legitimate, honest accept.
+func TestAcceptChallenge_ForgedDeclineWrongRepo_DoesNotBlock(t *testing.T) {
+	pds := newAcceptTestPDS(t)
+	challengeURI, challengeCID := seedBasicChallenge(pds)
+
+	// Planted in the CHALLENGER's own repo, not the challenged player's --
+	// this is the "wrong repo" case: getChallengeDeclineOutcome only ever
+	// lists challengedDID's own repo, so this record is never even
+	// examined.
+	pds.putChallengeResponse(testChallengerDID, "forgeddecl1", challengeURI, challengeCID, "declined")
+
+	challenged := acceptTestClient(t, pds, testChallengedDID)
+	game, err := challenged.AcceptChallenge(context.Background(), challengeURI)
+	if err != nil {
+		t.Fatalf("expected the honest accept to succeed despite a decline record forged into the WRONG repo, got error: %v", err)
+	}
+	if game == nil {
+		t.Fatal("expected a game, got nil")
+	}
+	if n := pds.gameCount(testChallengedDID); n != 1 {
+		t.Errorf("expected exactly 1 game record, got %d", n)
+	}
+}
+
+// TestAcceptChallenge_HonestAcceptNoDecline_StillWorks is the regression
+// that matters most: an ordinary accept, with no decline record anywhere,
+// must still succeed once the durable-decline check is added to the
+// accept path.
+func TestAcceptChallenge_HonestAcceptNoDecline_StillWorks(t *testing.T) {
+	pds := newAcceptTestPDS(t)
+	challengeURI, _ := seedBasicChallenge(pds)
+
+	challenged := acceptTestClient(t, pds, testChallengedDID)
+	game, err := challenged.AcceptChallenge(context.Background(), challengeURI)
+	if err != nil {
+		t.Fatalf("expected an honest accept with no decline record to succeed, got error: %v", err)
+	}
+	if game == nil {
+		t.Fatal("expected a game, got nil")
+	}
+	if n := pds.gameCount(testChallengedDID); n != 1 {
+		t.Errorf("expected exactly 1 game record, got %d", n)
+	}
+}
+
+// TestAcceptChallenge_DeclineCheckUnreachable_FailsOpen pins the
+// deliberate fail-open policy (atchess-1c9.91, see
+// getChallengeDeclineOutcome's doc comment): when the challenged player's
+// own repo cannot be listed for a durable decline (here, a bare HTTP 500),
+// AcceptChallenge proceeds with the accept rather than refusing it. This
+// is deliberately NOT fail-closed, unlike ErrIncompleteDerivation's policy
+// for cross-player game-status derivation -- decliner and accepter are
+// provably the same identity here (AcceptChallenge's role gate already
+// requires it), so there is no cross-party override this could protect
+// against, and the repo being listed is the SAME one that just
+// authenticated this very request.
+func TestAcceptChallenge_DeclineCheckUnreachable_FailsOpen(t *testing.T) {
+	pds := newAcceptTestPDS(t)
+	challengeURI, _ := seedBasicChallenge(pds)
+	pds.setListFail(testChallengedDID, "http500")
+
+	challenged := acceptTestClient(t, pds, testChallengedDID)
+	game, err := challenged.AcceptChallenge(context.Background(), challengeURI)
+	if err != nil {
+		t.Fatalf("expected AcceptChallenge to fail OPEN (proceed) when the decline check's listRecords call is unreachable, got error: %v", err)
+	}
+	if game == nil {
+		t.Fatal("expected a game, got nil")
+	}
+	if n := pds.gameCount(testChallengedDID); n != 1 {
+		t.Errorf("expected exactly 1 game record, got %d", n)
 	}
 }

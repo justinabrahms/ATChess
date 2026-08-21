@@ -91,13 +91,16 @@ var ErrOnlyChallengedMayAccept = errors.New("only the challenged player may acce
 // returned).
 var ErrChallengeConflict = errors.New("challenge conflicts with an existing, unrelated game record")
 
-// ErrChallengeNotAcceptable indicates the challenge record itself is not
-// in an acceptable state: its own "status" field is "declined" or
-// "accepted", or its "expiresAt" is in the past. See AcceptChallenge's
-// doc comment for this check's known limitation (it cannot see a decline
-// recorded as a SEPARATE app.atchess.challengeResponse record in the
-// decliner's own repo -- that requires a cross-repo read this method does
-// not perform; tracked as separate follow-up work, out of scope here).
+// ErrChallengeNotAcceptable indicates the challenge is not in an
+// acceptable state, for either of two reasons: (1) the challenge record
+// ITSELF says so -- its own "status" field is "declined" or "accepted",
+// or its "expiresAt" is in the past; or (2) a durable decline exists as a
+// SEPARATE app.atchess.challengeResponse record in the challenged
+// player's own repo (see RespondToChallenge and
+// getChallengeDeclineOutcome), which the challenge record's own fields
+// cannot reflect (AT Protocol forbids writing into someone else's repo,
+// so the decliner can never update the challenger's copy). See
+// AcceptChallenge's doc comment for both checks.
 var ErrChallengeNotAcceptable = errors.New("challenge is not in an acceptable state")
 
 // ErrChallengeChallengerForged indicates a challenge record's
@@ -654,14 +657,15 @@ func gameRecordReferencesChallenge(value map[string]interface{}, challengeURI st
 // The challenge record's OWN "status" and "expiresAt" fields are also
 // checked: "declined" or "accepted" status, or a past expiresAt, are
 // rejected with ErrChallengeNotAcceptable rather than silently accepted.
-// KNOWN LIMITATION: a decline is actually recorded as a SEPARATE
-// app.atchess.challengeResponse record in the DECLINING player's own
-// repo (see RespondToChallenge), not as a status flip on the challenge
-// record itself -- this method does not perform that cross-repo read, so
-// it cannot durably detect every decline this way. That gap is tracked as
-// separate follow-up work (out of scope for atchess-1c9.29); this check
-// only catches a challenge record whose own status/expiresAt fields make
-// the answer obvious without a second read.
+// A decline is actually recorded as a SEPARATE app.atchess.challengeResponse
+// record in the DECLINING player's own repo (see RespondToChallenge), not
+// as a status flip on the challenge record itself, so this field check
+// alone cannot see it (atchess-1c9.29's known limitation). AFTER the role
+// gate below establishes that the caller IS the challenged party,
+// getChallengeDeclineOutcome performs that second, own-repo read and
+// rejects with the same ErrChallengeNotAcceptable if a durable decline is
+// found (atchess-1c9.91) -- see that method's doc comment for the
+// fail-open policy on an unreachable repo.
 //
 // IDEMPOTENCY: the resulting game's rkey is the challenge's own
 // proposedGameId -- deterministic, not random -- and the game always
@@ -752,9 +756,9 @@ func (c *Client) AcceptChallenge(ctx context.Context, challengeURI string) (*che
 	}
 
 	// Reject a challenge whose OWN record already says it is not
-	// acceptable -- see the doc comment above for this check's known
-	// limitation (it cannot see a decline recorded in a separate
-	// app.atchess.challengeResponse record).
+	// acceptable. This cannot see a decline recorded in a separate
+	// app.atchess.challengeResponse record -- that is checked separately,
+	// after the role gate below (getChallengeDeclineOutcome).
 	if status == "declined" || status == "accepted" {
 		return nil, fmt.Errorf("%w: challenge %s has status %q", ErrChallengeNotAcceptable, challengeURI, status)
 	}
@@ -775,6 +779,22 @@ func (c *Client) AcceptChallenge(ctx context.Context, challengeURI string) (*che
 	// even performs the lookup that could leak that data.
 	if c.did != challengedDID {
 		return nil, fmt.Errorf("%w: %s", ErrOnlyChallengedMayAccept, c.did)
+	}
+
+	// Durable-decline check (atchess-1c9.91): the field check above can
+	// only see a decline expressed as a status flip on THIS record, but
+	// RespondToChallenge never does that -- a decline is a SEPARATE
+	// app.atchess.challengeResponse record written into the decliner's own
+	// repo (AT Protocol forbids writing into someone else's). challengedDID
+	// == c.did here (the role gate above just proved it), so this reads
+	// the CALLER's own repo for a durable decline of this exact challenge.
+	// See getChallengeDeclineOutcome's doc comment for why this is a
+	// deliberate fail-open on read failure, not fail-closed.
+	if declined, derr := c.getChallengeDeclineOutcome(ctx, challengeURI, cid, challengedDID); derr != nil {
+		log.Warn().Err(derr).Str("challengeURI", challengeURI).Str("challengedDID", challengedDID).
+			Msg("could not check for a durable challenge decline; proceeding with accept (fail-open, see getChallengeDeclineOutcome)")
+	} else if declined {
+		return nil, fmt.Errorf("%w: challenge %s was durably declined", ErrChallengeNotAcceptable, challengeURI)
 	}
 
 	gameURI := fmt.Sprintf("at://%s/app.atchess.game/%s", challengedDID, proposedGameID)
@@ -2097,6 +2117,96 @@ func (c *Client) getDrawAcceptOutcome(ctx context.Context, gameURI, whiteDID, bl
 	}
 
 	return latest, errors.Join(errs...)
+}
+
+// getChallengeDeclineOutcome reports whether challengeURI/challengeCID has
+// been durably declined, by looking for a matching
+// app.atchess.challengeResponse record (response == "declined") in
+// challengedDID's OWN repo -- the only repo RespondToChallenge could ever
+// have written such a record into (AT Protocol forbids writing into
+// someone else's repo, atchess-1c9.11). AcceptChallenge's role gate (see
+// its doc comment) already requires c.did == challengedDID for every
+// caller reaching this check, so challengedDID here is provably the SAME
+// identity as the one now asking to accept -- there is no cross-party
+// attack this defends against (atchess-1c9.91's step-zero finding: only
+// the challenged player can ever decline OR accept a given challenge),
+// only a stale-tab/double-submit self-override, where a player who
+// already declined tries to accept the same challenge anyway.
+//
+// A candidate record is trusted only once its "challenge" strongRef
+// (uri+cid) is confirmed to name THIS EXACT challengeURI/challengeCID
+// pair -- the same "corroborate the claim, don't just trust the field"
+// pattern as getDrawAcceptOutcome's drawOffer verification and
+// AcceptChallenge's own challenger-forgery check -- rather than trusting
+// any response=="declined" record that merely happens to sit in the right
+// repo. Because the read is scoped to exactly challengedDID's own repo (we
+// choose the "repo" listRecords parameter, not any field inside a
+// record), a decline record planted in the WRONG repo (e.g. the
+// challenger's own, or an uninvolved third party's) is never even
+// examined -- it cannot block a legitimate accept.
+//
+// FAILURE TO READ challengedDID's repo is a deliberate FAIL-OPEN, unlike
+// ErrIncompleteDerivation's fail-closed policy for cross-player game
+// status derivation (atchess-1c9.103 and friends): this read is not a
+// cross-party safety gate -- decliner and accepter are provably the same
+// identity (see above) -- and it reads from the SAME repo/PDS this very,
+// already-authenticated accept request just came through, so an
+// unreachable read here is a transient blip in the requester's OWN
+// dependency, not a third party's. Failing closed would trade a rare,
+// self-inflicted, easily-retried bug (a stale decline silently
+// overridden) for a routine availability regression on every legitimate
+// accept whenever this one collection listing hiccups. The caller
+// (AcceptChallenge) logs and proceeds on error; it never surfaces this as
+// a failure. This does add one listRecords round trip to every accept.
+func (c *Client) getChallengeDeclineOutcome(ctx context.Context, challengeURI, challengeCID, challengedDID string) (declined bool, err error) {
+	base, ownRepo, err := c.resolveReadEndpoint(ctx, challengedDID)
+	if err != nil {
+		return false, fmt.Errorf("resolve read endpoint for %s: %w", challengedDID, err)
+	}
+	params := url.Values{"repo": {challengedDID}, "collection": {"app.atchess.challengeResponse"}, "limit": {"100"}}
+	resp, err := c.getXRPC(ctx, base, ownRepo, "com.atproto.repo.listRecords", params)
+	if err != nil {
+		return false, fmt.Errorf("list challengeResponses for %s: %w", challengedDID, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return false, fmt.Errorf("list challengeResponses for %s: HTTP %d - %s", challengedDID, resp.StatusCode, string(body))
+	}
+
+	var listResp struct {
+		Records []struct {
+			URI   string `json:"uri"`
+			Value struct {
+				Challenge struct {
+					URI string `json:"uri"`
+					CID string `json:"cid"`
+				} `json:"challenge"`
+				Response string `json:"response"`
+			} `json:"value"`
+		} `json:"records"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&listResp); err != nil {
+		return false, fmt.Errorf("decode challengeResponses list for %s: %w", challengedDID, err)
+	}
+
+	for _, record := range listResp.Records {
+		if record.Value.Response != "declined" {
+			continue
+		}
+		if record.Value.Challenge.URI != challengeURI {
+			continue
+		}
+		if record.Value.Challenge.CID != challengeCID {
+			log.Warn().Str("challengeURI", challengeURI).Str("repo", challengedDID).Str("recordURI", record.URI).
+				Str("wantCID", challengeCID).Str("gotCID", record.Value.Challenge.CID).
+				Msg("ignoring challengeResponse record: its challenge strongRef CID does not match the current challenge record")
+			continue
+		}
+		return true, nil
+	}
+	return false, nil
 }
 
 func (c *Client) GetGame(ctx context.Context, gameURI string) (*chess.Game, error) {
