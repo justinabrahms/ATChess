@@ -38,6 +38,21 @@ type Services struct {
 	// same host key. See startProtocolService.
 	AliceStateDir string
 	BobStateDir   string
+
+	// AliceChallengeDBPath/BobChallengeDBPath are each instance's own
+	// CHALLENGE_DB_PATH (atchess-1c9.76/atchess-1c9.78): each
+	// protocol-service instance gets a distinct, per-instance SQLite file
+	// rather than the package default (./data/challenges.db relative to
+	// the repo root, shared by every instance started from this repo).
+	// Without that, one instance can observe challenge rows a DIFFERENT
+	// instance's own HTTP handler inserted directly into the shared file,
+	// which silently substitutes for -- and thereby masks the absence of
+	// -- real cross-instance delivery via the firehose/backfill. Exposed
+	// here, mirroring AliceStateDir/BobStateDir above, so tests can assert
+	// the two paths actually differ and are not the same underlying file
+	// (see startProtocolService).
+	AliceChallengeDBPath string
+	BobChallengeDBPath   string
 }
 
 // syncBuffer is a mutex-protected byte buffer used to capture a
@@ -102,11 +117,12 @@ func buildProtocolBinary(t *testing.T) string {
 
 // serviceInstance tracks one running protocol-service subprocess.
 type serviceInstance struct {
-	label    string
-	url      string
-	stateDir string
-	cmd      *exec.Cmd
-	logs     *syncBuffer
+	label           string
+	url             string
+	stateDir        string
+	challengeDBPath string
+	cmd             *exec.Cmd
+	logs            *syncBuffer
 
 	mu       sync.Mutex
 	exited   bool
@@ -298,12 +314,13 @@ func startProtocolService(t *testing.T, binPath string, account Account, port in
 	cmd.Stderr = logs
 
 	inst := &serviceInstance{
-		label:    label,
-		url:      url,
-		stateDir: stateDir,
-		cmd:      cmd,
-		logs:     logs,
-		exitedCh: make(chan struct{}),
+		label:           label,
+		url:             url,
+		stateDir:        stateDir,
+		challengeDBPath: challengeDBPath,
+		cmd:             cmd,
+		logs:            logs,
+		exitedCh:        make(chan struct{}),
 	}
 
 	if err := cmd.Start(); err != nil {
@@ -408,14 +425,16 @@ func StartServices(t *testing.T, accounts *Accounts) *Services {
 	plcDirectoryURL := resolvePLCDirectoryURL(t)
 	firehoseURLs := AllPDSFirehoseURLs(accounts)
 
-	aliceURL, aliceStateDir := StartPlayerService(t, binPath, accounts.Alice, "alice", plcDirectoryURL, firehoseURLs)
-	bobURL, bobStateDir := StartPlayerService(t, binPath, accounts.Bob, "bob", plcDirectoryURL, firehoseURLs)
+	aliceURL, aliceStateDir, aliceChallengeDBPath := StartPlayerService(t, binPath, accounts.Alice, "alice", plcDirectoryURL, firehoseURLs)
+	bobURL, bobStateDir, bobChallengeDBPath := StartPlayerService(t, binPath, accounts.Bob, "bob", plcDirectoryURL, firehoseURLs)
 
 	return &Services{
-		AliceURL:      aliceURL,
-		BobURL:        bobURL,
-		AliceStateDir: aliceStateDir,
-		BobStateDir:   bobStateDir,
+		AliceURL:             aliceURL,
+		BobURL:               bobURL,
+		AliceStateDir:        aliceStateDir,
+		BobStateDir:          bobStateDir,
+		AliceChallengeDBPath: aliceChallengeDBPath,
+		BobChallengeDBPath:   bobChallengeDBPath,
 	}
 }
 
@@ -454,15 +473,16 @@ func ResolvePLCDirectoryURL(t *testing.T) string {
 // listening on a freshly allocated port, configured to watch
 // firehoseURLs (see AllPDSFirehoseURLs) for challenge delivery. It blocks
 // until the instance reports healthy and returns its base URL and its own
-// (per-instance, see startProtocolService) FIREHOSE_STATE_DIR. Exported
-// (unlike the underlying startProtocolService) so tests that need to start
-// one player's instance independently of the other -- notably an
-// offline-backfill test, where one player's instance must NOT be running
-// yet when the other player issues a challenge -- can do so directly,
-// rather than only via StartServices' both-at-once topology.
-func StartPlayerService(t *testing.T, binPath string, account Account, label string, plcDirectoryURL string, firehoseURLs string) (url string, stateDir string) {
+// (per-instance, see startProtocolService) FIREHOSE_STATE_DIR and
+// CHALLENGE_DB_PATH. Exported (unlike the underlying startProtocolService)
+// so tests that need to start one player's instance independently of the
+// other -- notably an offline-backfill test, where one player's instance
+// must NOT be running yet when the other player issues a challenge -- can
+// do so directly, rather than only via StartServices' both-at-once
+// topology.
+func StartPlayerService(t *testing.T, binPath string, account Account, label string, plcDirectoryURL string, firehoseURLs string) (url string, stateDir string, challengeDBPath string) {
 	t.Helper()
 	port := freePort(t)
 	inst := startProtocolService(t, binPath, account, port, label, plcDirectoryURL, firehoseURLs)
-	return inst.url, inst.stateDir
+	return inst.url, inst.stateDir, inst.challengeDBPath
 }

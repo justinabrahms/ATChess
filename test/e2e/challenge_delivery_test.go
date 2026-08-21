@@ -486,7 +486,7 @@ func TestChallengeDelivery(t *testing.T) {
 			// this challenge. See this file's header comment, point 4, for
 			// the full explanation of why this subtest now passes for a
 			// different reason than it originally did.
-			bobSecondURL, _ := harness.StartPlayerService(t, binPath, accounts.Bob, "bob-second-instance-offline-backfill", plcDirectoryURL, firehoseURLs)
+			bobSecondURL, _, _ := harness.StartPlayerService(t, binPath, accounts.Bob, "bob-second-instance-offline-backfill", plcDirectoryURL, firehoseURLs)
 			bobSecond := harness.NewPlayer(t, accounts.Bob, bobSecondURL)
 			t.Logf("bob's second instance started (simulating his client coming online after being offline); login (which triggers the repo-read backfill) has already completed: %s", bobSecondURL)
 
@@ -573,6 +573,51 @@ func TestChallengeDelivery(t *testing.T) {
 			if seq < 0 {
 				t.Errorf("bob's instance persisted a negative cursor %d (should have been deleted, not stored, by CursorStore.Store)", seq)
 			}
+		}
+	})
+
+	// ---------------------------------------------------------------
+	// ChallengeDBIsolation (atchess-1c9.78): each instance's OWN
+	// CHALLENGE_DB_PATH (see Services' doc comment) must actually be a
+	// distinct file on disk, proving this test suite's own cross-instance
+	// delivery claim is not being silently supplied by a shared SQLite
+	// file instead (the defect atchess-1c9.76 fixed: before it, every
+	// instance shared one ./data/challenges.db, so one instance could
+	// observe a challenge row a DIFFERENT instance's own HTTP handler had
+	// inserted directly -- no firehose delivery or backfill involved at
+	// all). Modeled directly on CursorPersistence's two guards above: (1)
+	// the paths must be non-empty and different strings, checked up
+	// front, so this fails immediately rather than only if something
+	// downstream happens to notice; (2) os.SameFile on the two paths,
+	// which closes the gap a same-string check alone would leave open
+	// (e.g. two distinct path strings that resolve to one inode via a
+	// symlink). Unlike the cursors.json files above, no poll is needed
+	// here: internal/challenge.NewStore opens (and creates) the SQLite
+	// file synchronously during cmd/protocol/main.go's startup, well
+	// before that instance's /api/health first returns 200 -- and
+	// StartServices/waitForHealthy already blocked until both instances
+	// were healthy before returning `services` to this test. So both
+	// files are guaranteed to exist on disk by the time this subtest
+	// runs.
+	// ---------------------------------------------------------------
+	t.Run("ChallengeDBIsolation_PerInstancePathIsNotShared", func(t *testing.T) {
+		if services.AliceChallengeDBPath == "" || services.BobChallengeDBPath == "" {
+			t.Fatalf("services.AliceChallengeDBPath=%q services.BobChallengeDBPath=%q: per-instance CHALLENGE_DB_PATH was not wired up (empty)", services.AliceChallengeDBPath, services.BobChallengeDBPath)
+		}
+		if services.AliceChallengeDBPath == services.BobChallengeDBPath {
+			t.Fatalf("services.AliceChallengeDBPath == services.BobChallengeDBPath == %q: alice's and bob's instances were given the SAME challenge DB path -- this is exactly the defect atchess-1c9.76 fixed and this subtest exists to catch; every other assertion in this test file could now be passing because one instance's handler wrote a row the other instance's handler is reading directly, not because of real cross-instance delivery", services.AliceChallengeDBPath)
+		}
+
+		aliceInfo, err := os.Stat(services.AliceChallengeDBPath)
+		if err != nil {
+			t.Fatalf("os.Stat(%s) (alice's CHALLENGE_DB_PATH) failed: %v -- internal/challenge.NewStore should have created this file synchronously during startup, before /api/health first returned 200", services.AliceChallengeDBPath, err)
+		}
+		bobInfo, err := os.Stat(services.BobChallengeDBPath)
+		if err != nil {
+			t.Fatalf("os.Stat(%s) (bob's CHALLENGE_DB_PATH) failed: %v -- internal/challenge.NewStore should have created this file synchronously during startup, before /api/health first returned 200", services.BobChallengeDBPath, err)
+		}
+		if os.SameFile(aliceInfo, bobInfo) {
+			t.Fatalf("alice's challenge DB (%s) and bob's challenge DB (%s) are the SAME underlying file on disk -- their instances share one challenge store, which silently substitutes for real cross-instance delivery", services.AliceChallengeDBPath, services.BobChallengeDBPath)
 		}
 	})
 
