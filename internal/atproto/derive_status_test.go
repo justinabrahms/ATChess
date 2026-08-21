@@ -1317,6 +1317,14 @@ func TestGetGame_NegativeControl_BothReposReadable_NoTerminalEvent_Active(t *tes
 // "err == nil && status != active", so a derivation error (opponent's PDS
 // unreachable) was silently treated the same as "verified active",
 // letting a resignation through unchecked. It must now reject instead.
+// Also asserts ZERO createRecord/putRecord writes reached the fake server
+// (atchess-1c9.55 review): unlike CheckTimeViolation/ClaimTimeVictory (see
+// TestClaimTimeVictory_FailsClosed_WhenDerivationIncomplete's doc comment),
+// ResignGame writes its resignation record immediately after this gate
+// with no FEN parse or other check in between, so this assertion is
+// genuinely load-bearing here -- confirmed by reverting ResignGame's gate
+// alone: writeCallCount() goes from 0 to non-zero (a real resignation
+// record reaches the fake server), not just the errors.Is check going red.
 func TestResignGame_FailsClosed_WhenDerivationIncomplete(t *testing.T) {
 	mock := newDeriveTestPDS(t)
 	srv := mock.server()
@@ -1336,6 +1344,119 @@ func TestResignGame_FailsClosed_WhenDerivationIncomplete(t *testing.T) {
 	}
 	if !errors.Is(err, ErrIncompleteDerivation) {
 		t.Errorf("expected errors.Is(err, ErrIncompleteDerivation), got: %v", err)
+	}
+	if got := mock.writeCallCount(); got != 0 {
+		t.Errorf("expected ZERO createRecord/putRecord writes when derivation is incomplete, got %d", got)
+	}
+}
+
+// TestOfferDraw_FailsClosed_WhenDerivationIncomplete is the OfferDraw analog
+// of TestResignGame_FailsClosed_WhenDerivationIncomplete (atchess-1c9.55):
+// OfferDraw has its own independent 3-line gate on currentGameStatus
+// (client.go, just above the drawOfferRecord construction) -- sharing
+// currentGameStatus with ResignGame/CheckTimeViolation does NOT mean
+// sharing the fail-closed DECISION, so this proves OfferDraw's own gate
+// rejects the write, not just that some other caller's gate does. Asserts
+// ZERO createRecord/putRecord writes reached the fake server, not merely
+// that OfferDraw returned an error -- an error return alone would not catch
+// a regression that logs-and-proceeds after fetching the CID.
+func TestOfferDraw_FailsClosed_WhenDerivationIncomplete(t *testing.T) {
+	mock := newDeriveTestPDS(t)
+	srv := mock.server()
+	defer srv.Close()
+
+	// atchess-1c9.95 fix-pass: see setUnreachable's doc comment -- must be
+	// a validator-passing-but-dead endpoint, not a plain closed
+	// httptest.Server's own address.
+	mock.setUnreachable(t, blackDID)
+
+	gameURI := mock.seedActiveGame(t, time.Now().Add(-time.Hour), nil)
+
+	client := newDeriveTestClient(t, mock)
+	_, err := client.OfferDraw(context.Background(), gameURI, "")
+	if err == nil {
+		t.Fatalf("expected OfferDraw to fail closed when the game's status could not be verified (black's PDS unreachable), got nil error")
+	}
+	if !errors.Is(err, ErrIncompleteDerivation) {
+		t.Errorf("expected errors.Is(err, ErrIncompleteDerivation), got: %v", err)
+	}
+	if got := mock.writeCallCount(); got != 0 {
+		t.Errorf("expected ZERO createRecord/putRecord writes when derivation is incomplete, got %d", got)
+	}
+}
+
+// TestOfferDraw_NegativeControl_ActiveGame_Succeeds is the required
+// negative control for TestOfferDraw_FailsClosed_WhenDerivationIncomplete:
+// with both repos fully readable, a legitimate OfferDraw in a still-active
+// game must still succeed and actually reach the fake server's write path,
+// proving the gate above is not simply blocking everything.
+func TestOfferDraw_NegativeControl_ActiveGame_Succeeds(t *testing.T) {
+	mock := newDeriveTestPDS(t)
+	srv := mock.server()
+	defer srv.Close()
+
+	gameURI := mock.seedActiveGame(t, time.Now().Add(-time.Hour), nil)
+
+	client := newDeriveTestClient(t, mock)
+	if _, err := client.OfferDraw(context.Background(), gameURI, ""); err != nil {
+		t.Fatalf("expected a legitimate draw offer in an active game to succeed, got error: %v", err)
+	}
+	if got := mock.writeCallCount(); got == 0 {
+		t.Errorf("expected the offer to actually reach the fake server's write path, got %d writes", got)
+	}
+}
+
+// TestClaimTimeVictory_FailsClosed_WhenDerivationIncomplete pins the ERROR
+// IDENTITY that ClaimTimeVictory surfaces when the game's status/FEN cannot
+// be derived (here: black's PDS is unreachable): errors.Is(err,
+// ErrIncompleteDerivation) must hold. It does NOT prove that
+// CheckTimeViolation's own gate (client.go, currentGameStatusAndFEN just
+// after the game record fetch, around client.go:3631-3637) is what stops
+// the write -- reviewer-verified (atchess-1c9.55 review) that it isn't.
+// currentGameStatusAndFEN returns ("", "", err) on every error path
+// (client.go:3123-3129), so derivedFEN is always empty when that gate is
+// bypassed; the very next check downstream, the FEN-parity split at
+// client.go:3645-3648 (len(fenParts) < 2), then fires on the empty string
+// and returns "invalid FEN format" BEFORE any write is attempted. That is
+// what currently backstops the zero-writes assertion below when the gate
+// itself is deleted -- confirmed by reverting the gate alone: this test's
+// errors.Is assertion goes red (wrong error, "invalid FEN format" instead
+// of ErrIncompleteDerivation-wrapped) while the writeCallCount() assertion
+// stays green by coincidence, not by design. So the zero-writes assertion
+// here is defense-in-depth, not proof the gate is load-bearing (unlike
+// TestOfferDraw_FailsClosed_WhenDerivationIncomplete and
+// TestResignGame_FailsClosed_WhenDerivationIncomplete, where the
+// zero-writes assertion IS the thing that reddens on a reverted gate). If
+// FEN handling ever changes to tolerate an empty string (e.g. defaulting
+// to a start position instead of erroring), that backstop disappears and
+// this test's errors.Is(ErrIncompleteDerivation) check becomes the ONLY
+// thing standing between a reverted/deleted gate and a real fail-open
+// write via ClaimTimeVictory -- do not delete that assertion, and do not
+// mistake it for proof the gate itself still exists. Making the gate
+// independently observable (e.g. ordering the FEN-parity check so it
+// cannot mask a missing gate) is tracked separately, not fixed here.
+func TestClaimTimeVictory_FailsClosed_WhenDerivationIncomplete(t *testing.T) {
+	mock := newDeriveTestPDS(t)
+	srv := mock.server()
+	defer srv.Close()
+
+	// atchess-1c9.95 fix-pass: see setUnreachable's doc comment -- must be
+	// a validator-passing-but-dead endpoint, not a plain closed
+	// httptest.Server's own address.
+	mock.setUnreachable(t, blackDID)
+
+	gameURI := mock.seedActiveGame(t, time.Now().Add(-time.Hour), nil)
+
+	client := newDeriveTestClient(t, mock)
+	err := client.ClaimTimeVictory(context.Background(), gameURI)
+	if err == nil {
+		t.Fatalf("expected ClaimTimeVictory to fail closed when the game's status could not be verified (black's PDS unreachable), got nil error")
+	}
+	if !errors.Is(err, ErrIncompleteDerivation) {
+		t.Errorf("expected errors.Is(err, ErrIncompleteDerivation), got: %v", err)
+	}
+	if got := mock.writeCallCount(); got != 0 {
+		t.Errorf("expected ZERO createRecord/putRecord writes when derivation is incomplete, got %d", got)
 	}
 }
 
