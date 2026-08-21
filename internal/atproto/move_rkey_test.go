@@ -125,3 +125,24 @@ func TestMoveRecordContentEqual_DifferentGameCidNotEqual(t *testing.T) {
 		t.Fatalf("expected a differing embedded game cid to compare unequal, not be silently folded together")
 	}
 }
+
+// TestMoveRecordContentEqual_NewFieldIsNotSilentlyExcluded is the drift
+// guard for atchess-1c9.115 item 1. moveRecordContentEqual used to compare
+// a hardcoded field list; a future field added to moveRecord (client.go)
+// would be silently EXCLUDED from the comparison, so two submissions
+// differing only in that new field would wrongly compare equal and be
+// folded together as an idempotent resubmission instead of surfacing as
+// ErrMoveRecordConflict. moveRecordContentEqual is now derived from the
+// union of both records' own keys instead of a hand-written list, which
+// makes that exclusion structurally impossible: this test pins that by
+// adding an entirely new, never-hardcoded key and confirming a difference
+// in it alone is still detected.
+func TestMoveRecordContentEqual_NewFieldIsNotSilentlyExcluded(t *testing.T) {
+	a := baseMoveRecordValue()
+	b := baseMoveRecordValue()
+	a["totallyNewHypotheticalField"] = "value-one"
+	b["totallyNewHypotheticalField"] = "value-two"
+	if moveRecordContentEqual(a, b) {
+		t.Fatalf("expected a difference in a field neither hardcoded field list nor any prior test knew about to still be detected, not silently ignored")
+	}
+}

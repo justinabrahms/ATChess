@@ -1462,20 +1462,37 @@ func moveRkeyForPly(gameURI string, ply int) string {
 // in the two submissions differs, they were not actually resubmissions of
 // the same request against the same observed game state, and must not be
 // folded together silently.
+//
+// DELIBERATELY derived from the UNION of both records' own keys, rather
+// than a hand-written field list: a hardcoded list silently drifts out of
+// sync the moment moveRecord (above) gains a new field, and the failure
+// direction is the dangerous one -- an unlisted field would be excluded
+// from the comparison, so two submissions differing ONLY in that new field
+// would compare equal and be folded together as an idempotent resubmission
+// instead of surfacing as ErrMoveRecordConflict. Deriving from the maps
+// themselves makes that class of drift structurally impossible: any key
+// added to moveRecord is automatically part of this comparison. "createdAt"
+// is the one deliberate, visible exception (see doc comment above).
 func moveRecordContentEqual(a, b map[string]interface{}) bool {
-	fields := []string{"$type", "player", "from", "to", "san", "fen", "check", "checkmate", "draw"}
-	for _, f := range fields {
-		if !reflect.DeepEqual(a[f], b[f]) {
+	for k := range a {
+		if k == "createdAt" {
+			continue
+		}
+		if !reflect.DeepEqual(a[k], b[k]) {
 			return false
 		}
 	}
-
-	aGame, _ := a["game"].(map[string]interface{})
-	bGame, _ := b["game"].(map[string]interface{})
-	if aGame == nil || bGame == nil {
-		return aGame == nil && bGame == nil
+	for k := range b {
+		if k == "createdAt" {
+			continue
+		}
+		if _, ok := a[k]; !ok {
+			// b has a key a lacks entirely (as opposed to a differing
+			// value, already caught above): still not equal.
+			return false
+		}
 	}
-	return reflect.DeepEqual(aGame["uri"], bGame["uri"]) && reflect.DeepEqual(aGame["cid"], bGame["cid"])
+	return true
 }
 
 // moveRecordIsAfter reports whether the move record (fen, t, rkey) should

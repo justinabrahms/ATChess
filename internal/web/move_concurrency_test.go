@@ -803,3 +803,137 @@ func TestMakeMoveHandler_RecordMove_NonConflictFailureStill500(t *testing.T) {
 		t.Errorf("non-conflict failure body must not claim a conflict, got: %s", body)
 	}
 }
+
+// moveCreateFailurePDS is a minimal mock PDS purpose-built for
+// TestMakeMoveHandler_RecordMove_MoveCreateFailure_RecordAbsent_Still500
+// (atchess-1c9.115 item 2). It serves the game record's getRecord/putRecord
+// normally (so RecordMove's game-record CAS update succeeds), but always
+// fails the MOVE record's createRecord with a bare, non-distinguishing HTTP
+// 500 -- exactly the shape atchess-1c9.113 verified live for a duplicate-
+// rkey collision -- while never actually writing anything. A subsequent
+// getRecord for that move rkey therefore genuinely reports the record
+// absent (RecordNotFound), not merely a stale/partial value: this is the
+// "create failed for a real reason, not a collision" branch RecordMove's
+// post-failure read-back must fail closed on (surface the original error,
+// HTTP 500 at the handler level), never fold into an idempotent success.
+type moveCreateFailurePDS struct {
+	base string
+}
+
+func (p *moveCreateFailurePDS) server(t *testing.T) *httptest.Server {
+	srv := newFakeHTTPSEndpoint(t, http.HandlerFunc(p.handle))
+	p.base = srv.URL
+	return srv
+}
+
+func (p *moveCreateFailurePDS) handle(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	if strings.HasPrefix(r.URL.Path, "/did:plc:") {
+		did := strings.TrimPrefix(r.URL.Path, "/")
+		_ = json.NewEncoder(w).Encode(atproto.DIDDocument{
+			ID: did,
+			Service: []atproto.DIDService{
+				{ID: "#atproto_pds", Type: "AtprotoPersonalDataServer", ServiceEndpoint: p.base},
+			},
+		})
+		return
+	}
+
+	switch r.URL.Path {
+	case "/xrpc/com.atproto.repo.getRecord":
+		q := r.URL.Query()
+		if q.Get("collection") == "app.atchess.game" {
+			_ = json.NewEncoder(w).Encode(map[string]interface{}{
+				"uri": "at://did:plc:player/app.atchess.game/game1",
+				"cid": "cid-game1-v1",
+				"value": map[string]interface{}{
+					"$type":     "app.atchess.game",
+					"createdAt": time.Now().Format(time.RFC3339),
+					"white":     "did:plc:player",
+					"black":     "did:plc:opponent",
+					"status":    "active",
+					"fen":       "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+					"pgn":       "",
+				},
+			})
+			return
+		}
+		// app.atchess.move: nothing was ever written (createRecord below
+		// always fails before storing anything), so a real PDS answers
+		// "not found" here, not a stale/partial value.
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]string{"error": "RecordNotFound", "message": "could not locate record"})
+		return
+
+	case "/xrpc/com.atproto.repo.listRecords":
+		// GetGame's derived-status scan needs an always-empty, always-200
+		// list to derive this freshly-seeded, move-free game as active
+		// before MakeMoveHandler ever reaches RecordMove.
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"records": []interface{}{}})
+		return
+
+	case "/xrpc/com.atproto.repo.putRecord":
+		// The game record's CAS-protected update succeeds normally: this
+		// test isolates the failure to the MOVE record's createRecord
+		// below, not the game record's putRecord (already covered by
+		// TestMakeMoveHandler_RecordMove_NonConflictFailureStill500 above).
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"uri": "at://did:plc:player/app.atchess.game/game1",
+			"cid": "cid-game1-v2",
+		})
+		return
+
+	case "/xrpc/com.atproto.repo.createRecord":
+		// A genuine server-side failure on the move record's FIRST and
+		// ONLY creation attempt -- not a duplicate-rkey collision, and
+		// nothing is ever stored. No structured "already exists" (or any
+		// other) signal in the body, exactly like the live bare 500
+		// atchess-1c9.113 measured for a real rkey collision: RecordMove
+		// cannot distinguish this response, by shape, from that one. The
+		// only thing that tells them apart is the read-back afterward
+		// finding the record absent (this case) vs. present and matching
+		// (a collision). See client.go's RecordMove doc comment.
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]string{"message": "internal database error"})
+		return
+
+	default:
+		w.WriteHeader(http.StatusNotFound)
+	}
+}
+
+// TestMakeMoveHandler_RecordMove_MoveCreateFailure_RecordAbsent_Still500 is
+// the atchess-1c9.115 item 2 fail-closed regression test: atchess-1c9.113's
+// post-collision read-back must surface the ORIGINAL error (and thus HTTP
+// 500 at the handler level) when the move record is genuinely absent after
+// a failed createRecord, rather than ever synthesizing an idempotent
+// success for a create that never actually landed. Before this test
+// existed, nothing in the repo pinned that branch: atchess-1c9.87's
+// analogous test (TestMakeMoveHandler_RecordMove_NonConflictFailureStill500
+// above) covers only the game record's putRecord, not the move record's
+// createRecord.
+func TestMakeMoveHandler_RecordMove_MoveCreateFailure_RecordAbsent_Still500(t *testing.T) {
+	const playerDID = "did:plc:player"
+
+	pds := &moveCreateFailurePDS{}
+	srv := pds.server(t)
+	defer srv.Close()
+
+	svc := &Service{
+		config:         &config.Config{ATProto: config.ATProtoConfig{PLCDirectoryURL: srv.URL}},
+		challengeStore: newTestChallengeStore(t),
+	}
+
+	session := newRaceSession(playerDID, "player.test", srv.URL)
+	gameURI := "at://did:plc:player/app.atchess.game/game1"
+
+	code, body := doMakeMove(svc, session, gameURI, "e2", "e4")
+
+	if code != http.StatusInternalServerError {
+		t.Fatalf("expected a move-record createRecord failure with the record genuinely absent on read-back to yield HTTP 500 (fail closed, never an idempotent success), got %d: %s", code, body)
+	}
+	if !strings.Contains(body, "Failed to record move") {
+		t.Errorf("expected failure body to say 'Failed to record move', got: %s", body)
+	}
+}

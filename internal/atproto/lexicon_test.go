@@ -397,9 +397,9 @@ func (p *fakePDS) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"handle":     fakeHandle,
 		})
 	case "/xrpc/com.atproto.repo.createRecord":
-		p.handleWrite(w, r)
+		p.handleWrite(w, r, true)
 	case "/xrpc/com.atproto.repo.putRecord":
-		p.handleWrite(w, r)
+		p.handleWrite(w, r, false)
 	case "/xrpc/com.atproto.repo.getRecord":
 		p.handleGet(w, r)
 	case "/xrpc/com.atproto.repo.listRecords":
@@ -414,7 +414,16 @@ func writeJSON(w http.ResponseWriter, v interface{}) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-func (p *fakePDS) handleWrite(w http.ResponseWriter, r *http.Request) {
+// handleWrite serves both com.atproto.repo.createRecord (isCreate == true)
+// and com.atproto.repo.putRecord (isCreate == false). isCreate matters only
+// for an explicit rkey that already names an existing record: putRecord is
+// legitimately an upsert (that IS the operation), but createRecord at an
+// already-occupied rkey was verified live (atchess-1c9.113) to be REJECTED
+// by a real PDS with a bare, non-distinguishing HTTP 500 -- the first
+// write is left intact, not silently overwritten. This fake used to
+// overwrite unconditionally regardless of isCreate, diverging from that
+// (atchess-1c9.115 item 3, the fourth such divergence found this run).
+func (p *fakePDS) handleWrite(w http.ResponseWriter, r *http.Request, isCreate bool) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
@@ -438,6 +447,16 @@ func (p *fakePDS) handleWrite(w http.ResponseWriter, r *http.Request) {
 	rkey := req.RKey
 	if rkey == "" {
 		rkey = p.nextID("rkey")
+	} else if isCreate {
+		if _, exists := p.records[req.Collection][rkey]; exists {
+			// Explicit-rkey collision on createRecord: reject, matching
+			// the live PDS's bare 500, and leave the existing record
+			// untouched -- do NOT overwrite it.
+			p.mu.Unlock()
+			w.WriteHeader(http.StatusInternalServerError)
+			writeJSON(w, map[string]interface{}{"error": "InternalServerError", "message": "Internal Server Error"})
+			return
+		}
 	}
 	cid := p.nextID("cid")
 	// req.Record is already exactly what a real wire round-trip would
