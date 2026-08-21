@@ -2032,6 +2032,33 @@ func terminalEventIsAfter(candidate, current *terminalEvent) bool {
 	return moveIsAfter(candidate.at, candidate.rkey, current.at, current.rkey)
 }
 
+// statusFromMoveRecord returns the terminal chess.GameStatus produced by m
+// (checkmate or a rules-forced draw), or "" if m is nil or not itself
+// terminal. Shared by GetGame -- which wraps a non-"" result in a
+// terminalEvent and merges it against the resignation/draw-accept/
+// time-violation sources via latestTerminalEvent -- and GetTimeRemaining,
+// which (for the cost reasons documented on GetTimeRemaining itself)
+// derives status ONLY from the move it already fetched to derive FEN,
+// rather than paying for GetGame's full multi-source scan. This keeps the
+// two derivations from silently drifting apart the way FEN-derived/
+// status-raw did before atchess-1c9.105.
+func statusFromMoveRecord(m *moveRecord) chess.GameStatus {
+	if m == nil {
+		return ""
+	}
+	if m.Checkmate {
+		fenParts := strings.Split(m.FEN, " ")
+		if len(fenParts) > 1 && fenParts[1] == "w" {
+			return chess.StatusBlackWon
+		}
+		return chess.StatusWhiteWon
+	}
+	if m.Draw {
+		return chess.StatusDraw
+	}
+	return ""
+}
+
 // getResignationOutcome scans app.atchess.resignation records in BOTH
 // players' repos for gameURI and returns the most recent one as a
 // terminalEvent (the resigning player's opponent wins), or nil if none
@@ -2645,15 +2672,8 @@ func (c *Client) GetGame(ctx context.Context, gameURI string) (*chess.Game, erro
 	var moveEvent *terminalEvent
 	if moveErr == nil && latestMove != nil {
 		game.FEN = latestMove.FEN
-		if latestMove.Checkmate {
-			fenParts := strings.Split(latestMove.FEN, " ")
-			status := chess.StatusWhiteWon
-			if len(fenParts) > 1 && fenParts[1] == "w" {
-				status = chess.StatusBlackWon
-			}
+		if status := statusFromMoveRecord(latestMove); status != "" {
 			moveEvent = &terminalEvent{status: status, at: latestMove.CreatedAt, rkey: latestMove.rkey, kind: terminalEventFromMove}
-		} else if latestMove.Draw {
-			moveEvent = &terminalEvent{status: chess.StatusDraw, at: latestMove.CreatedAt, rkey: latestMove.rkey, kind: terminalEventFromMove}
 		}
 	}
 
@@ -3902,36 +3922,65 @@ func (c *Client) GetTimeRemaining(ctx context.Context, gameID string) (time.Dura
 		return 0, fmt.Errorf("failed to get game record: %w", err)
 	}
 
-	// Check if game is still active
-	if status, ok := gameValue["status"].(string); ok && status != "active" {
-		return 0, fmt.Errorf("game is not active")
-	}
-
 	// Get players
 	whiteDID, _ := gameValue["white"].(string)
 	blackDID, _ := gameValue["black"].(string)
 
-	// Determine whose turn it is from the derived FEN, not the raw cached
-	// gameValue["fen"] field -- that cache is one ply stale after every
-	// move by the player who doesn't own the game record (see
-	// currentGameStatusAndFEN's doc comment, atchess-1c9.103). This reuses
-	// the same derivation path as GetGame/CheckTimeViolation
-	// (getLatestMoveForGame) rather than inventing a third way to work out
-	// the current position. If no move records exist yet, the cached FEN
-	// is correct (nobody has moved) and is used as-is. If derivation
-	// itself fails (e.g. the opponent's PDS is unreachable), fail closed
-	// rather than falling back to the possibly-stale cached FEN: unlike
-	// CheckTimeViolation this doesn't already pay for a GetGame call, so
-	// this does add network round trips (up to one listRecords call per
-	// player) to a function that previously made none for this purpose.
+	// Determine whose turn it is -- and whether the game has actually
+	// ended -- from the derived FEN and status, not the raw cached
+	// gameValue["fen"]/["status"] fields. Both caches are one ply/event
+	// stale after every move or terminal event (checkmate, resignation,
+	// accepted draw, time violation) recorded by the player who doesn't
+	// own the game record (see currentGameStatusAndFEN's doc comment,
+	// atchess-1c9.103). This reuses the same derivation path as
+	// GetGame/CheckTimeViolation (getLatestMoveForGame) rather than
+	// inventing a third way to work out the current position, and derives
+	// status from that SAME already-fetched move via statusFromMoveRecord
+	// -- exactly the source FEN is derived from -- rather than the raw
+	// cache, so the two can no longer silently disagree (atchess-1c9.105).
+	//
+	// This does NOT reproduce GetGame's full multi-source scan (moves +
+	// resignation + draw-accept + time-violation, each read across both
+	// repos): that was measured at up to 8 XRPC calls beyond the game
+	// record fetch, on top of which GetTimeRemaining would ALSO still need
+	// getGameRecord for the challenge ref this function reads below (which
+	// *chess.Game doesn't carry), so switching to it would roughly TRIPLE
+	// this endpoint's cost instead of reducing it -- the wrong direction
+	// for a UI-polled, display-only endpoint. So a checkmate/forced-draw
+	// ending is now caught here (for free, from data already fetched for
+	// FEN), while a resignation/draw-accept/time-violation recorded only
+	// in the non-owner's repo is not; the cached status still catches
+	// those when the record owner is the one who triggered them, same as
+	// before. Closing that remaining gap would mean either paying GetGame's
+	// full cost on every poll or serving this from an AppView-style index
+	// -- out of scope here (see atchess-1c9.122).
+	//
+	// If move derivation itself fails (e.g. the opponent's PDS is
+	// unreachable), fail closed with an error rather than falling back to
+	// the possibly-stale cached FEN/status: unlike CheckTimeViolation this
+	// doesn't already pay for a GetGame call, so this does add network
+	// round trips (up to one listRecords call per player, more with
+	// pagination per atchess-1c9.119) to a function that previously made
+	// none for this purpose. This is an existing, unmodified failure path
+	// from atchess-1c9.103 -- returning an error (not a countdown) is
+	// still display-only-safe: a stalled endpoint is not the same as a
+	// silently-wrong one.
 	cachedFEN, _ := gameValue["fen"].(string)
+	cachedStatus, _ := gameValue["status"].(string)
 	latestMove, moveErr := c.getLatestMoveForGame(ctx, gameID, whiteDID, blackDID)
 	if moveErr != nil {
 		return 0, fmt.Errorf("cannot verify current position: %w", moveErr)
 	}
 	fen := cachedFEN
+	status := chess.GameStatus(cachedStatus)
 	if latestMove != nil {
 		fen = latestMove.FEN
+		if derived := statusFromMoveRecord(latestMove); derived != "" {
+			status = derived
+		}
+	}
+	if status != "" && status != chess.StatusActive {
+		return 0, fmt.Errorf("game is not active")
 	}
 	fenParts := strings.Split(fen, " ")
 	if len(fenParts) < 2 {

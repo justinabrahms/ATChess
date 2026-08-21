@@ -262,6 +262,75 @@ func TestGetTimeRemaining_NonOwnerJustMoved_ReflectsFreshMove(t *testing.T) {
 	}
 }
 
+// fenAfterBlackFoolsMate is the position after 1. f3 e5 2. g4 Qh4# --
+// Fool's Mate: BLACK delivers checkmate. Active color "w" (white to move,
+// but mated) is what statusFromMoveRecord reads (fenParts[1] == "w") to
+// attribute the win to black, exactly as GetGame's moveEvent construction
+// does.
+const fenAfterBlackFoolsMate = "rnb1kbnr/pppp1ppp/8/4p3/6Pq/5P2/PPPPP2P/RNBQKBNR w KQkq - 1 3"
+
+// seedFederatedGameNonOwnerCheckmate seeds a correspondence game OWNED BY
+// WHITE ("game1" lives in whiteDID's repo) whose cached "status" field is,
+// and (per RecordMove's own-repo-only cache refresh) remains, "active".
+// Black -- the NON-owner -- then delivers checkmate (Fool's Mate) in a move
+// recorded only into BLACK's own repo, which never touches white's cached
+// game record. So the raw cached gameValue["status"] still reads "active"
+// even though the game has genuinely, provably ended.
+func seedFederatedGameNonOwnerCheckmate(mock *deriveTestPDS) (gameURI string) {
+	gameCreated := time.Now().Add(-time.Hour)
+	gameURI, _ = mock.seed(whiteDID, "app.atchess.game", "game1", map[string]interface{}{
+		"$type":     "app.atchess.game",
+		"createdAt": gameCreated.Format(time.RFC3339),
+		"white":     whiteDID,
+		"black":     blackDID,
+		"status":    "active", // STALE: never updated, black doesn't own this record.
+		"fen":       fenStart,
+		"pgn":       "1. f3 e5 2. g4 Qh4#",
+		"timeControl": map[string]interface{}{
+			"type":        "correspondence",
+			"daysPerMove": float64(3),
+		},
+	})
+
+	mock.seed(blackDID, "app.atchess.move", "move1", map[string]interface{}{
+		"$type":     "app.atchess.move",
+		"createdAt": time.Now().Format(time.RFC3339),
+		"game":      map[string]interface{}{"uri": gameURI},
+		"player":    blackDID,
+		"from":      "h4",
+		"to":        "h4",
+		"san":       "Qh4#",
+		"fen":       fenAfterBlackFoolsMate,
+		"checkmate": true,
+	})
+
+	return gameURI
+}
+
+// TestGetTimeRemaining_NonOwnerCheckmate_NoLiveCountdown is the headline
+// test for atchess-1c9.105 item 1: GetTimeRemaining derives a fresh FEN
+// (atchess-1c9.103) but used to still read the raw cached
+// gameValue["status"] ("active"), so a federated game actually ended by the
+// NON-owner's terminal move (checkmate, recorded only in the non-owner's
+// own repo) still reported a live countdown. It must now derive status
+// from the SAME already-fetched latest move used for FEN
+// (statusFromMoveRecord) -- exactly like GetGame's moveEvent -- and refuse
+// to report a countdown for a game that has ended.
+func TestGetTimeRemaining_NonOwnerCheckmate_NoLiveCountdown(t *testing.T) {
+	mock := newDeriveTestPDS(t)
+	srv := mock.server()
+	defer srv.Close()
+
+	gameURI := seedFederatedGameNonOwnerCheckmate(mock)
+
+	client := newDeriveTestClient(t, mock)
+
+	remaining, err := client.GetTimeRemaining(context.Background(), gameURI)
+	if err == nil {
+		t.Fatalf("expected GetTimeRemaining to refuse a live countdown for a game ended by the non-owner's checkmate, got remaining=%v with no error", remaining)
+	}
+}
+
 // TestGetTimeRemaining_DerivationFailure_FailsClosed mirrors
 // TestCheckTimeViolation_DerivationFailure_FailsClosed for GetTimeRemaining.
 func TestGetTimeRemaining_DerivationFailure_FailsClosed(t *testing.T) {
