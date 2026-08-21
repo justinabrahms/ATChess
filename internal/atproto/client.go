@@ -136,6 +136,77 @@ var ErrChallengeChallengerForged = errors.New("challenge record's challenger fie
 // retry" and silently swallowing a genuine outage.
 var ErrGameRecordConflict = errors.New("game record update conflict: the game record was updated by another write first")
 
+// swapRecordCASContract documents the actual, measured contract of
+// putRecord's "swapRecord" parameter (atchess-1c9.117, qualifying
+// atchess-1c9.112's fix). It is not a type or a function that anything
+// calls; it exists so this fact lives next to the code instead of only in
+// a bead. Read this before adding a fifth call site that passes
+// "swapRecord", or before trusting ErrGameRecordConflict/isInvalidSwapBody
+// to mean "any stale token is always caught".
+//
+// THE MEASURED CONTRACT (confirmed directly against the dual-PDS harness,
+// ghcr.io/bluesky-social/pds:latest, @atproto/pds@0.5.27, 2026-08-21, on a
+// throwaway collection/record, all four combinations):
+//
+//   - identical-value put, STALE swapRecord  -> HTTP 200. Record's CID is
+//     UNCHANGED; the response carries no "commit" object at all (contrast
+//     createRecord/a real update, which both return one) -- no new commit
+//     is minted, so a later legitimate CAS against that same CID still
+//     works.
+//   - identical-value put, CORRECT swapRecord -> HTTP 200, same unchanged
+//     CID (expected; included for completeness).
+//   - differing-value put, STALE swapRecord   -> HTTP 400
+//     {"error":"InvalidSwap","message":"Record was at <cid>"}. This is the
+//     only one of the four combinations where the token is actually
+//     enforced.
+//   - differing-value put, CORRECT swapRecord -> HTTP 200 (not separately
+//     re-verified here; this is putRecord's ordinary success path and is
+//     exercised by every non-conflicting move in this codebase already).
+//
+// WHY: this is not a race-timing artifact, it is unconditional server
+// logic. @atproto/pds@0.5.27's putRecord handler
+// (dist/api/com/atproto/repo/putRecord.js) computes the CID the write
+// WOULD produce, and short-circuits to a no-op ("if (current && current.cid
+// === write.cid.toString()) { return {commit: null, write} }") BEFORE it
+// ever calls actorTxn.repo.processWrites -- which is the only place
+// swapRecord/swapCommit are compared against the stored record and a
+// BadRecordSwapError (-> "InvalidSwap") can be raised. An identical-value
+// write never reaches that comparison, so a stale token on it is not
+// rejected; it is simply never looked at.
+//
+// SO: "swapRecord protects the game record" is true ONLY for a write that
+// would actually change the stored value. Do not write code against this
+// package that assumes a stale swapRecord is ALWAYS rejected -- it is only
+// rejected when the new record differs from what's currently stored.
+// swapRecord cannot be used to detect "did anything touch this record
+// since I read it", only "am I about to silently overwrite a DIFFERENT
+// value than the one I compare-and-swapped against". Every call site in
+// this file that sets "swapRecord" today -- RecordMove,
+// RespondToDrawOffer's best-effort cache refresh, ResignGame, and
+// ClaimTimeVictory; audited under atchess-1c9.117 -- is
+// unaffected: each only lands in the no-op case when the write it was
+// about to make would not have changed the record's meaning anyway (and
+// RespondToDrawOffer's call additionally never inspects the response at
+// all), so none of them currently depend on the stronger, false
+// assumption. If a future call site needs that stronger guarantee,
+// swapRecord alone cannot provide it -- some other mechanism (e.g. a
+// content hash / version field compared after the fact, or a
+// deterministic rkey the way RecordMove's move records use one) is
+// required.
+//
+// SPEC STATUS: this is an implementation detail of this PDS, not a
+// documented part of the AT Protocol lexicon. com.atproto.repo.putRecord's
+// generated lexicon definition (dist/lexicons/com/atproto/repo/
+// putRecord.defs.js in the same package) declares "swapRecord" as an
+// optional nullable CID string and lists "InvalidSwap" as the procedure's
+// only defined error code; it says nothing about an identical-value
+// exception, and no spec text was found anywhere in this image that
+// promises one. Do not rely on this short-circuit against any other AT
+// Protocol server implementation, and do not assume a future version of
+// this same PDS keeps it -- treat the "safe" call sites above as safe
+// because their writes are idempotent regardless of whether the
+// short-circuit fires, not because the short-circuit is guaranteed.
+
 // ErrMoveRecordConflict indicates RecordMove's move-record createRecord
 // (see moveRkeyForPly) collided at its deterministic (game, ply) rkey with
 // an EXISTING move record whose content genuinely differs from the move
@@ -161,6 +232,14 @@ var ErrMoveRecordConflict = errors.New("move record conflict: a different move a
 // current CID) on a putRecord call. See ErrGameRecordConflict's doc
 // comment for why this is a prefix match rather than an exact one, and
 // why the bare HTTP status code is never used as the signal instead.
+//
+// A false result from this function does NOT mean the swap succeeded
+// because the token was valid -- it may instead mean the swap was never
+// evaluated at all. See swapRecordCASContract (atchess-1c9.117): the PDS
+// short-circuits an identical-value putRecord to a no-op (HTTP 200)
+// before it ever compares swapRecord, so a stale token on a write that
+// wouldn't have changed anything never reaches the "InvalidSwap" path
+// this function detects.
 func isInvalidSwapBody(body []byte) bool {
 	var e struct {
 		Error string `json:"error"`
@@ -935,6 +1014,16 @@ func (c *Client) RecordMove(ctx context.Context, gameURI string, move *chess.Mov
 		}
 		gameValue["updatedAt"] = time.Now().Format(time.RFC3339)
 
+		// swapRecordCASContract: safe against the identical-value no-op --
+		// when two racing writers compute this SAME move against the same
+		// starting gameCID, gameValue is mutated identically by both
+		// (deterministic FEN/status; updatedAt is RFC3339 second
+		// granularity, so it also matches when both land in the same
+		// second), so a no-op here always means the record already holds
+		// the value this write wanted anyway. A genuinely different
+		// concurrent write (a different move, or landing in a different
+		// second) still produces a differing record and gets the swap
+		// fully evaluated, surfacing as ErrGameRecordConflict below.
 		putReq := map[string]interface{}{
 			"repo":       repo,
 			"collection": "app.atchess.game",
@@ -3192,6 +3281,10 @@ func (c *Client) RespondToDrawOffer(ctx context.Context, drawOfferURI string, ac
 	if accept {
 		gameParts := strings.Split(gameURI, "/")
 		if len(gameParts) >= 5 && gameParts[2] == c.did {
+			// swapRecordCASContract: this is doubly unaffected by the
+			// identical-value no-op -- the response isn't even inspected
+			// (see comment above), and this write is a best-effort cache
+			// refresh GetGame never depends on anyway.
 			gCID, gameValue, err := c.getGameRecord(ctx, gameURI)
 			if err == nil {
 				gameValue["status"] = "draw"
@@ -3288,6 +3381,14 @@ func (c *Client) ResignGame(ctx context.Context, gameID string, reason string) e
 		gameValue["updatedAt"] = time.Now().Format(time.RFC3339)
 
 		// Update the game record
+		//
+		// swapRecordCASContract: safe against the identical-value no-op --
+		// newStatus is only reached from an active game (checked above),
+		// so this write always changes "status" away from "active"; two
+		// racing resignations by the SAME player land in the no-op case
+		// only when they'd write the SAME final status anyway, and a
+		// racing DIFFERENT status (e.g. the other player also resigning)
+		// still differs and gets the swap fully evaluated below.
 		rkey := parts[4]
 		updateReq := map[string]interface{}{
 			"repo":       c.did,
@@ -3761,6 +3862,13 @@ func (c *Client) ClaimTimeVictory(ctx context.Context, gameID string) error {
 		gameValue["updatedAt"] = time.Now().Format(time.RFC3339)
 
 		// Update the game record
+		//
+		// swapRecordCASContract: same reasoning as ResignGame's matching
+		// update above -- newStatus always moves the record away from
+		// "active", so an identical-value no-op here only occurs when a
+		// racing write would have produced the SAME status anyway; a
+		// genuinely different racing outcome still differs and gets the
+		// swap fully evaluated.
 		rkey := parts[4]
 		updateReq := map[string]interface{}{
 			"repo":       c.did,
