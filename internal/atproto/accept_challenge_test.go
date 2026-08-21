@@ -780,6 +780,91 @@ func TestAcceptChallenge_ForgedDeclineWrongRepo_DoesNotBlock(t *testing.T) {
 	}
 }
 
+// TestAcceptChallenge_DeclineNamesDifferentChallenge_DoesNotBlock pins the
+// URI-matching half of getChallengeDeclineOutcome's corroboration
+// (atchess-1c9.111 item 3, verified out-of-tree by atchess-1c9.91's
+// reviewer but never pinned by a test): a challengeResponse record that
+// lives in the RIGHT repo (challengedDID's own) and has
+// response=="declined", but whose "challenge" strongRef names a
+// DIFFERENT challenge URI than the one being accepted -- must never block
+// this, unrelated, accept.
+//
+// The decline record's CID is deliberately set to the CURRENT challenge's
+// own (correct) CID, not some other value -- if it used a different CID
+// too, the CID check alone would already reject this record, masking
+// whether the URI check does its job at all. Isolating the URI mismatch
+// this way is what lets a red/green cycle on JUST the URI comparison mean
+// anything (see this bead's brief).
+func TestAcceptChallenge_DeclineNamesDifferentChallenge_DoesNotBlock(t *testing.T) {
+	pds := newAcceptTestPDS(t)
+	challengeURI, challengeCID := seedBasicChallenge(pds)
+
+	otherURI := challengeURI + "-unrelated"
+	if otherURI == challengeURI {
+		t.Fatalf("test fixture bug: the 'other' challenge URI (%s) is the SAME as the one being accepted -- this test needs a genuine URI mismatch to mean anything", otherURI)
+	}
+	pds.putChallengeResponse(testChallengedDID, "declresp-other", otherURI, challengeCID, "declined")
+
+	challenged := acceptTestClient(t, pds, testChallengedDID)
+	game, err := challenged.AcceptChallenge(context.Background(), challengeURI)
+	if err != nil {
+		t.Fatalf("expected the accept to succeed despite an unrelated decline record naming a DIFFERENT challenge URI, got error: %v", err)
+	}
+	if game == nil {
+		t.Fatal("expected a game, got nil")
+	}
+	if n := pds.gameCount(testChallengedDID); n != 1 {
+		t.Errorf("expected exactly 1 game record, got %d", n)
+	}
+}
+
+// TestAcceptChallenge_DeclineHasStaleCID_DoesNotBlock pins the
+// CID-matching half of getChallengeDeclineOutcome's corroboration
+// (atchess-1c9.111 item 3; the underlying "is a stale CID correct to
+// ignore" POLICY question stays deferred to atchess-1c9.52, this test
+// only pins the CODE'S CURRENT, already-shipped behaviour so a future
+// refactor cannot silently drop the CID check).
+//
+// The challenged player declined this exact challenge URI while it still
+// had CID staleCID. The challenger then re-put (mutated) that SAME
+// challenge record afterwards, at the same rkey/URI, which bumps its CID
+// in this fake PDS exactly as a real repo write would. The live
+// challenge's CID no longer matches what the decline record pinned, so
+// getChallengeDeclineOutcome must treat the decline as not corroborated
+// and the accept must still succeed.
+func TestAcceptChallenge_DeclineHasStaleCID_DoesNotBlock(t *testing.T) {
+	pds := newAcceptTestPDS(t)
+	challengeURI, staleCID := seedBasicChallenge(pds)
+
+	pds.putChallengeResponse(testChallengedDID, "declresp-stale", challengeURI, staleCID, "declined")
+
+	newCID := pds.putChallenge(testChallengerDID, "chal1", map[string]interface{}{
+		"$type":          "app.atchess.challenge",
+		"createdAt":      time.Now().Add(-time.Hour).Format(time.RFC3339),
+		"challenger":     testChallengerDID,
+		"challenged":     testChallengedDID,
+		"status":         "pending",
+		"color":          "white",
+		"proposedGameId": "derivedgame1",
+		"expiresAt":      time.Now().Add(24 * time.Hour).Format(time.RFC3339),
+	})
+	if newCID == staleCID {
+		t.Fatalf("test fixture bug: re-putting the challenge produced the SAME CID (%s) as before -- this test needs a genuine CID mismatch to mean anything", newCID)
+	}
+
+	challenged := acceptTestClient(t, pds, testChallengedDID)
+	game, err := challenged.AcceptChallenge(context.Background(), challengeURI)
+	if err != nil {
+		t.Fatalf("expected the accept to succeed despite a decline record whose challenge strongRef CID is stale (does not match the challenge's CURRENT CID), got error: %v", err)
+	}
+	if game == nil {
+		t.Fatal("expected a game, got nil")
+	}
+	if n := pds.gameCount(testChallengedDID); n != 1 {
+		t.Errorf("expected exactly 1 game record, got %d", n)
+	}
+}
+
 // TestAcceptChallenge_HonestAcceptNoDecline_StillWorks is the regression
 // that matters most: an ordinary accept, with no decline record anywhere,
 // must still succeed once the durable-decline check is added to the
