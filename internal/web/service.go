@@ -375,6 +375,17 @@ func (s *Service) MakeMoveHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Record move in AT Protocol
 	if err := client.RecordMove(context.Background(), gameID, moveResult); err != nil {
+		if errors.Is(err, atproto.ErrGameRecordConflict) {
+			// The game record's compare-and-swap lost a race -- almost
+			// always the other player's move landing first. This is a
+			// conflict for the client to retry against fresh state, not
+			// a server fault: 409, distinct from every other RecordMove
+			// failure (network error, PDS 5xx, malformed response),
+			// which still falls through to the 500 below (atchess-1c9.87).
+			log.Warn().Err(err).Str("gameID", gameID).Msg("Move record conflict: game record was updated by another move first")
+			http.Error(w, "Failed to record move: conflicts with a concurrent update, refresh and retry", http.StatusConflict)
+			return
+		}
 		log.Error().Err(err).Str("gameID", gameID).Msg("Failed to record move")
 		http.Error(w, "Failed to record move", http.StatusInternalServerError)
 		return

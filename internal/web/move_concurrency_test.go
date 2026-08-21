@@ -476,7 +476,13 @@ func TestMakeMoveHandler_ConcurrentMove_SamePlayerTwice_ExactlyOneSucceeds(t *te
 		switch c {
 		case http.StatusOK:
 			successes++
-		case http.StatusInternalServerError:
+		case http.StatusConflict:
+			// atchess-1c9.87: a CAS conflict (the game record's swapCid
+			// lost the race) is not a server fault, so the loser gets
+			// 409, not 500 -- distinct from a genuine RecordMove failure
+			// (network error, PDS 5xx, malformed response), which is
+			// still mapped to 500 (see TestMakeMoveHandler_RecordMove_
+			// NonConflictFailureStill500).
 			failures++
 			if !strings.Contains(bodies[i], "Failed to record move") {
 				t.Errorf("expected failure body to say 'Failed to record move', got: %s", bodies[i])
@@ -500,5 +506,113 @@ func TestMakeMoveHandler_ConcurrentMove_SamePlayerTwice_ExactlyOneSucceeds(t *te
 	mock.mu.Unlock()
 	if moveCreates != 1 {
 		t.Errorf("expected exactly 1 move record created despite both submissions reaching RecordMove, got %d (writeCalls=%v)", moveCreates, writeCalls)
+	}
+}
+
+// nonConflictFailurePDS is a minimal mock PDS purpose-built for
+// TestMakeMoveHandler_RecordMove_NonConflictFailureStill500 (atchess-1c9.87
+// item 3): it serves the game record's getRecord normally, but always
+// fails its putRecord with a genuine server error that carries NO
+// "InvalidSwap"-prefixed structured "error" body -- the opposite of
+// raceMockPDS's swapCid-mismatch rejection above. This proves
+// isInvalidSwapBody (internal/atproto/client.go) does not match too
+// broadly: a real outage (an unreachable dependency, a malformed PDS
+// response, an ordinary 500) must still surface as ErrGameRecordConflict's
+// generic sibling error, which MakeMoveHandler maps to HTTP 500, NOT to
+// 409 -- if it did, a client would be told to "just retry" a failure that
+// retrying cannot fix.
+type nonConflictFailurePDS struct {
+	base string
+}
+
+func (p *nonConflictFailurePDS) server(t *testing.T) *httptest.Server {
+	srv := newFakeHTTPSEndpoint(t, http.HandlerFunc(p.handle))
+	p.base = srv.URL
+	return srv
+}
+
+func (p *nonConflictFailurePDS) handle(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	if strings.HasPrefix(r.URL.Path, "/did:plc:") {
+		did := strings.TrimPrefix(r.URL.Path, "/")
+		_ = json.NewEncoder(w).Encode(atproto.DIDDocument{
+			ID: did,
+			Service: []atproto.DIDService{
+				{ID: "#atproto_pds", Type: "AtprotoPersonalDataServer", ServiceEndpoint: p.base},
+			},
+		})
+		return
+	}
+
+	switch r.URL.Path {
+	case "/xrpc/com.atproto.repo.getRecord":
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{
+			"uri": "at://did:plc:player/app.atchess.game/game1",
+			"cid": "cid-game1-v1",
+			"value": map[string]interface{}{
+				"$type":     "app.atchess.game",
+				"createdAt": time.Now().Format(time.RFC3339),
+				"white":     "did:plc:player",
+				"black":     "did:plc:opponent",
+				"status":    "active",
+				"fen":       "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+				"pgn":       "",
+			},
+		})
+		return
+
+	case "/xrpc/com.atproto.repo.listRecords":
+		// GetGame's derived-status scan (see ErrIncompleteDerivation) asks
+		// for moves/resignations/timeViolations/drawResponses for both
+		// players before MakeMoveHandler ever reaches RecordMove --
+		// answer with an always-empty, always-200 list so that scan
+		// succeeds and the game derives as active, exactly as it should
+		// for this test's freshly-seeded, move-free game.
+		_ = json.NewEncoder(w).Encode(map[string]interface{}{"records": []interface{}{}})
+		return
+
+	case "/xrpc/com.atproto.repo.putRecord":
+		// A genuine server-side failure, NOT a swapCid conflict: no
+		// "error" field at all, let alone one prefixed "InvalidSwap".
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(map[string]string{"message": "internal database error"})
+		return
+
+	default:
+		w.WriteHeader(http.StatusNotFound)
+	}
+}
+
+// TestMakeMoveHandler_RecordMove_NonConflictFailureStill500 proves the
+// atchess-1c9.87 sentinel mapping is narrow: a RecordMove failure that is
+// NOT a CAS conflict (here, an ordinary PDS 500 with no InvalidSwap-shaped
+// body) must still surface to the client as HTTP 500, not be
+// misclassified as a 409 "just retry" conflict.
+func TestMakeMoveHandler_RecordMove_NonConflictFailureStill500(t *testing.T) {
+	const playerDID = "did:plc:player"
+
+	pds := &nonConflictFailurePDS{}
+	srv := pds.server(t)
+	defer srv.Close()
+
+	svc := &Service{
+		config:         &config.Config{ATProto: config.ATProtoConfig{PLCDirectoryURL: srv.URL}},
+		challengeStore: newTestChallengeStore(t),
+	}
+
+	session := newRaceSession(playerDID, "player.test", srv.URL)
+	gameURI := "at://did:plc:player/app.atchess.game/game1"
+
+	code, body := doMakeMove(svc, session, gameURI, "e2", "e4")
+
+	if code != http.StatusInternalServerError {
+		t.Fatalf("expected a non-conflict RecordMove failure to yield HTTP 500, got %d: %s", code, body)
+	}
+	if !strings.Contains(body, "Failed to record move") {
+		t.Errorf("expected failure body to say 'Failed to record move', got: %s", body)
+	}
+	if strings.Contains(body, "conflict") {
+		t.Errorf("non-conflict failure body must not claim a conflict, got: %s", body)
 	}
 }

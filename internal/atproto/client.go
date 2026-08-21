@@ -116,6 +116,40 @@ var ErrChallengeNotAcceptable = errors.New("challenge is not in an acceptable st
 // (atchess-1c9.106).
 var ErrChallengeChallengerForged = errors.New("challenge record's challenger field disagrees with its own repo")
 
+// ErrGameRecordConflict indicates a game record update inside RecordMove
+// failed its compare-and-swap (com.atproto.repo.putRecord's "swapCid")
+// because another write landed on the same record first -- almost always
+// the other player's move winning a race, not a server fault. Detected
+// from the PDS response body's structured "error" field beginning with
+// "InvalidSwap" (see isInvalidSwapBody), NEVER from the bare HTTP status
+// code alone: the real AT Protocol PDS reports this as "InvalidSwap", and
+// this codebase's own two in-memory PDS test doubles for concurrent
+// moves already disagree on the exact string --
+// internal/web/move_concurrency_test.go's raceMockPDS uses
+// "InvalidSwapError" -- so an exact match would miss it, hence the prefix
+// match. An unparseable or non-matching body is deliberately NOT treated
+// as a conflict: RecordMove falls back to its ordinary "failed to update
+// game record" error, which MakeMoveHandler maps to 500, so an ambiguous
+// failure fails closed toward "server error" rather than toward "just
+// retry" and silently swallowing a genuine outage.
+var ErrGameRecordConflict = errors.New("game record update conflict: the game record was updated by another write first")
+
+// isInvalidSwapBody reports whether an AT Protocol error response body
+// carries a structured "error" field indicating a failed
+// compare-and-swap (a "swapCid" that no longer matches the record's
+// current CID) on a putRecord call. See ErrGameRecordConflict's doc
+// comment for why this is a prefix match rather than an exact one, and
+// why the bare HTTP status code is never used as the signal instead.
+func isInvalidSwapBody(body []byte) bool {
+	var e struct {
+		Error string `json:"error"`
+	}
+	if err := json.Unmarshal(body, &e); err != nil {
+		return false
+	}
+	return strings.HasPrefix(e.Error, "InvalidSwap")
+}
+
 // isRecordNotFoundBody reports whether an AT Protocol error response body
 // carries the structured "RecordNotFound" error code. Used instead of the
 // HTTP status code alone -- see ErrRecordNotFound's doc comment for why.
@@ -897,7 +931,10 @@ func (c *Client) RecordMove(ctx context.Context, gameURI string, move *chess.Mov
 
 		if putResp.StatusCode != http.StatusOK {
 			body, _ := io.ReadAll(putResp.Body)
-			return fmt.Errorf("failed to update game record (conflict — another move may have been played): HTTP %d, body: %s", putResp.StatusCode, string(body))
+			if isInvalidSwapBody(body) {
+				return fmt.Errorf("%w: HTTP %d, body: %s", ErrGameRecordConflict, putResp.StatusCode, string(body))
+			}
+			return fmt.Errorf("failed to update game record: HTTP %d, body: %s", putResp.StatusCode, string(body))
 		}
 	}
 
