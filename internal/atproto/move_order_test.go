@@ -246,3 +246,94 @@ func TestGetResignationOutcome_SameSecondTie_DeterministicByRkey(t *testing.T) {
 		t.Errorf("expected white_won (black's resignation rkey sorts after white's), got %q", got.status)
 	}
 }
+
+// --- atchess-1c9.102: getLastMove had NO tiebreak at all (not even the
+// unsound TID one from moveIsAfter), and its result feeds
+// CheckTimeViolation's decision about who violated the time control.
+//
+// IMPORTANT FINDING, pinned by this test's own structure: CheckTimeViolation
+// determines WHO is being accused (ViolatingPlayer) from the game record's
+// OWN cached "fen" field (active-color parity) BEFORE it ever calls
+// getLastMove -- that identity is invariant, and getLastMove's excludePlayerDID
+// filter always narrows its candidates to that one fixed opponent's OWN
+// repo (a move record only ever lives in its author's own repo -- see
+// RecordMove), so getLastMove's Player field can never disagree with what
+// CheckTimeViolation already decided. So getLastMove's ordering choice
+// cannot flip WHICH DID gets named. What it DOES corrupt is WHETHER that
+// correctly-identified player is truly accused at all: the old code
+// (bare moveTime.After, trusting raw CreatedAt alone) always prefers
+// whichever of the opponent's own move records has the latest raw
+// timestamp -- so a stale, low-ply record whose CreatedAt happens to be
+// fresher than the opponent's TRUE latest (higher-ply) move completely
+// masks a real, otherwise-detectable violation: the accused escapes
+// entirely rather than being wrongly named. This is the mechanically
+// reachable direction of the bug for CheckTimeViolation specifically (a
+// literal same-second CreatedAt tie, by contrast, is provably harmless
+// here: getLastMove's only field CheckTimeViolation reads is CreatedAt,
+// and two tied records share the identical CreatedAt string regardless of
+// which one is "picked" -- unlike GetGame, which also reads FEN and so
+// was fixed by atchess-1c9.100 for exactly that reason).
+//
+// This is a constructed test, not a timing test: it builds that discord
+// directly rather than relying on a race.
+func TestCheckTimeViolation_StaleLowPlyRecordWithFresherTimestamp_MustNotMaskRealViolation(t *testing.T) {
+	mock := newDeriveTestPDS(t)
+	srv := mock.server()
+	defer srv.Close()
+
+	// White's TRUE latest move is Qh5 (ply 5), played well past the
+	// resolved correspondence default -- a real violation, if correctly
+	// identified as the latest.
+	longAgo := time.Now().Add(-time.Duration(defaultDaysPerMove+2) * 24 * time.Hour)
+
+	// Game record: black to move (qh5FEN's active color is "b"), its
+	// cached top-level "fen" kept in sync with white's true latest move,
+	// exactly as RecordMove does in production.
+	gameURI, _ := mock.seed(whiteDID, "app.atchess.game", "game1", map[string]interface{}{
+		"$type":     "app.atchess.game",
+		"createdAt": longAgo.Add(-time.Hour).Format(time.RFC3339),
+		"white":     whiteDID,
+		"black":     blackDID,
+		"status":    "active",
+		"fen":       qh5FEN,
+		"pgn":       "",
+	})
+
+	mock.seed(whiteDID, "app.atchess.move", "move-qh5", map[string]interface{}{
+		"$type":     "app.atchess.move",
+		"createdAt": longAgo.Format(time.RFC3339),
+		"game":      map[string]interface{}{"uri": gameURI},
+		"player":    whiteDID,
+		"from":      "d1",
+		"to":        "h5",
+		"san":       "Qh5",
+		"fen":       qh5FEN,
+	})
+
+	// A stale ply-1 record (white's very first move, e4) stamped with a
+	// FRESH timestamp -- e.g. a clock-skewed client or a replayed write.
+	// Its raw CreatedAt is more recent than Qh5's despite representing an
+	// earlier point in the game.
+	mock.seed(whiteDID, "app.atchess.move", "move-e4-stale", map[string]interface{}{
+		"$type":     "app.atchess.move",
+		"createdAt": time.Now().Add(-time.Hour).Format(time.RFC3339),
+		"game":      map[string]interface{}{"uri": gameURI},
+		"player":    whiteDID,
+		"from":      "e2",
+		"to":        "e4",
+		"san":       "e4",
+		"fen":       "rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1", // ply 1
+	})
+
+	client := newDeriveTestClient(t, mock)
+	hasViolation, violation, err := client.CheckTimeViolation(context.Background(), gameURI)
+	if err != nil {
+		t.Fatalf("CheckTimeViolation: %v", err)
+	}
+	if !hasViolation {
+		t.Fatalf("CheckTimeViolation: expected a violation (white's TRUE latest move, Qh5 at ply 5, was made %s ago -- well past the resolved correspondence default of %d days), got none: the stale ply-1 record's fresher CreatedAt masked it", time.Since(longAgo), defaultDaysPerMove)
+	}
+	if violation.ViolatingPlayer != blackDID {
+		t.Errorf("CheckTimeViolation: expected blackDID to be named the violator (it is black's turn per the game's fen), got %q", violation.ViolatingPlayer)
+	}
+}

@@ -2883,10 +2883,21 @@ func (c *Client) CheckTimeViolation(ctx context.Context, gameID string) (bool, *
 	return false, nil, nil
 }
 
-// getLastMove retrieves the most recent move in a game
+// getLastMove retrieves the most recent move in a game, excluding moves by
+// excludePlayerDID. Ordering uses moveRecordIsAfter (atchess-1c9.100/.102):
+// a bare CreatedAt comparison is only second-resolution and, worse, had no
+// tiebreak at all here, so two moves recorded in the same second could
+// order arbitrarily -- which fed CheckTimeViolation's attribution of WHICH
+// player violated the time control. moveRecordIsAfter orders by the ply
+// derived from each record's own FEN instead, which is domain-correct and
+// cross-repo-comparable; see its doc comment for why that is sound where a
+// bare timestamp/TID tiebreak was not. FEN and rkey are read here only to
+// feed that comparison -- callers still only read CreatedAt/Player.
 func (c *Client) getLastMove(ctx context.Context, gameID string, excludePlayerDID string) (*struct {
 	CreatedAt string
 	Player    string
+	FEN       string
+	rkey      string
 }, error) {
 	// List moves for both players
 	players := []string{}
@@ -2918,6 +2929,8 @@ func (c *Client) getLastMove(ctx context.Context, gameID string, excludePlayerDI
 	var lastMove *struct {
 		CreatedAt string
 		Player    string
+		FEN       string
+		rkey      string
 	}
 	var lastMoveTime time.Time
 
@@ -2940,12 +2953,14 @@ func (c *Client) getLastMove(ctx context.Context, gameID string, excludePlayerDI
 
 		var listResp struct {
 			Records []struct {
+				URI   string `json:"uri"`
 				Value struct {
 					CreatedAt string `json:"createdAt"`
 					Game      struct {
 						URI string `json:"uri"`
 					} `json:"game"`
 					Player string `json:"player"`
+					FEN    string `json:"fen"`
 				} `json:"value"`
 			} `json:"records"`
 		}
@@ -2961,15 +2976,20 @@ func (c *Client) getLastMove(ctx context.Context, gameID string, excludePlayerDI
 				if err != nil {
 					continue
 				}
+				rkey := recordKey(record.URI)
 
-				if lastMove == nil || moveTime.After(lastMoveTime) {
+				if lastMove == nil || moveRecordIsAfter(record.Value.FEN, moveTime, rkey, lastMove.FEN, lastMoveTime, lastMove.rkey) {
 					lastMoveTime = moveTime
 					lastMove = &struct {
 						CreatedAt string
 						Player    string
+						FEN       string
+						rkey      string
 					}{
 						CreatedAt: record.Value.CreatedAt,
 						Player:    record.Value.Player,
+						FEN:       record.Value.FEN,
+						rkey:      rkey,
 					}
 				}
 			}
