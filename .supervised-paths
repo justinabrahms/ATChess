@@ -1,0 +1,26 @@
+# Supervised paths — changes here require a human in the loop.
+#
+# Not "do not touch". These paths are in bounds for agent work; they are out
+# of bounds for agent work that MERGES ITSELF. The distinction is the whole
+# point: everything else in this repository has an oracle that can fail a bad
+# change without a person present (see docs/ORACLES.md). These paths do not.
+# The only thing standing between a plausible-looking change here and main is
+# somebody opening the page and looking at it.
+#
+# Enforced by scripts/check-supervised-paths.sh, not by policy. A rule that
+# lives only in a document is a rule an unattended runner never reads.
+#
+# One glob per line, matched against repo-relative paths. Blank lines and
+# lines beginning with # are ignored.
+
+# The entire web frontend. index.html and spectator.html carry the board
+# rendering, move input, challenge flow, and live-update handling inline.
+# There is no rendering test, no DOM assertion, no interaction test, and no
+# screenshot diff. internal/web/static_derivation_incomplete_guard_test.go
+# greps these files for one string; that is a tripwire for a single known
+# regression, not coverage.
+web/static/*
+
+# OAuth client metadata is served to third parties and mis-editing it breaks
+# login for everyone, in a way no test here would catch.
+web/static/client-metadata.json

@@ -1,4 +1,4 @@
-.PHONY: build protocol web run-protocol run-web dev-protocol dev-web dev test test-protocol test-web test-integration test-e2e test-local test-local-up test-local-down test-federation-up test-federation-up-ci test-federation-down test-federation-hosts-clean lint fmt clean
+.PHONY: check-supervised build protocol web run-protocol run-web dev-protocol dev-web dev test test-protocol test-web test-integration test-e2e test-local test-local-up test-local-down test-federation-up test-federation-up-ci test-federation-down test-federation-hosts-clean lint fmt clean
 
 # Build commands
 build: protocol web
@@ -95,7 +95,16 @@ test-local-down:
 # nothing at all. See that script's header comment for the full rationale,
 # including why the markers live inside the pds-alice-data/pds-bob-data
 # volumes rather than in the repo or a container label.
+# BLAST-RADIUS GATE (check-public-plc-blast-radius.sh) runs FIRST here --
+# ahead of the mode check, any mkdir, and anything being brought up. Local
+# mode publishes permanent, undeletable DID documents to the public
+# https://plc.directory, so an unattended caller has to be refused while a
+# refusal still touches nothing at all. The prose warning in
+# docker-compose.dual-pds.yml's header protects a human who reads it once;
+# it is no protection against a runner that retries. test-federation-up-ci
+# is hermetic and is deliberately NOT gated.
 test-federation-up:
+	./scripts/check-public-plc-blast-radius.sh
 	./scripts/check-dual-pds-mode.sh local check
 	./scripts/ensure-dual-pds-hosts.sh
 	mkdir -p certs/dual-pds
@@ -129,6 +138,16 @@ test-federation-down:
 # (repeated /etc/hosts rewrites, and multiple harnesses fighting over shared host state).
 test-federation-hosts-clean:
 	./scripts/remove-dual-pds-hosts.sh
+
+# Supervised-path gate (decision atchess-b2d.2). web/static/ has no oracle --
+# no rendering test, no DOM assertion, no interaction test -- so a change there
+# that renders a blank board passes the whole suite. Agent work on those paths
+# is allowed; agent work that MERGES ITSELF is not. Deliberately not folded
+# into `make test`: a human at a terminal always passes this gate, so wiring it
+# into the default suite would only ever fire in CI, where it cannot yet tell a
+# person's frontend PR from a robot's. See docs/ORACLES.md.
+check-supervised:
+	./scripts/check-supervised-paths.sh
 
 # Code quality
 lint:
