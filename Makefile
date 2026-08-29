@@ -1,4 +1,4 @@
-.PHONY: check-supervised build protocol web run-protocol run-web dev-protocol dev-web dev test test-protocol test-web test-integration test-e2e test-local test-local-up test-local-down test-federation-up test-federation-up-ci test-federation-down test-federation-hosts-clean lint fmt clean
+.PHONY: check-supervised deploy verify test-verbose build protocol web run-protocol run-web dev-protocol dev-web dev test test-protocol test-web test-integration test-e2e test-local test-local-up test-local-down test-federation-up test-federation-up-ci test-federation-down test-federation-hosts-clean lint fmt clean
 
 # Build commands
 build: protocol web
@@ -41,7 +41,35 @@ dev:
 	@wait
 
 # Testing
+#
+# THE FLEET CONTRACT (pipeline#adr-011, #adr-007). `make test` is the gate CI
+# runs on every pull request and the thing that must be green before `make
+# deploy` is even attempted. It runs two suites:
+#
+#   go test ./...   the Go suite, including the oracles in docs/ORACLES.md
+#   test/*.sh       shipped demos, which are permanent regression tests
+#
+# test/pending/ is EXCLUDED on purpose. A demo there belongs to a slice that
+# has not shipped yet -- it is written before the code (pipeline#adr-003) and
+# is expected to be red until the slice lands. `pipe deploy` promotes it out of
+# pending/ once it passes, at which point this target starts running it and it
+# never goes red again without someone noticing.
+#
+# test/e2e and test/integration need a live PDS stack and are not part of this
+# gate; they have their own targets below.
 test:
+	go test ./internal/... ./cmd/...
+	@found=0; failed=0; \
+	 for d in test/*.sh; do \
+	   [ -e "$$d" ] || continue; \
+	   found=$$((found+1)); \
+	   echo "--- $$d"; \
+	   bash "$$d" || failed=$$((failed+1)); \
+	 done; \
+	 echo "demos: $$found run, $$failed failed"; \
+	 [ "$$failed" -eq 0 ]
+
+test-verbose:
 	go test -v ./...
 
 test-protocol:
@@ -148,6 +176,46 @@ test-federation-hosts-clean:
 # person's frontend PR from a robot's. See docs/ORACLES.md.
 check-supervised:
 	./scripts/check-supervised-paths.sh
+
+# DEPLOY -- the fleet's release path (pipeline#adr-006, #adr-015, #adr-018).
+#
+# CI runs this, and only on a green master. Deploy is a CONSEQUENCE of green,
+# never a command you type: running it by hand against the live services is how
+# you ship code no test agreed to. A red suite skips it.
+#
+# The repo declares its own deploy; there is no fleet config format. This
+# mirrors what the GitHub Actions workflow already does -- build static
+# binaries, drop them in place, restart the units -- so that the gitea runner
+# and GitHub cannot disagree about what deployed means.
+DEPLOY_DIR ?= /srv/atchess/app/bin
+PROTOCOL_UNIT ?= atchess-protocol
+WEB_UNIT ?= atchess-web
+
+.PHONY: deploy verify
+deploy: build
+	@install -d "$(DEPLOY_DIR)"
+	@install -m 0755 bin/atchess-protocol "$(DEPLOY_DIR)/atchess-protocol"
+	@install -m 0755 bin/atchess-web "$(DEPLOY_DIR)/atchess-web"
+	@systemctl --user restart "$(PROTOCOL_UNIT)" "$(WEB_UNIT)" 2>/dev/null \
+	  || sudo systemctl restart "$(PROTOCOL_UNIT)" "$(WEB_UNIT)"
+	@echo "deployed to $(DEPLOY_DIR); restarted $(PROTOCOL_UNIT) $(WEB_UNIT)"
+	@$(MAKE) --no-print-directory verify
+
+# A 200 IS NOT PROOF. The flags service taught this rig that a process can
+# restart, come back healthy and come back EMPTY -- which passes a liveness
+# check while every feature reads off. So verify asserts something only a
+# working build can produce: the protocol service validates a real chess
+# position, which exercises the engine rather than the listener.
+PROTOCOL_URL ?= http://localhost:8080
+WEB_URL ?= http://localhost:8081
+
+verify:
+	@set -e; \
+	 curl -fsS --max-time 5 "$(PROTOCOL_URL)/health" >/dev/null \
+	   || { echo "verify: protocol service is not answering at $(PROTOCOL_URL)"; exit 1; }; \
+	 curl -fsS --max-time 5 "$(WEB_URL)/" >/dev/null \
+	   || { echo "verify: web service is not answering at $(WEB_URL)"; exit 1; }; \
+	 echo "verify: both services answering"
 
 # Code quality
 lint:
