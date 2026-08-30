@@ -61,12 +61,31 @@ fi
 
 # --- every endpoint the UI calls, with the verb the UI uses -------------------
 # PRESENT means: not 404. 401/403 are the route answering. See the header.
+# PRESENT means the route exists AND the service behind it is alive.
+#
+# The first version of this function treated everything except 404 and 000 as
+# ok, which meant a 502 -- the backend crash-looping and Caddy having nothing
+# to proxy to -- was reported as "deployed". Measured 2026-08-30: a deploy took
+# the protocol service down entirely, and this check printed five green lines
+# about endpoints that were answering only in the sense that a reverse proxy
+# was answering for them. That is the same mistake as reading a 404 as absence:
+# believing a status code means what it looks like it means.
+#
+# 401/403 are the strongest evidence a route exists -- something authenticated
+# enough to refuse you. 5xx is the service being broken, and is never ok here.
 present() { # present <label> <method> <path>
   local c; c=$(code "$2" "$3")
   case "$c" in
-    404) bad "$1: $2 $3 -> 404, the route is not deployed" ;;
-    000) bad "$1: $2 $3 -> no answer at all" ;;
-    *)   ok "$1: $2 $3 -> $c (deployed)" ;;
+    401|403|200|204|400|409|422)
+      ok "$1: $2 $3 -> $c (deployed and answering)" ;;
+    404)
+      bad "$1: $2 $3 -> 404 with the verb the UI uses; the route is not deployed" ;;
+    000)
+      bad "$1: $2 $3 -> no answer at all; the site is unreachable" ;;
+    5*)
+      bad "$1: $2 $3 -> $c; the service behind the proxy is DOWN, not merely unauthenticated" ;;
+    *)
+      bad "$1: $2 $3 -> $c, which this check does not recognise; treat unknown as broken" ;;
   esac
 }
 present "session"      GET  /api/auth/session
@@ -101,6 +120,12 @@ NEG=$(curl -s --max-time 20 -X POST -H 'Content-Type: application/json' \
        "$SITE/api/auth/oauth/login" 2>/dev/null)
 if grep -q '"authorization_url"' <<<"$NEG"; then
   bad "a nonsense handle produced an authorization URL — resolution is not really happening"
+elif [ "$fail" -ne 0 ]; then
+  # Do not claim this one when the service is already failing: with the backend
+  # down, EVERY handle is "refused" and this line reads as a passing control
+  # while proving nothing. Measured 2026-08-30 during an outage, where it was
+  # the single green line among failures.
+  echo "  --   nonsense handle: not asserted, the service is already failing"
 else
   ok "a nonsense handle is refused"
 fi

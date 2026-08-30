@@ -12,6 +12,24 @@ WorkingDirectory=/srv/atchess/app
 EnvironmentFile=/etc/atchess/protocol.env
 ExecStart=/srv/atchess/app/atchess-protocol
 
+# STATE PATHS -- DECLARED HERE, GRANTED BELOW, DELIBERATELY ADJACENT.
+#
+# The service writes exactly two things. Both default to a path RELATIVE to the
+# working directory (./data/...), which no unit file can reliably grant: the
+# grant is absolute and the default depends on where the process was started.
+# So set them absolutely here, and keep them next to the ReadWritePaths line
+# that permits them -- the two must agree, and the only way to keep them
+# agreeing is to make disagreeing visible in a three-line diff.
+#
+# Measured 2026-08-30, and the reason this comment exists: a deploy of a build
+# that had gained a challenge store crash-looped on
+#   "creating challenge store directory data: mkdir data: read-only file system"
+# because ProtectSystem=strict left the log directory as the only writable
+# path. The binary was correct, the tests were green, and the site was down.
+# Adding a state path to this service means adding it in BOTH places below.
+Environment="CHALLENGE_DB_PATH=/srv/atchess/data/challenges.db"
+Environment="FIREHOSE_STATE_DIR=/srv/atchess/data/firehose"
+
 Restart=on-failure
 RestartSec=5
 
@@ -24,6 +42,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
+# Grants the two Environment= paths declared above. Keep in sync with them.
 ReadWritePaths=/srv/atchess/data /srv/atchess/logs
 ProtectKernelTunables=true
 ProtectKernelModules=true
