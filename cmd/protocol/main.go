@@ -295,8 +295,16 @@ func main() {
 	authed.Use(web.AuthMiddleware)
 	authed.HandleFunc("/auth/current", service.GetCurrentUserHandler).Methods("GET")
 	authed.HandleFunc("/games", service.CreateGameHandler).Methods("POST")
+	// GET /games answers "what am I playing?". It did not exist until
+	// 2026-08-30, which is why the page's game list was a hardcoded
+	// "No active games" and a player who closed the tab lost their game.
+	authed.HandleFunc("/games", service.ListGamesHandler).Methods("GET")
 	authed.HandleFunc("/moves", service.MakeMoveHandler).Methods("POST")
 	authed.HandleFunc("/challenges", service.CreateChallengeHandler).Methods("POST")
+	// GET /challenges lists the challenges you SENT. The page only ever
+	// showed incoming ones, so issuing a challenge produced no visible
+	// evidence anywhere (2026-08-30).
+	authed.HandleFunc("/challenges", service.ListOutgoingChallengesHandler).Methods("GET")
 	authed.HandleFunc("/challenge-notifications", service.GetChallengeNotificationsHandler).Methods("GET")
 	authed.HandleFunc("/challenge-notifications/{key}", service.DeclineChallengeHandler).Methods("DELETE")
 	authed.HandleFunc("/challenge-notifications/{key}/accept", service.AcceptChallengeHandler).Methods("POST")

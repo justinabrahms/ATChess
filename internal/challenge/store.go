@@ -170,6 +170,30 @@ CREATE TABLE IF NOT EXISTS challenges (
 	status            TEXT NOT NULL DEFAULT 'open'
 );
 CREATE INDEX IF NOT EXISTS idx_challenges_challenged_did ON challenges(challenged_did);
+
+-- games: the service's own index of games it has LEARNED ABOUT.
+--
+-- A game record lives in exactly one player's repository and AT Protocol has no
+-- way to enumerate "all games everywhere", so a spectator listing has to be
+-- built from observation. Before this table, GetActiveGamesHandler returned a
+-- hardcoded empty slice with a TODO -- it was not that the query was slow, it
+-- was that no query existed.
+--
+-- Rows are written whenever this service sees a game: on accept, on a move, and
+-- whenever a player's game listing scans a repo. That makes the index eventually
+-- complete for anything anyone here has touched, which is the honest scope of
+-- what a single instance can know.
+CREATE TABLE IF NOT EXISTS games (
+	uri        TEXT PRIMARY KEY,
+	white_did  TEXT NOT NULL,
+	black_did  TEXT NOT NULL,
+	status     TEXT NOT NULL DEFAULT '',
+	fen        TEXT NOT NULL DEFAULT '',
+	created_at TEXT NOT NULL DEFAULT '',
+	updated_at TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_games_status ON games(status);
+CREATE INDEX IF NOT EXISTS idx_games_players ON games(white_did, black_did);
 `
 	if _, err := db.Exec(schema); err != nil {
 		return err
@@ -544,4 +568,66 @@ func FromChallengeRecord(repoDID, rkey, cid string, record map[string]interface{
 		CreatedAt:        createdAt,
 		ExpiresAt:        expiresAt,
 	}
+}
+
+// IndexedGame is one row of the service's own game index.
+type IndexedGame struct {
+	URI       string
+	WhiteDID  string
+	BlackDID  string
+	Status    string
+	FEN       string
+	CreatedAt string
+	UpdatedAt string
+}
+
+// RecordGame upserts what this service currently knows about a game.
+//
+// Called from every path that observes one — accept, move, and a player's game
+// listing — so the index fills in from ordinary use rather than needing a
+// crawler. An upsert rather than an insert because the same game is seen many
+// times and the newest observation is the one worth keeping.
+//
+// Errors are returned but every caller treats them as non-fatal: this is an
+// index, and failing a player's move because a cache write failed would be a
+// far worse bug than a missing spectator row.
+func (s *Store) RecordGame(g IndexedGame) error {
+	if g.URI == "" {
+		return fmt.Errorf("refusing to index a game with no URI")
+	}
+	_, err := s.db.Exec(`
+INSERT INTO games (uri, white_did, black_did, status, fen, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(uri) DO UPDATE SET
+	status     = excluded.status,
+	fen        = excluded.fen,
+	updated_at = excluded.updated_at
+`, g.URI, g.WhiteDID, g.BlackDID, g.Status, g.FEN, g.CreatedAt, g.UpdatedAt)
+	return err
+}
+
+// ActiveGames returns games this service has seen that are still in progress,
+// most recently updated first.
+func (s *Store) ActiveGames(limit int) ([]IndexedGame, error) {
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	rows, err := s.db.Query(`
+SELECT uri, white_did, black_did, status, fen, created_at, updated_at
+FROM games WHERE status = 'active'
+ORDER BY updated_at DESC, created_at DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+
+	var out []IndexedGame
+	for rows.Next() {
+		var g IndexedGame
+		if err := rows.Scan(&g.URI, &g.WhiteDID, &g.BlackDID, &g.Status, &g.FEN, &g.CreatedAt, &g.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, g)
+	}
+	return out, rows.Err()
 }

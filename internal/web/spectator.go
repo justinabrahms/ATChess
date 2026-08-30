@@ -38,12 +38,34 @@ type PlayerInfo struct {
 
 // GetActiveGamesHandler returns a list of active games for spectating
 func (s *Service) GetActiveGamesHandler(w http.ResponseWriter, r *http.Request) {
-	// In a real implementation, this would query indexed games from a database
-	// For now, we'll use the firehose processor's tracked games
-
-	// TODO: Implement proper game indexing service
-	// This is a placeholder that returns an empty list
+	// Reads the service's own game index (internal/challenge, `games` table),
+	// which is populated wherever this service observes a game: on accept, on a
+	// move, and whenever a player's game listing scans a repo.
+	//
+	// This used to return a hardcoded empty slice with a TODO. The honest scope
+	// of what a single instance can list is "games anyone here has touched" --
+	// AT Protocol offers no way to enumerate every game in the network, so a
+	// listing is necessarily built from observation rather than queried.
 	games := []GameIndex{}
+	if s.challengeStore != nil {
+		indexed, err := s.challengeStore.ActiveGames(50)
+		if err != nil {
+			log.Error().Err(err).Msg("spectator: could not read the game index")
+			http.Error(w, "Could not list active games", http.StatusInternalServerError)
+			return
+		}
+		for _, g := range indexed {
+			games = append(games, GameIndex{
+				URI:    g.URI,
+				GameID: g.URI,
+				Status: chess.GameStatus(g.Status),
+				Players: GamePlayers{
+					White: PlayerInfo{DID: g.WhiteDID},
+					Black: PlayerInfo{DID: g.BlackDID},
+				},
+			})
+		}
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{

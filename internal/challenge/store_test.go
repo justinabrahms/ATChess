@@ -1021,3 +1021,48 @@ func TestFromChallengeRecord_CreatedAtWithinClockSkewTolerance_NotShortened(t *t
 		t.Fatalf("expected ExpiresAt preserved unchanged for a createdAt within clock-skew tolerance, got %v want %v", pc.ExpiresAt, want)
 	}
 }
+
+// The game index is what makes a spectator listing possible at all. Before it,
+// GetActiveGamesHandler returned a hardcoded empty slice.
+func TestGameIndexUpsertsAndListsActive(t *testing.T) {
+	s, _ := newTestStore(t)
+
+	g := IndexedGame{URI: "at://did:plc:a/app.atchess.game/1", WhiteDID: "did:plc:a",
+		BlackDID: "did:plc:b", Status: "active", FEN: "fen1", CreatedAt: "2026-01-01T00:00:00Z", UpdatedAt: "2026-01-01T00:00:00Z"}
+	if err := s.RecordGame(g); err != nil {
+		t.Fatalf("RecordGame: %v", err)
+	}
+	// Seeing the same game again must UPDATE it, not add a second row. Every
+	// listing re-observes every game, so an insert-only index would grow without
+	// bound and show duplicates.
+	g.Status, g.FEN, g.UpdatedAt = "active", "fen2", "2026-01-02T00:00:00Z"
+	if err := s.RecordGame(g); err != nil {
+		t.Fatalf("RecordGame (second observation): %v", err)
+	}
+
+	active, err := s.ActiveGames(10)
+	if err != nil {
+		t.Fatalf("ActiveGames: %v", err)
+	}
+	if len(active) != 1 {
+		t.Fatalf("got %d rows, want 1 — the index is accumulating duplicates", len(active))
+	}
+	if active[0].FEN != "fen2" {
+		t.Errorf("FEN = %q, want the newer observation fen2", active[0].FEN)
+	}
+
+	// A finished game is not an active one.
+	done := IndexedGame{URI: "at://did:plc:a/app.atchess.game/2", WhiteDID: "did:plc:a",
+		BlackDID: "did:plc:b", Status: "white_won", UpdatedAt: "2026-01-03T00:00:00Z"}
+	if err := s.RecordGame(done); err != nil {
+		t.Fatalf("RecordGame(finished): %v", err)
+	}
+	active, _ = s.ActiveGames(10)
+	if len(active) != 1 {
+		t.Errorf("a finished game appeared in the active listing (%d rows)", len(active))
+	}
+
+	if err := s.RecordGame(IndexedGame{}); err == nil {
+		t.Error("a game with no URI was indexed; it can never be looked up again")
+	}
+}

@@ -691,9 +691,19 @@
 
                 <!-- Challenge Inbox -->
                 <div class="sidebar-card">
-                    <h3>Challenges</h3>
+                    <h3>Challenges received</h3>
                     <div id="challengesList">
                         <div class="no-items">No pending challenges</div>
+                    </div>
+                </div>
+
+                <!-- Challenges this player has sent. Previously invisible:
+                     only incoming challenges were ever listed, so issuing one
+                     produced no evidence anywhere that it had happened. -->
+                <div class="sidebar-card">
+                    <h3>Challenges sent</h3>
+                    <div id="outgoingChallenges">
+                        <div class="no-items">No challenges sent</div>
                     </div>
                 </div>
             </div>
@@ -845,6 +855,7 @@
             initializeBoard();
             loadActiveGames();
             loadChallenges();
+            loadOutgoingChallenges();
             
             // Check for game in URL
             const urlParams = new URLSearchParams(window.location.search);
@@ -1136,11 +1147,83 @@
             }
         }
         
-        // Load active games
+        // Load the games this player is in.
+        //
+        // This was a stub that rendered "No active games" unconditionally, so a
+        // player who closed the tab lost their game -- it was reachable only by
+        // holding its URI. GET /api/games now answers it for real.
         async function loadActiveGames() {
-            // TODO: Implement endpoint to fetch user's active games
-            // For now, show empty state
-            document.getElementById('gamesList').innerHTML = '<div class="no-items">No active games</div>';
+            const el = document.getElementById('gamesList');
+            try {
+                const data = await (await apiFetch(`/games`)).json();
+                const games = data.games || [];
+                if (games.length === 0) {
+                    el.innerHTML = '<div class="no-items">No games yet</div>';
+                } else {
+                    el.innerHTML = games.map(g => {
+                        const enc = encodeURIComponent(btoa(g.id).replace(/\+/g, '-').replace(/\//g, '_'));
+                        const turn = g.yourTurn ? '<strong>your move</strong>'
+                                                : (g.status === 'active' ? 'their move' : g.status);
+                        return `<div class="game-item" onclick="openGame('${enc}')">
+                                  <div class="game-opponent">vs ${escapeHtml(g.opponent || 'unknown')}</div>
+                                  <div class="game-status">${turn} &middot; ${escapeHtml(g.yourColor)}</div>
+                                </div>`;
+                    }).join('');
+                }
+                // A partial answer must say so. Some of a player's repos being
+                // unreadable looks exactly like having fewer games, and that is
+                // the reading that makes someone think a game vanished.
+                if (data.incomplete) {
+                    el.innerHTML += '<div class="no-items">Some games could not be loaded. Try again shortly.</div>';
+                }
+            } catch (error) {
+                el.innerHTML = `<div class="no-items">Could not load games: ${escapeHtml(error.message)}</div>`;
+            }
+        }
+
+        // Open a game from the list, keeping the URL shareable/reloadable.
+        function openGame(encodedGameId) {
+            const url = new URL(window.location);
+            url.searchParams.set('game', encodedGameId);
+            window.history.replaceState({}, document.title, url);
+            loadGame(encodedGameId);
+        }
+
+        // Text from other people's repos reaches the DOM here, so it is escaped
+        // rather than trusted: a handle is attacker-chosen data.
+        function escapeHtml(s) {
+            return String(s == null ? '' : s)
+                .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+        }
+
+        // Load the challenges this player has SENT. The page only ever showed
+        // incoming ones, so issuing a challenge produced no visible evidence
+        // anywhere that it had happened.
+        async function loadOutgoingChallenges() {
+            const el = document.getElementById('outgoingChallenges');
+            if (!el) return;
+            try {
+                const data = await (await apiFetch(`/challenges`)).json();
+                const out = data.challenges || [];
+                if (out.length === 0) {
+                    el.innerHTML = '<div class="no-items">No challenges sent</div>';
+                    return;
+                }
+                el.innerHTML = out.map(c => {
+                    const accepted = c.status === 'accepted' && c.gameUri;
+                    const enc = accepted
+                        ? encodeURIComponent(btoa(c.gameUri).replace(/\+/g, '-').replace(/\//g, '_'))
+                        : '';
+                    const label = accepted ? 'accepted &mdash; open game' : escapeHtml(c.status || 'pending');
+                    return `<div class="challenge-item"${accepted ? ` onclick="openGame('${enc}')"` : ''}>
+                              <div>to ${escapeHtml(c.challengedDid)}</div>
+                              <div class="game-status">${label}</div>
+                            </div>`;
+                }).join('');
+            } catch (error) {
+                el.innerHTML = `<div class="no-items">Could not load sent challenges: ${escapeHtml(error.message)}</div>`;
+            }
         }
         
         // Load challenges
