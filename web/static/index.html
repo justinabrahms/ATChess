@@ -575,9 +575,42 @@
                 font-size: 30px;
             }
         }
+
+        /* Toasts. alert() blocks the page, cannot be styled, cannot show two
+           things at once, and on a move error interrupts the board mid-thought.
+           These stack, dismiss themselves, and are announced to screen readers
+           via the aria-live region they live in. */
+        #toasts {
+            position: fixed; top: 1rem; right: 1rem; z-index: 1000;
+            display: flex; flex-direction: column; gap: .5rem;
+            max-width: min(24rem, calc(100vw - 2rem));
+        }
+        .toast {
+            display: flex; align-items: flex-start; gap: .6rem;
+            padding: .7rem .9rem; border-radius: .5rem;
+            background: #1f2937; color: #f9fafb;
+            box-shadow: 0 6px 20px rgba(0,0,0,.25);
+            border-left: 4px solid #6b7280;
+            font-size: .92rem; line-height: 1.35;
+            animation: toast-in .18s ease-out;
+        }
+        .toast.is-error   { border-left-color: #dc2626; }
+        .toast.is-success { border-left-color: #16a34a; }
+        .toast.is-info    { border-left-color: #2563eb; }
+        .toast-body { flex: 1; overflow-wrap: anywhere; }
+        .toast-close {
+            background: none; border: 0; color: inherit; opacity: .7;
+            cursor: pointer; font-size: 1.1rem; line-height: 1; padding: 0 .1rem;
+        }
+        .toast-close:hover { opacity: 1; }
+        @keyframes toast-in { from { opacity: 0; transform: translateY(-.4rem); } }
+        /* Respect a reader who has asked for less motion. */
+        @media (prefers-reduced-motion: reduce) { .toast { animation: none; } }
     </style>
 </head>
 <body>
+    <!-- Announced to assistive tech; see notify() -->
+    <div id="toasts" role="status" aria-live="polite" aria-atomic="false"></div>
     <!-- Header -->
     <header class="header">
         <div class="header-content">
@@ -753,6 +786,65 @@
             }
         }
         
+        // notify — how this app talks to you.
+        //
+        // Replaces nine alert() calls. alert() blocks the whole page until
+        // dismissed, cannot show two things at once, cannot be styled, and on a
+        // rejected move interrupts you mid-thought to say something you could
+        // have read in the corner. It is also untestable and unstylable, which
+        // is why nothing modern uses it.
+        //
+        // Errors persist until dismissed; successes clear themselves. Nothing
+        // is ever silently dropped: if the caller has something to say, it
+        // lands somewhere the user can read it.
+        function notify(message, kind = 'info', opts = {}) {
+            const host = document.getElementById('toasts');
+            if (!host) { console.log(`[${kind}] ${message}`); return; }
+
+            const el = document.createElement('div');
+            el.className = `toast is-${kind}`;
+
+            const body = document.createElement('div');
+            body.className = 'toast-body';
+            // textContent, not innerHTML: these messages carry server text and
+            // opponent handles, which are attacker-chosen data.
+            body.textContent = message;
+
+            const close = document.createElement('button');
+            close.className = 'toast-close';
+            close.setAttribute('aria-label', 'Dismiss');
+            close.textContent = '\u00d7';
+            close.onclick = () => el.remove();
+
+            el.append(body, close);
+            host.append(el);
+
+            // An error stays until dismissed -- it usually needs an action, and
+            // a message that vanishes before it is read is the same as no
+            // message. Everything else clears itself.
+            const ms = opts.duration ?? (kind === 'error' ? 0 : 5000);
+            if (ms > 0) setTimeout(() => el.remove(), ms);
+            return el;
+        }
+
+        // confirmAction — a non-blocking replacement for confirm() on the two
+        // irreversible actions. Resolves true only if the user presses the
+        // confirming button; dismissing means no.
+        function confirmAction(message, confirmLabel = 'Confirm') {
+            return new Promise(resolve => {
+                const el = notify(message, 'info', { duration: 0 });
+                if (!el) { resolve(false); return; }
+                const yes = document.createElement('button');
+                yes.className = 'toast-close';
+                yes.style.cssText = 'opacity:1;font-size:.85rem;font-weight:600;white-space:nowrap';
+                yes.textContent = confirmLabel;
+                yes.onclick = () => { el.remove(); resolve(true); };
+                // Dismissing the toast is a "no", so the promise always settles.
+                el.querySelector('.toast-close').addEventListener('click', () => resolve(false));
+                el.insertBefore(yes, el.querySelector('.toast-close'));
+            });
+        }
+
         // apiFetch — the ONLY way this page should talk to the API.
         //
         // WHY IT EXISTS. Every authenticated endpoint requires an X-Session-ID
@@ -1108,7 +1200,7 @@
                 updateGameStatus();
                 
             } catch (error) {
-                alert('Invalid move: ' + error.message);
+                notify('Invalid move: ' + error.message, 'error');
             }
         }
         
@@ -1136,14 +1228,14 @@
                 
                 
                 const challenge = await response.json();
-                alert('Challenge sent to ' + opponentHandle);
+                notify('Challenge sent to ' + opponentHandle, 'success');
                 
                 // Reset form
                 document.getElementById('opponentHandle').value = '';
                 document.getElementById('colorChoice').value = 'random';
                 
             } catch (error) {
-                alert('Error creating game: ' + error.message);
+                notify(error.message, 'error');
             }
         }
         
@@ -1337,7 +1429,7 @@
                 loadChallenges();
 
             } catch (error) {
-                alert('Error accepting challenge: ' + error.message);
+                notify('Could not accept challenge: ' + error.message, 'error');
             }
         }
         
@@ -1355,7 +1447,7 @@
                 loadChallenges();
 
             } catch (error) {
-                alert('Error declining challenge: ' + error.message);
+                notify('Could not decline challenge: ' + error.message, 'error');
             }
         }
         
@@ -1380,7 +1472,7 @@
                 window.history.pushState({}, '', url);
                 
             } catch (error) {
-                alert('Error loading game: ' + error.message);
+                notify('Could not load game: ' + error.message, 'error');
             }
         }
         
@@ -1469,30 +1561,90 @@
                     break;
                     
                 case 'draw_offer':
-                    if (confirm('Your opponent offers a draw. Accept?')) {
-                        // TODO: Implement draw acceptance
-                    }
+                    // The offer's URI is what the respond endpoint keys on; a
+                    // response without it cannot be attributed to an offer.
+                    respondToDrawOffer(data.drawOfferUri || data.uri);
                     break;
-                    
+
                 case 'resignation':
-                    alert('Your opponent resigned. You win!');
-                    // TODO: Update game state
+                    notify('Your opponent resigned \u2014 you win.', 'success', { duration: 0 });
+                    // Re-read rather than patching local state: the authoritative
+                    // result is derived from both players' records, not from the
+                    // contents of this websocket frame.
+                    if (currentGame) {
+                        loadGame(btoa(currentGame.id).replace(/\+/g, '-').replace(/\//g, '_'));
+                    }
+                    loadActiveGames();
                     break;
             }
         }
         
-        // Game actions
-        function offerDraw() {
-            if (!currentGame) return;
-            // TODO: Implement draw offer
-            alert('Draw offer not yet implemented');
+
+        // respondToDrawOffer — answer an offer that arrived over the websocket.
+        //
+        // Was `if (confirm(...)) { /* TODO */ }`: it blocked the page to ask a
+        // question and then did nothing with the answer, so accepting a draw
+        // silently did not happen.
+        async function respondToDrawOffer(drawOfferUri) {
+            if (!drawOfferUri) {
+                notify('Your opponent offered a draw, but the offer could not be identified.', 'error');
+                return;
+            }
+            const accept = await confirmAction('Your opponent offers a draw. Accept?', 'Accept draw');
+            try {
+                await apiFetch(`/draw-offers/respond`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ drawOfferUri, accept })
+                });
+                notify(accept ? 'Draw accepted. The game is over.' : 'Draw declined.',
+                       accept ? 'info' : 'success', accept ? { duration: 0 } : {});
+                if (currentGame) {
+                    loadGame(btoa(currentGame.id).replace(/\+/g, '-').replace(/\//g, '_'));
+                }
+                loadActiveGames();
+            } catch (error) {
+                notify('Could not respond to the draw offer: ' + error.message, 'error');
+            }
         }
-        
-        function resignGame() {
-            if (!currentGame) return;
-            if (confirm('Are you sure you want to resign?')) {
-                // TODO: Implement resignation
-                alert('Resignation not yet implemented');
+
+        // Game actions.
+        //
+        // Both of these were live buttons wired to an alert saying the feature
+        // did not exist, while POST /api/draw-offers and POST /api/resign had
+        // existed all along. A button that does nothing is worse than a missing one: it
+        // tells the player the feature is there and then wastes their move.
+        async function offerDraw() {
+            if (!currentGame) { notify('Open a game first.', 'info'); return; }
+            try {
+                await apiFetch(`/draw-offers`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ gameId: currentGame.id, message: '' })
+                });
+                notify('Draw offered. Waiting for your opponent.', 'success');
+            } catch (error) {
+                notify('Could not offer a draw: ' + error.message, 'error');
+            }
+        }
+
+        async function resignGame() {
+            if (!currentGame) { notify('Open a game first.', 'info'); return; }
+            // Resigning ends the game and cannot be undone, so it is confirmed
+            // — but not with confirm(), which blocks the page for the same
+            // reasons alert() does.
+            if (!await confirmAction('Resign this game? This cannot be undone.', 'Resign')) return;
+            try {
+                await apiFetch(`/resign`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ gameId: currentGame.id, reason: '' })
+                });
+                notify('You resigned. The game is over.', 'info', { duration: 0 });
+                loadGame(btoa(currentGame.id).replace(/\+/g, '-').replace(/\//g, '_'));
+                loadActiveGames();
+            } catch (error) {
+                notify('Could not resign: ' + error.message, 'error');
             }
         }
         

@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -231,5 +232,76 @@ func TestUIUsesApiFetchForEveryAPICall(t *testing.T) {
 			"A direct fetch sends no X-Session-ID, so the endpoint answers 401, and the "+
 			"call site invents its own error message instead of showing the server's.",
 			strings.Join(offenders, ", "))
+	}
+}
+
+// THE UI MUST NOT USE alert() / confirm() / prompt().
+//
+// There were nine alert() calls. They block the entire page until dismissed,
+// cannot show two things at once, cannot be styled, and on a rejected move
+// interrupt the player mid-thought to say something that belonged in the
+// corner. Two of them said "not yet implemented" behind live buttons.
+//
+// notify() and confirmAction() replace them. This gate exists because alert()
+// is the single easiest thing to reach for when adding a message, and one of
+// them undoes the whole point.
+func TestUIDoesNotUseBlockingDialogs(t *testing.T) {
+	root := repoRoot(t)
+	pages, err := filepath.Glob(filepath.Join(root, "web", "static", "*.html"))
+	if err != nil || len(pages) == 0 {
+		t.Fatalf("no pages under web/static (err=%v) — this test would pass vacuously", err)
+	}
+
+	// Word-boundary-ish: `alert(` but not `.alert(` or `notifyAlert(`.
+	blocking := regexp.MustCompile(`(^|[^.\w])(alert|confirm|prompt)\s*\(`)
+
+	var offenders []string
+	for _, page := range pages {
+		b, rerr := os.ReadFile(page)
+		if rerr != nil {
+			t.Fatalf("reading %s: %v", page, rerr)
+		}
+		for i, line := range strings.Split(string(b), "\n") {
+			trimmed := strings.TrimSpace(line)
+			// Comments explain why these are banned; they are not uses.
+			if strings.HasPrefix(trimmed, "//") || strings.HasPrefix(trimmed, "*") ||
+				strings.HasPrefix(trimmed, "/*") {
+				continue
+			}
+			if blocking.MatchString(line) {
+				offenders = append(offenders,
+					filepath.Base(page)+":"+strconv.Itoa(i+1)+"  "+trimmed)
+			}
+		}
+	}
+
+	if len(offenders) > 0 {
+		t.Errorf("the UI uses a blocking dialog in %d place(s):\n  %s\n\n"+
+			"Use notify(message, 'error'|'success'|'info') instead, or "+
+			"confirmAction(message, label) for something irreversible. "+
+			"alert() blocks the page, cannot be styled, and cannot show two things at once.",
+			len(offenders), strings.Join(offenders, "\n  "))
+	}
+}
+
+// The page must not ship buttons wired to "not yet implemented". Two did —
+// Offer Draw and Resign — while their endpoints had existed all along. A button
+// that does nothing is worse than a missing one: it promises a feature and then
+// wastes the player's move.
+func TestUIHasNoNotImplementedActions(t *testing.T) {
+	root := repoRoot(t)
+	pages, _ := filepath.Glob(filepath.Join(root, "web", "static", "*.html"))
+	for _, page := range pages {
+		b, err := os.ReadFile(page)
+		if err != nil {
+			continue
+		}
+		lower := strings.ToLower(string(b))
+		for _, phrase := range []string{"not yet implemented", "todo: implement"} {
+			if strings.Contains(lower, phrase) {
+				t.Errorf("%s still contains %q — either build it or remove the control that offers it",
+					filepath.Base(page), phrase)
+			}
+		}
 	}
 }
