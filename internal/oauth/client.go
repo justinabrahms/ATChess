@@ -21,6 +21,42 @@ import (
 	"github.com/justinabrahms/atchess/internal/dpop"
 )
 
+// Scope is the OAuth scope ATChess requests. It is a CONSTANT because it was
+// three separate string literals -- the client metadata we advertise, the
+// authorization request, and the token exchange -- and those three drifting
+// apart is a silent failure: you either break sign-in, or request more than
+// you told the user you would.
+//
+// WHY IT IS THIS BROAD, which is a fair thing to be unhappy about.
+//
+// `transition:generic` is AT Protocol's transitional catch-all. On the consent
+// screen it reads as "manage your profile, posts, likes and follows", "create,
+// update, and delete any public data linked to your account", and "perform
+// authenticated actions towards any service on your behalf". A chess app needs
+// none of that. It needs to write app.atchess.* records into the signed-in
+// user's repository and read them back.
+//
+// There is currently no narrower option. Measured 2026-08-30, both
+// eurosky.social and bsky.social advertise exactly:
+//
+//	scopes_supported: ["atproto", "transition:email",
+//	                   "transition:generic", "transition:chat.bsky"]
+//
+// `atproto` alone is identity and grants no repo write, and games live in the
+// player's own repository -- that is the entire architecture, not an
+// implementation detail. So `transition:generic` is the minimum that works,
+// and the granular permissions that would let this be `repo:app.atchess.game`
+// and friends are not deployed anywhere in the ecosystem yet.
+//
+// WHAT WE DELIBERATELY DO NOT REQUEST: `transition:email` and
+// `transition:chat.bsky`. Both are offered and neither is needed.
+// TestScopeRequestsNoMoreThanNeeded fails if either appears.
+//
+// WHEN GRANULAR SCOPES SHIP: re-check scopes_supported on a real PDS, narrow
+// this to the app.atchess.* collections, and keep a fallback for servers still
+// advertising only the transitional set.
+const Scope = "atproto transition:generic"
+
 type OAuthClient struct {
 	clientID     string
 	redirectURI  string
@@ -100,7 +136,7 @@ func (c *OAuthClient) BuildAuthorizationURL(authEndpoint, handle, state, codeCha
 	params.Set("client_id", c.clientID)
 	params.Set("redirect_uri", c.redirectURI)
 	params.Set("state", state)
-	params.Set("scope", "atproto transition:generic")
+	params.Set("scope", Scope)
 	params.Set("code_challenge", codeChallenge)
 	params.Set("code_challenge_method", "S256")
 
@@ -205,7 +241,7 @@ func (c *OAuthClient) PushAuthorizationRequest(parEndpoint, issuer, handle, stat
 		data.Set("client_id", c.clientID)
 		data.Set("redirect_uri", c.redirectURI)
 		data.Set("state", state)
-		data.Set("scope", "atproto transition:generic")
+		data.Set("scope", Scope)
 		data.Set("code_challenge", codeChallenge)
 		data.Set("code_challenge_method", "S256")
 		if handle != "" {

@@ -1125,7 +1125,7 @@ func (s *Service) ClientMetadataHandler(w http.ResponseWriter, r *http.Request) 
 		"redirect_uris": []string{
 			fmt.Sprintf("%s://%s/api/callback", scheme, host),
 		},
-		"scope":                           "atproto transition:generic",
+		"scope":                           oauth.Scope,
 		"grant_types":                     []string{"authorization_code", "refresh_token"},
 		"response_types":                  []string{"code"},
 		"token_endpoint_auth_method":      "private_key_jwt",
