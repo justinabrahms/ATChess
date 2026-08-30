@@ -225,6 +225,13 @@ WEB_URL ?= http://localhost:8081
 # for why this detects drift rather than installing over it.
 SSH_TARGET ?= justin@abrah.ms
 
+# The whole product, between two real accounts, against the deployed site.
+# Needs test/.live-accounts.json (gitignored, app passwords) and WRITES REAL
+# RECORDS -- deliberately never part of `make test` and never unattended.
+# Exit 2 means a remote PDS failed a write, not that ATChess regressed.
+verify-live:
+	@bash test/verify/live-federation.sh
+
 check-units:
 	@SSH_TARGET="$(SSH_TARGET)" bash deploy/scripts/check-unit-drift.sh
 
