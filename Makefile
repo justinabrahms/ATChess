@@ -220,6 +220,14 @@ verify:
 PROTOCOL_URL ?= http://localhost:8080
 WEB_URL ?= http://localhost:8081
 
+# Is the unit running on the server the unit in this repo? Read-only; the
+# deploy runs this before touching anything. See deploy/scripts/check-unit-drift.sh
+# for why this detects drift rather than installing over it.
+SSH_TARGET ?= justin@abrah.ms
+
+check-units:
+	@SSH_TARGET="$(SSH_TARGET)" bash deploy/scripts/check-unit-drift.sh
+
 verify-local:
 	@set -e; \
 	 curl -fsS --max-time 5 "$(PROTOCOL_URL)/health" >/dev/null \

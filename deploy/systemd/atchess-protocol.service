@@ -1,3 +1,24 @@
+# ATChess protocol service.
+#
+# THIS FILE IS THE TRUTH, AND deploy/scripts/check-unit-drift.sh ENFORCES THAT.
+# The deploy refuses to proceed if the unit installed on the server differs
+# from this one, directive for directive. Comments and blank lines are ignored
+# by the comparison, so this documentation costs nothing.
+#
+# WHY DETECTION RATHER THAN INSTALLATION. The obvious fix for drift is to have
+# the deploy copy this file into /etc/systemd/system and reload. That requires
+# giving the deploy user write access there, which is root code execution:
+# anyone who can push to main could rewrite arbitrary units as root. For a repo
+# an agent pipeline writes to, that trade is wrong. The deploy user's sudo is
+# deliberately seven commands (systemctl stop/restart/status/daemon-reload on
+# these two units, nothing else). So the deploy READS the installed unit --
+# they are mode 644 -- and fails loudly when it disagrees with this file. A
+# human applies the change once; drift cannot then recur silently.
+#
+# Reconciled 2026-08-30 from what was actually running, which had drifted from
+# the previous template in ExecStart, Group, logging and ReadWritePaths. The
+# running version was more correct in most of those, so this took its side.
+
 [Unit]
 Description=ATChess Protocol Service
 After=network.target
@@ -5,65 +26,46 @@ After=network.target
 [Service]
 Type=simple
 User=atchess
-Group=www
+Group=atchess
 WorkingDirectory=/srv/atchess/app
+ExecStart=/srv/atchess/app/bin/atchess-protocol
+Environment="ATCHESS_STATIC_DIR=/srv/atchess/app/web/static"
+Environment="ATCHESS_LEXICONS_DIR=/srv/atchess/app/lexicons"
 
-# Load environment variables from file
+# STATE PATHS -- DECLARED HERE, GRANTED BY ReadWritePaths BELOW.
+#
+# The service writes exactly two things, and both DEFAULT to a path relative to
+# the working directory (./data/...). A relative default cannot be granted by a
+# unit file: the grant is absolute, the default depends on where the process
+# was started, and ProtectSystem=strict resolves the difference by refusing.
+#
+# Measured 2026-08-30: a deploy of a build that had gained a challenge store
+# crash-looped on "mkdir data: read-only file system" and every /api/* path
+# returned 502 for twenty minutes. The binary was correct and every test was
+# green; the gap was entirely between what the code writes and what the host
+# allows. internal/config/deploy_grants_write_paths_test.go now fails if a
+# write path is added to config.go without being pinned and granted here.
+#
+# These live under the app directory, which is where the deploy replaces
+# binaries. That is survivable today -- the deploy only removes web/static --
+# but it is not where state belongs. Moving it to /srv/atchess/data needs a
+# directory created by hand, so it is filed rather than done in the same change
+# as an outage fix.
+Environment="CHALLENGE_DB_PATH=/srv/atchess/app/data/challenges.db"
+Environment="FIREHOSE_STATE_DIR=/srv/atchess/app/data/firehose"
+Restart=always
+RestartSec=10
+StandardOutput=append:/var/log/atchess/protocol.log
+StandardError=append:/var/log/atchess/protocol-error.log
 EnvironmentFile=/etc/atchess/protocol.env
-ExecStart=/srv/atchess/app/atchess-protocol
-
-# STATE PATHS -- DECLARED HERE, GRANTED BELOW, DELIBERATELY ADJACENT.
-#
-# The service writes exactly two things. Both default to a path RELATIVE to the
-# working directory (./data/...), which no unit file can reliably grant: the
-# grant is absolute and the default depends on where the process was started.
-# So set them absolutely here, and keep them next to the ReadWritePaths line
-# that permits them -- the two must agree, and the only way to keep them
-# agreeing is to make disagreeing visible in a three-line diff.
-#
-# Measured 2026-08-30, and the reason this comment exists: a deploy of a build
-# that had gained a challenge store crash-looped on
-#   "creating challenge store directory data: mkdir data: read-only file system"
-# because ProtectSystem=strict left the log directory as the only writable
-# path. The binary was correct, the tests were green, and the site was down.
-# Adding a state path to this service means adding it in BOTH places below.
-Environment="CHALLENGE_DB_PATH=/srv/atchess/data/challenges.db"
-Environment="FIREHOSE_STATE_DIR=/srv/atchess/data/firehose"
-
-Restart=on-failure
-RestartSec=5
-
-# Logging - using syslog for compatibility with older systemd
-StandardOutput=syslog
-StandardError=syslog
-
-# Security hardening
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-# Grants the two Environment= paths declared above. Keep in sync with them.
-ReadWritePaths=/srv/atchess/data /srv/atchess/logs
-ProtectKernelTunables=true
-ProtectKernelModules=true
-ProtectControlGroups=true
-RestrictAddressFamilies=AF_INET AF_INET6
-RestrictNamespaces=true
-LockPersonality=true
-RestrictRealtime=true
-RestrictSUIDSGID=true
-RemoveIPC=true
-# PrivateMounts requires systemd 233+
-
-# Resource limits
-LimitNOFILE=1024
-# MemoryLimit is deprecated, use MemoryMax for newer systemd
-# CPUQuota requires specific syntax
-
-# Logging - append: requires systemd 240+
-SyslogIdentifier=atchess-protocol
-StandardOutput=syslog
-StandardError=syslog
+# Grants the two Environment= paths declared above, plus the log directory.
+# Adding a state path means editing BOTH places.
+ReadWritePaths=/var/log/atchess /srv/atchess/app/data
+ReadOnlyPaths=/etc/atchess/keys
 
 [Install]
 WantedBy=multi-user.target

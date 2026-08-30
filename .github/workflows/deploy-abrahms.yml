@@ -49,6 +49,22 @@ jobs:
         chmod 600 ~/.ssh/deploy_key
         ssh-keyscan -H -p ${{ secrets.DEPLOY_PORT || 22 }} ${{ secrets.DEPLOY_HOST }} >> ~/.ssh/known_hosts
     
+    # DRIFT GATE -- runs before anything on the server is touched, so a
+    # refusal costs nothing. If the installed unit is not the unit in this
+    # repository, then every test that reads deploy/systemd/ is describing a
+    # file nobody runs, and the deploy is about to restart a service under
+    # rules the suite never saw. Reads only; the deploy user cannot write
+    # units by design. See deploy/scripts/check-unit-drift.sh.
+    - name: Check systemd units match the repository
+      env:
+        DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+        DEPLOY_USER: ${{ secrets.DEPLOY_USER || 'atchess-deploy' }}
+        DEPLOY_PORT: ${{ secrets.DEPLOY_PORT || 22 }}
+      run: |
+        SSH_TARGET="${DEPLOY_USER}@${DEPLOY_HOST}" \
+        SSH_OPTS="-i $HOME/.ssh/deploy_key -p ${DEPLOY_PORT} -o BatchMode=yes -o ConnectTimeout=10" \
+        bash deploy/scripts/check-unit-drift.sh
+
     - name: Deploy to server
       env:
         DEPLOY_HOST: ${{ secrets.DEPLOY_HOST || 'abrah.ms' }}
