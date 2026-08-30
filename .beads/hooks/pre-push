@@ -48,12 +48,19 @@ fi
 # case falls back to RUNNING the suite: the failure this can afford is a slow
 # push, not an ungated default branch.
 if [ -f Makefile ] && grep -qE "^test:" Makefile; then
+  # The default branch is whatever this repo actually uses, not a hardcoded
+  # "master". atchess is `main`, and a hook that matches only master silently
+  # stops gating the one branch that deploys -- which is worse than no hook,
+  # because it still prints reassuring output for feature branches.
+  _fs_default=$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||')
+  [ -n "$_fs_default" ] || _fs_default=$(git config --get init.defaultBranch 2>/dev/null)
+  [ -n "$_fs_default" ] || _fs_default=master
   _fs_refs=$(cat)
   case "$_fs_refs" in
-    ""|*refs/heads/master*)
+    ""|*refs/heads/"$_fs_default"*)
       echo "pre-push: make test"
       make test || { echo "pre-push: suite is red — push refused (--no-verify to override)"; exit 1; } ;;
     *)
-      echo "pre-push: not the default branch — the suite runs in CI on the pull request" ;;
+      echo "pre-push: not $_fs_default — the suite runs in CI on the pull request" ;;
   esac
 fi
