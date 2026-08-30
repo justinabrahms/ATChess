@@ -34,7 +34,23 @@ func InitializeOAuth(baseURL string) error {
 	}
 
 	oauthClient = client
-	sessionStore = oauth.NewSessionStore()
+	// DO NOT replace an existing session store. This line used to be an
+	// unconditional assignment, which silently discarded the store that
+	// EnableSessionPersistence had just configured in main -- so persistence
+	// was reported as enabled, no file was ever written, and every restart
+	// still logged everyone out. The symptom was indistinguishable from
+	// persistence not working at all.
+	if sessionStore == nil {
+		sessionStore = oauth.NewSessionStore()
+	}
+	// Whatever store we ended up with must honour the configured path, even if
+	// it was created before persistence was requested or by some future caller.
+	if sessionPersistPath != "" {
+		if err := sessionStore.EnablePersistence(sessionPersistPath); err != nil {
+			log.Warn().Err(err).Str("path", sessionPersistPath).
+				Msg("could not re-apply session persistence after OAuth init")
+		}
+	}
 	authStore = oauth.NewAuthorizationStore()
 
 	// Start session cleanup routine
@@ -228,13 +244,20 @@ func (s *Service) OAuthCallbackHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	session := &oauth.Session{
-		DID:                  tokens.Sub,
-		Handle:               authReq.Handle,
-		PDSURL:               pdsURL,
-		AuthServerURL:        iss,
-		AccessToken:          tokens.AccessToken,
-		RefreshToken:         tokens.RefreshToken,
-		ExpiresAt:            time.Now().Add(time.Duration(tokens.ExpiresIn) * time.Second),
+		DID:           tokens.Sub,
+		Handle:        authReq.Handle,
+		PDSURL:        pdsURL,
+		AuthServerURL: iss,
+		AccessToken:   tokens.AccessToken,
+		RefreshToken:  tokens.RefreshToken,
+		// A SESSION IS NOT AN ACCESS TOKEN. Both of these used to be the
+		// access token's expiry, so an OAuth session died whenever the token
+		// did -- an hour or less on most PDSes -- even though RefreshToken and
+		// EnsureFresh exist precisely to keep it alive across that. Reported
+		// 2026-08-30 as being "logged out aggressively". The app-password path
+		// has always had this split right (24h session, JWT expiry for the
+		// token); this one conflated them.
+		ExpiresAt:            time.Now().Add(sessionLifetime),
 		AccessTokenExpiresAt: time.Now().Add(time.Duration(tokens.ExpiresIn) * time.Second),
 		DPoPKey:              authReq.DPoPKey,
 	}
@@ -478,8 +501,24 @@ func getTokenEndpoint(issuer string) (string, error) {
 // store is a package-level singleton created lazily, and enabling persistence
 // after a session exists would write a file that is already missing entries.
 func EnableSessionPersistence(path string) error {
+	// Remembered so any later (re)creation of the store re-applies it. The
+	// store used to be replaced wholesale during OAuth init, which threw the
+	// path away.
+	sessionPersistPath = path
 	if sessionStore == nil {
 		sessionStore = oauth.NewSessionStore()
 	}
 	return sessionStore.EnablePersistence(path)
 }
+
+// sessionPersistPath is where sessions are mirrored, remembered at package
+// level so it survives the store being recreated.
+var sessionPersistPath string
+
+// sessionLifetime is how long a login lasts, independently of how long any
+// individual access token lasts.
+//
+// Matches the app-password path (internal/web/service.go), which has always
+// used 24h. An access token expiring is a routine event handled by refreshing
+// it (EnsureFresh); it is not a reason to make somebody sign in again.
+const sessionLifetime = 24 * time.Hour

@@ -99,3 +99,45 @@ func TestCorruptSessionFileDoesNotPreventStartup(t *testing.T) {
 		t.Error("the store was left unusable by a corrupt file")
 	}
 }
+
+// Persistence must survive the store being recreated.
+//
+// It did not: OAuth init did `sessionStore = oauth.NewSessionStore()`
+// unconditionally, throwing away the store EnableSessionPersistence had just
+// configured. The service logged "session persistence enabled", wrote no file,
+// and logged everyone out on every restart — a symptom indistinguishable from
+// the feature not existing.
+func TestPersistencePathSurvivesAReconfiguredStore(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sessions.json")
+
+	first := NewSessionStore()
+	if err := first.EnablePersistence(path); err != nil {
+		t.Fatal(err)
+	}
+	first.CreateSession(&Session{DID: "did:plc:a", ExpiresAt: time.Now().Add(time.Hour)})
+
+	// A second store over the same path, as after a re-init.
+	second := NewSessionStore()
+	if err := second.EnablePersistence(path); err != nil {
+		t.Fatal(err)
+	}
+	id := second.CreateSession(&Session{DID: "did:plc:b", ExpiresAt: time.Now().Add(time.Hour)})
+
+	// Both sessions must be on disk: the second store loaded the first's work
+	// before adding its own.
+	third := NewSessionStore()
+	if err := third.EnablePersistence(path); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := third.GetSession(id); err != nil {
+		t.Errorf("the reconfigured store did not persist its own session: %v", err)
+	}
+	count := 0
+	third.mu.RLock()
+	count = len(third.sessions)
+	third.mu.RUnlock()
+	if count != 2 {
+		t.Errorf("expected both sessions to survive, found %d — a recreated store dropped the earlier one", count)
+	}
+}

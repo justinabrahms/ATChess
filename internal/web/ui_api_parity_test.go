@@ -305,3 +305,63 @@ func TestUIHasNoNotImplementedActions(t *testing.T) {
 		}
 	}
 }
+
+// A LIST MUST NOT ASSERT EMPTINESS BEFORE IT HAS LOADED.
+//
+// The three sidebar lists shipped with "No active games" / "No pending
+// challenges" / "No challenges sent" hardcoded in the markup. That is not a
+// placeholder, it is a wrong answer: the games list derives every row (several
+// repo scans each), so a player watched it say they had no games for as long as
+// the fetch took. Reported 2026-08-30 — "shows empty until it loads".
+//
+// It is the same mistake as rendering a turn from a stale record, and the same
+// rule fixes both: when you do not know yet, say so.
+func TestListsShowLoadingNotEmptinessBeforeTheyLoad(t *testing.T) {
+	root := repoRoot(t)
+	b, err := os.ReadFile(filepath.Join(root, "web", "static", "index.html"))
+	if err != nil {
+		t.Fatalf("reading index.html: %v", err)
+	}
+	src := string(b)
+
+	// For each async list, the markup between its container and the next
+	// closing div must be a loading state, not an empty-state claim.
+	for _, id := range []string{"gamesList", "challengesList", "outgoingChallenges"} {
+		i := strings.Index(src, `id="`+id+`"`)
+		if i < 0 {
+			t.Errorf("no element with id %q — the list was renamed and this gate stopped checking it", id)
+			continue
+		}
+		end := strings.Index(src[i:], "</div>")
+		if end < 0 {
+			t.Errorf("%s: could not find the end of the container", id)
+			continue
+		}
+		initial := src[i : i+end]
+		if strings.Contains(initial, "no-items") {
+			t.Errorf("%s asserts an empty state in static markup:\n  %s\n\n"+
+				"It renders before any fetch completes, so it tells the player "+
+				"they have nothing when the truth is that we have not looked yet. "+
+				"Use the loading-row/spinner markup and let the loader replace it.",
+				id, strings.TrimSpace(initial))
+		}
+		if !strings.Contains(initial, "loading-row") {
+			t.Errorf("%s has no loading state; a slow list looks like an empty one", id)
+		}
+	}
+
+	// And every loader must actually put one up, or the markup's loading state
+	// is only correct until the first refresh.
+	for _, fn := range []string{"loadActiveGames", "loadChallenges", "loadOutgoingChallenges"} {
+		j := strings.Index(src, "async function "+fn+"(")
+		if j < 0 {
+			t.Errorf("loader %s not found; this gate has drifted from the code", fn)
+			continue
+		}
+		window := src[j:min(j+400, len(src))]
+		if !strings.Contains(window, "showLoading") {
+			t.Errorf("%s does not show a loading state, so a refresh leaves the "+
+				"previous contents (or an empty state) up while it fetches", fn)
+		}
+	}
+}

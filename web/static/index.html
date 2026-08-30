@@ -606,6 +606,26 @@
         @keyframes toast-in { from { opacity: 0; transform: translateY(-.4rem); } }
         /* Respect a reader who has asked for less motion. */
         @media (prefers-reduced-motion: reduce) { .toast { animation: none; } }
+
+        /* Loading state. A list that renders "No games yet" while it is still
+           fetching is not a blank slate, it is a wrong answer -- the same
+           mistake as showing a turn from a stale record. Show that we are
+           looking. */
+        .loading-row {
+            display: flex; align-items: center; gap: .55rem;
+            padding: .6rem .2rem; color: #6b7280; font-size: .9rem;
+        }
+        .spinner {
+            width: .95rem; height: .95rem; flex: none;
+            border: 2px solid rgba(107,114,128,.3);
+            border-top-color: #6b7280; border-radius: 50%;
+            animation: spin .7s linear infinite;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        /* Without motion, the row still says what is happening. */
+        @media (prefers-reduced-motion: reduce) {
+            .spinner { animation: none; border-top-color: transparent; }
+        }
     </style>
 </head>
 <body>
@@ -718,7 +738,7 @@
                 <div class="sidebar-card">
                     <h3>Your Games</h3>
                     <div class="games-list" id="gamesList">
-                        <div class="no-items">No active games</div>
+                        <div class="loading-row"><span class="spinner" aria-hidden="true"></span>Loading your games…</div>
                     </div>
                 </div>
 
@@ -726,7 +746,7 @@
                 <div class="sidebar-card">
                     <h3>Challenges received</h3>
                     <div id="challengesList">
-                        <div class="no-items">No pending challenges</div>
+                        <div class="loading-row"><span class="spinner" aria-hidden="true"></span>Loading challenges…</div>
                     </div>
                 </div>
 
@@ -736,7 +756,7 @@
                 <div class="sidebar-card">
                     <h3>Challenges sent</h3>
                     <div id="outgoingChallenges">
-                        <div class="no-items">No challenges sent</div>
+                        <div class="loading-row"><span class="spinner" aria-hidden="true"></span>Loading sent challenges…</div>
                     </div>
                 </div>
             </div>
@@ -786,6 +806,20 @@
             }
         }
         
+        // showLoading — say we are looking, rather than saying there is nothing.
+        //
+        // The games list derives every row (several repo scans per game), so
+        // there is a real gap before it renders. Leaving the empty-state text up
+        // during that gap tells the player they have no games, which is a wrong
+        // answer rather than a slow one.
+        function showLoading(elementId, label) {
+            const el = document.getElementById(elementId);
+            if (el) {
+                el.innerHTML = `<div class="loading-row"><span class="spinner" aria-hidden="true"></span>${label}</div>`;
+            }
+            return el;
+        }
+
         // notify — how this app talks to you.
         //
         // Replaces nine alert() calls. alert() blocks the whole page until
@@ -1245,7 +1279,7 @@
         // player who closed the tab lost their game -- it was reachable only by
         // holding its URI. GET /api/games now answers it for real.
         async function loadActiveGames() {
-            const el = document.getElementById('gamesList');
+            const el = showLoading('gamesList', 'Loading your games\u2026');
             try {
                 const data = await (await apiFetch(`/games`)).json();
                 const games = data.games || [];
@@ -1302,7 +1336,7 @@
         // incoming ones, so issuing a challenge produced no visible evidence
         // anywhere that it had happened.
         async function loadOutgoingChallenges() {
-            const el = document.getElementById('outgoingChallenges');
+            const el = showLoading('outgoingChallenges', 'Loading sent challenges\u2026');
             if (!el) return;
             try {
                 const data = await (await apiFetch(`/challenges`)).json();
@@ -1329,6 +1363,7 @@
         
         // Load challenges
         async function loadChallenges() {
+            showLoading('challengesList', 'Loading challenges\u2026');
             try {
                 const response = await apiFetch(`/challenge-notifications`);
                 
