@@ -130,7 +130,7 @@ func (s *Service) UpdateSpectatorCountHandler(hub *Hub) http.HandlerFunc {
 		var req struct {
 			Action string `json:"action"` // "join" or "leave"
 		}
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		if err := decodeJSONBody(r, &req); err != nil {
 			http.Error(w, "Invalid request body", http.StatusBadRequest)
 			return
 		}

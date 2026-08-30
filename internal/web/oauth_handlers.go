@@ -70,7 +70,7 @@ func (s *Service) OAuthLoginHandler(w http.ResponseWriter, r *http.Request) {
 		Handle string `json:"handle"`
 	}
 
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeJSONBody(r, &req); err != nil {
 		http.Error(w, "Invalid request", http.StatusBadRequest)
 		return
 	}
@@ -80,8 +80,18 @@ func (s *Service) OAuthLoginHandler(w http.ResponseWriter, r *http.Request) {
 	// resolution chain discarded).
 	pdsURL, authServerURL, metadata, err := s.resolveOAuthEndpoints(req.Handle)
 	if err != nil {
-		log.Error().Err(err).Str("handle", req.Handle).Msg("Failed to resolve OAuth endpoints")
-		http.Error(w, "Failed to resolve authentication server", http.StatusInternalServerError)
+		// A handle that does not exist, or that arrived with whitespace or a
+		// typo, is the caller's mistake. It answered 500 with "Failed to
+		// resolve authentication server", which reads as "our server is
+		// broken" and gave the user nothing to act on -- reported 2026-08-30
+		// by someone whose handle simply had two trailing spaces.
+		status := statusForError(err)
+		log.Error().Err(err).Str("handle", req.Handle).Int("status", status).Msg("Failed to resolve OAuth endpoints")
+		if status == http.StatusBadRequest {
+			http.Error(w, fmt.Sprintf("Could not find an account for %q. Check the handle and try again.", req.Handle), status)
+		} else {
+			http.Error(w, "Failed to resolve authentication server", status)
+		}
 		return
 	}
 

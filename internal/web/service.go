@@ -256,7 +256,7 @@ type CreateGameRequest struct {
 
 func (s *Service) CreateGameHandler(w http.ResponseWriter, r *http.Request) {
 	var req CreateGameRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeJSONBody(r, &req); err != nil {
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
 		return
 	}
@@ -287,7 +287,7 @@ type MakeMoveRequest struct {
 
 func (s *Service) MakeMoveHandler(w http.ResponseWriter, r *http.Request) {
 	var req MakeMoveRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeJSONBody(r, &req); err != nil {
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
 		return
 	}
@@ -495,7 +495,7 @@ func (s *Service) GetGameHandler(w http.ResponseWriter, r *http.Request) {
 
 func (s *Service) CreateChallengeHandler(w http.ResponseWriter, r *http.Request) {
 	var req CreateChallengeRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeJSONBody(r, &req); err != nil {
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
 		return
 	}
@@ -526,8 +526,18 @@ func (s *Service) CreateChallengeHandler(w http.ResponseWriter, r *http.Request)
 		// input, network, auth). There is no longer a distinct "delivery
 		// failed but the challenge record itself is fine" case to map to
 		// 502; a plain 500 is the right signal now.
-		log.Error().Err(err).Msg("Failed to create challenge")
-		http.Error(w, "Failed to create challenge", http.StatusInternalServerError)
+		// A malformed or unresolvable opponent handle is the caller's
+		// mistake, not ours. Reported 2026-08-30: a handle with two trailing
+		// spaces produced "Failed to create challenge" with a 500, which
+		// tells the user the server is broken about a typo they could fix
+		// instantly, and tells error-rate monitoring the same lie.
+		status := statusForError(err)
+		log.Error().Err(err).Int("status", status).Msg("Failed to create challenge")
+		if status == http.StatusBadRequest {
+			http.Error(w, fmt.Sprintf("Could not create challenge: %v", err), status)
+		} else {
+			http.Error(w, "Failed to create challenge", status)
+		}
 		return
 	}
 
@@ -837,7 +847,7 @@ func (s *Service) OfferDrawHandler(w http.ResponseWriter, r *http.Request) {
 		GameID  string `json:"gameId"`
 		Message string `json:"message"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeJSONBody(r, &req); err != nil {
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
 		return
 	}
@@ -863,7 +873,7 @@ func (s *Service) RespondToDrawHandler(w http.ResponseWriter, r *http.Request) {
 		DrawOfferURI string `json:"drawOfferUri"`
 		Accept       bool   `json:"accept"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeJSONBody(r, &req); err != nil {
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
 		return
 	}
@@ -888,7 +898,7 @@ func (s *Service) ResignGameHandler(w http.ResponseWriter, r *http.Request) {
 		GameID string `json:"gameId"`
 		Reason string `json:"reason"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeJSONBody(r, &req); err != nil {
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
 		return
 	}
@@ -994,8 +1004,10 @@ func (s *Service) GetTimeRemainingHandler(w http.ResponseWriter, r *http.Request
 }
 
 type AuthRequest struct {
-	Handle   string `json:"handle"`
-	Password string `json:"password"`
+	Handle string `json:"handle"`
+	// Not trimmed: a password may legitimately end in whitespace, and
+	// silently altering a credential is an auth failure with no visible cause.
+	Password string `json:"password" trim:"-"`
 }
 
 type AuthResponse struct {
@@ -1008,7 +1020,7 @@ type AuthResponse struct {
 
 func (s *Service) LoginHandler(w http.ResponseWriter, r *http.Request) {
 	var req AuthRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := decodeJSONBody(r, &req); err != nil {
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
 		return
 	}
