@@ -2,6 +2,7 @@ package oauth
 
 import (
 	"crypto/ecdsa"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"sync"
@@ -130,6 +131,11 @@ func (s *Session) refresh(refreshFn RefreshFunc, force bool) (string, error) {
 type SessionStore struct {
 	sessions map[string]*Session // map session ID to session
 	mu       sync.RWMutex
+
+	// persistPath, when set by EnablePersistence, is the file sessions are
+	// mirrored to so a restart does not log everyone out. Empty means
+	// in-memory only, which is what tests want.
+	persistPath string
 }
 
 // NewSessionStore creates a new session store
@@ -148,6 +154,7 @@ func (s *SessionStore) CreateSession(session *Session) string {
 	sessionID := generateJTI()
 	s.sessions[sessionID] = session
 
+	s.persistLocked()
 	return sessionID
 }
 
@@ -175,6 +182,7 @@ func (s *SessionStore) DeleteSession(sessionID string) {
 	defer s.mu.Unlock()
 
 	delete(s.sessions, sessionID)
+	s.persistLocked()
 }
 
 // CleanupExpiredSessions removes all expired sessions
@@ -188,6 +196,7 @@ func (s *SessionStore) CleanupExpiredSessions() {
 			delete(s.sessions, id)
 		}
 	}
+	s.persistLocked()
 }
 
 // StartCleanupRoutine starts a goroutine that periodically cleans up expired sessions
@@ -252,14 +261,52 @@ func (a *AuthorizationStore) GetAndDeleteAuthorization(state string) (*Authoriza
 	return req, nil
 }
 
-// MarshalJSON custom marshaller to handle private key serialization
+// MarshalJSON serializes a session, INCLUDING its DPoP private key.
+//
+// The key used to be dropped ("We don't serialize private keys") with the field
+// left in place as a placeholder. That was fine while sessions only ever lived
+// in a map, and became a bug the moment they were persisted: an OAuth session
+// restored without its DPoP key cannot sign a single request, so it would come
+// back looking valid and fail every call — worse than being logged out, because
+// it fails silently and later.
+//
+// The key is as sensitive as the refresh token sitting beside it, so whatever
+// holds this output must be protected accordingly; SessionStore writes 0600.
 func (s *Session) MarshalJSON() ([]byte, error) {
 	type Alias Session
+	var keyData []byte
+	if s.DPoPKey != nil {
+		if der, err := x509.MarshalECPrivateKey(s.DPoPKey); err == nil {
+			keyData = der
+		}
+	}
 	return json.Marshal(&struct {
 		*Alias
 		DPoPKeyData []byte `json:"dpop_key_data,omitempty"`
 	}{
 		Alias:       (*Alias)(s),
-		DPoPKeyData: nil, // We don't serialize private keys
+		DPoPKeyData: keyData,
 	})
+}
+
+// UnmarshalJSON restores a session and its DPoP key.
+//
+// A key that fails to parse leaves DPoPKey nil rather than failing the whole
+// session: an app-password session legitimately has none, and the alternative
+// is discarding every session in the file because one is malformed.
+func (s *Session) UnmarshalJSON(b []byte) error {
+	type Alias Session
+	aux := &struct {
+		*Alias
+		DPoPKeyData []byte `json:"dpop_key_data,omitempty"`
+	}{Alias: (*Alias)(s)}
+	if err := json.Unmarshal(b, aux); err != nil {
+		return err
+	}
+	if len(aux.DPoPKeyData) > 0 {
+		if key, err := x509.ParseECPrivateKey(aux.DPoPKeyData); err == nil {
+			s.DPoPKey = key
+		}
+	}
+	return nil
 }

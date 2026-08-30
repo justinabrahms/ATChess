@@ -53,6 +53,9 @@ Environment="ATCHESS_LEXICONS_DIR=/srv/atchess/app/lexicons"
 # as an outage fix.
 Environment="CHALLENGE_DB_PATH=/srv/atchess/app/data/challenges.db"
 Environment="FIREHOSE_STATE_DIR=/srv/atchess/app/data/firehose"
+# Sessions, so a restart does not log every user out. Holds refresh tokens and
+# DPoP private keys; the file is written 0600.
+Environment="SESSION_STORE_PATH=/srv/atchess/app/data/sessions.json"
 Restart=always
 RestartSec=10
 StandardOutput=append:/var/log/atchess/protocol.log

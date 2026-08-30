@@ -150,7 +150,15 @@ jobs:
     
     - name: Verify deployment
       env:
-        DEPLOY_HOST: ${{ secrets.DEPLOY_HOST || 'atchess.abrah.ms' }}
+        # THE SITE, NOT THE SSH HOST. These are different machines' worth of
+        # different: DEPLOY_HOST is where the deploy ssh'es (abrah.ms), and
+        # https://abrah.ms is a personal site that has never served ATChess.
+        # Pointed there, the smoke test saw "/" answer 200 and then failed on
+        # /client-metadata.json, so every deploy since the smoke test landed has
+        # reported failure while the actual deployment was fine. A gate that
+        # fails good work stops being believed, which is worse than not having
+        # one -- so this is a bug in the gate and it is fixed here.
+        ATCHESS_SITE: ${{ secrets.ATCHESS_SITE || 'https://atchess.abrah.ms' }}
       run: |
         # Wait for services to start
         echo "Waiting for services to start..."
@@ -173,8 +181,8 @@ jobs:
         # the verb the UI uses, treats 5xx as down rather than as "answering",
         # and exercises handle resolution end to end. It is the same command a
         # human runs as `make verify`.
-        echo "Running the deployed smoke test..."
-        ATCHESS_SITE="https://$DEPLOY_HOST" bash test/verify/deployed-smoke.sh
+        echo "Running the deployed smoke test against $ATCHESS_SITE ..."
+        bash test/verify/deployed-smoke.sh
         
         # Always check service status
         echo "Checking service status on server..."

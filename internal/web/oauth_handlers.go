@@ -472,3 +472,14 @@ func getTokenEndpoint(issuer string) (string, error) {
 
 	return metadata.TokenEndpoint, nil
 }
+
+// EnableSessionPersistence points the package's session store at a file so
+// sessions survive a restart. Must be called before any handler runs — the
+// store is a package-level singleton created lazily, and enabling persistence
+// after a session exists would write a file that is already missing entries.
+func EnableSessionPersistence(path string) error {
+	if sessionStore == nil {
+		sessionStore = oauth.NewSessionStore()
+	}
+	return sessionStore.EnablePersistence(path)
+}

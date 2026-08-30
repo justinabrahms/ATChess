@@ -64,6 +64,24 @@ func main() {
 	// firehose subscription or the login backfill catches up. See
 	// internal/challenge.Store's doc comment and
 	// docs/firehose-and-backfill.md.
+	// Sessions are mirrored to disk BEFORE anything can create one, so a
+	// restart does not silently log every user out. Reported 2026-08-30 as
+	// "when I refresh, I'm logged out" during an afternoon of five deploys —
+	// and it matters more here than most places, because the whole point of
+	// the pipeline this repo feeds is that deploys are frequent and unattended.
+	//
+	// A failure to load is logged and tolerated: starting empty logs people
+	// out, which is bad, but refusing to start is worse, and a corrupt session
+	// file must never be able to hold the service down.
+	if p := cfg.Session.StorePath; p != "" {
+		if err := web.EnableSessionPersistence(p); err != nil {
+			log.Warn().Err(err).Str("path", p).
+				Msg("could not load persisted sessions; users will need to sign in again")
+		} else {
+			log.Info().Str("path", p).Msg("session persistence enabled")
+		}
+	}
+
 	challengeStore, err := challenge.NewStore(cfg.Challenge.DBPath)
 	if err != nil {
 		log.Fatal().Err(err).Str("dbPath", cfg.Challenge.DBPath).Msg("Failed to open challenge store")

@@ -14,6 +14,7 @@ type Config struct {
 	Development DevelopmentConfig `mapstructure:"development"`
 	Firehose    FirehoseConfig    `mapstructure:"firehose"`
 	Challenge   ChallengeConfig   `mapstructure:"challenge"`
+	Session     SessionConfig     `mapstructure:"session"`
 }
 
 type ServerConfig struct {
@@ -131,6 +132,14 @@ type ChallengeConfig struct {
 	PruneInterval time.Duration `mapstructure:"prune_interval"`
 }
 
+// SessionConfig controls where logged-in sessions are mirrored.
+type SessionConfig struct {
+	// StorePath is the file sessions are persisted to. Empty disables
+	// persistence, which means every restart logs every user out — the
+	// behaviour this config exists to end.
+	StorePath string `mapstructure:"store_path"`
+}
+
 // SplitFirehoseURLs parses raw (see FirehoseConfig.URL's doc comment) as a
 // comma-separated list of com.atproto.sync.subscribeRepos websocket URLs,
 // trimming whitespace and dropping empty entries. Shared by
@@ -183,6 +192,7 @@ func Load() (*Config, error) {
 	viper.BindEnv("firehose.state_dir", "FIREHOSE_STATE_DIR", "ATCHESS_FIREHOSE_STATE_DIR")
 	viper.BindEnv("firehose.transport", "FIREHOSE_TRANSPORT", "ATCHESS_FIREHOSE_TRANSPORT")
 	viper.BindEnv("challenge.db_path", "CHALLENGE_DB_PATH", "ATCHESS_CHALLENGE_DB_PATH")
+	viper.BindEnv("session.store_path", "SESSION_STORE_PATH", "ATCHESS_SESSION_STORE_PATH")
 	viper.BindEnv("challenge.prune_interval", "CHALLENGE_PRUNE_INTERVAL", "ATCHESS_CHALLENGE_PRUNE_INTERVAL")
 
 	// Set defaults
@@ -198,6 +208,9 @@ func Load() (*Config, error) {
 	viper.SetDefault("firehose.state_dir", "./data/firehose")
 	viper.SetDefault("firehose.transport", "")
 	viper.SetDefault("challenge.db_path", "./data/challenges.db")
+	// Sessions are mirrored here so a restart does not log every user out.
+	// Holds refresh tokens and DPoP private keys; written 0600.
+	viper.SetDefault("session.store_path", "./data/sessions.json")
 	viper.SetDefault("challenge.prune_interval", "1h")
 
 	// Read config. A missing config file is a supported deployment mode

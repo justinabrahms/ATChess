@@ -38,10 +38,25 @@ import (
 // path to an absolute location, and must grant that location."
 
 var (
-	// SetDefault("challenge.db_path", "./data/challenges.db")
-	writeDefault = regexp.MustCompile(`SetDefault\("([a-z_]+\.(?:db_path|state_dir))",\s*"([^"]+)"\)`)
+	// Any SetDefault whose VALUE looks like a filesystem path.
+	//
+	// DETECTED BY VALUE, NOT BY NAME, and that distinction is the whole point.
+	// This pattern used to be `(db_path|state_dir)` — a list of the two key
+	// names that existed when it was written. Adding session.store_path, a
+	// third path the service writes, sailed straight past it: the gate reported
+	// green on exactly the omission it exists to catch, because the new key was
+	// not named like the old ones.
+	//
+	// A name-based check only ever knows about the mistakes already made. This
+	// one asks what the value IS.
+	writeDefault = regexp.MustCompile(`SetDefault\("([a-z_.]+)",\s*"((?:\./|/)[^"]*)"\)`)
 	// BindEnv("challenge.db_path", "CHALLENGE_DB_PATH", ...)
-	bindEnv = regexp.MustCompile(`BindEnv\("([a-z_]+\.(?:db_path|state_dir))",\s*"([A-Z_]+)"`)
+	//
+	// Matches ANY key, for the same reason writeDefault does: the previous
+	// version enumerated the two key names that existed when it was written,
+	// so a third write path reported "no environment binding" while its
+	// BindEnv sat three lines above the ones it did recognise.
+	bindEnv = regexp.MustCompile(`BindEnv\("([a-z_.]+)",\s*"([A-Z_]+)"`)
 	unitEnv = regexp.MustCompile(`(?m)^Environment="([A-Z_]+)=([^"]+)"`)
 	unitRW  = regexp.MustCompile(`(?m)^ReadWritePaths=(.+)$`)
 )
@@ -136,7 +151,7 @@ func TestWritePathScrapeIsNotVacuous(t *testing.T) {
 	}
 	// The two that exist today. If either stops being found, the scrape has
 	// drifted from the config and the gate above is decoration.
-	for _, want := range []string{"challenge.db_path", "firehose.state_dir"} {
+	for _, want := range []string{"challenge.db_path", "firehose.state_dir", "session.store_path"} {
 		if !found[want] {
 			t.Errorf("the scrape no longer finds %q in config.go; the write-path gate is no longer checking it", want)
 		}
