@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rs/zerolog/log"
@@ -55,9 +56,15 @@ import (
 // so the page does not have to work out which colour the viewer is.
 type gameListEntry struct {
 	*chess.Game
-	Opponent  string `json:"opponent"`
-	YourColor string `json:"yourColor"`
-	YourTurn  bool   `json:"yourTurn"`
+	Opponent       string `json:"opponent"`
+	OpponentHandle string `json:"opponentHandle,omitempty"`
+	YourColor      string `json:"yourColor"`
+	YourTurn       bool   `json:"yourTurn"`
+	// Stale is true when the live position could not be derived and this row
+	// reflects only what the game record happens to store — which lags by every
+	// move the opponent has made. A client must not render whose turn it is
+	// from a stale row.
+	Stale bool `json:"stale,omitempty"`
 }
 
 // ListGamesHandler serves GET /api/games for the authenticated player.
@@ -137,13 +144,31 @@ func (s *Service) ListGamesHandler(w http.ResponseWriter, r *http.Request) {
 
 	sort.Slice(games, func(i, j int) bool { return games[i].CreatedAt > games[j].CreatedAt })
 
+	// DERIVE THE REAL POSITION. The fen stored on a game record is not the
+	// current one and cannot be.
+	//
+	// A game record lives in exactly one repo, and AT Protocol forbids writing
+	// to anyone else's — so the record's fen only ever advances when its OWNER
+	// moves. The opponent's moves exist only as move records in their own repo.
+	// Reading the stored fen therefore shows a position that is behind by every
+	// move the opponent has made.
+	//
+	// Measured 2026-08-30: the list said "your move · black" while the game
+	// view said "Opponent's turn", because black had played and the record
+	// still held the position before it. Reported by the user noticing the two
+	// panels disagree — the listing was confidently wrong, which is worse than
+	// being slow.
+	derived := s.deriveGames(ctx, client, games)
+
 	entries := make([]gameListEntry, 0, len(games))
 	for _, g := range games {
-		e := gameListEntry{Game: g, YourColor: "white", Opponent: g.Black}
-		if g.Black == did {
-			e.YourColor, e.Opponent = "black", g.White
+		use := g
+		stale := true
+		if d, ok := derived[g.ID]; ok && d != nil {
+			use, stale = d, false
 		}
-		e.YourTurn = turnOf(g.FEN) == e.YourColor && g.Status == chess.StatusActive
+		e := buildEntry(use, did, stale)
+		e.OpponentHandle = client.HandleForDID(ctx, e.Opponent)
 		entries = append(entries, e)
 	}
 
@@ -300,4 +325,58 @@ func rkeyOfATURI(uri string) string {
 		return uri[i+1:]
 	}
 	return ""
+}
+
+// deriveGames resolves the true current position of each game, concurrently.
+//
+// GetGame is the same derivation the single-game view uses: it replays both
+// players' move records rather than trusting the stored fen. It is expensive —
+// several repo scans per game — so it runs bounded-concurrent, and a game that
+// cannot be derived is reported as stale rather than guessed at.
+func (s *Service) deriveGames(ctx context.Context, client *atproto.Client, games []*chess.Game) map[string]*chess.Game {
+	out := make(map[string]*chess.Game, len(games))
+	if len(games) == 0 {
+		return out
+	}
+	var (
+		mu  sync.Mutex
+		wg  sync.WaitGroup
+		sem = make(chan struct{}, 4) // bounded: each derivation is several scans
+	)
+	for _, g := range games {
+		wg.Add(1)
+		go func(g *chess.Game) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			full, err := client.GetGame(ctx, g.ID)
+			if err != nil || full == nil {
+				log.Debug().Err(err).Str("game", g.ID).Msg("games list: could not derive position")
+				return
+			}
+			mu.Lock()
+			out[g.ID] = full
+			mu.Unlock()
+		}(g)
+	}
+	wg.Wait()
+	return out
+}
+
+// buildEntry turns a game into one listing row from did's point of view.
+//
+// Whose turn it is is claimed ONLY when the position was actually derived. A
+// guess from a stale record is what made this list say "your move · black"
+// while the game view said "Opponent's turn": the record's fen only advances
+// when its owner moves, so it lags by every move the opponent has made.
+func buildEntry(g *chess.Game, did string, stale bool) gameListEntry {
+	e := gameListEntry{Game: g, YourColor: "white", Opponent: g.Black, Stale: stale}
+	if g.Black == did {
+		e.YourColor, e.Opponent = "black", g.White
+	}
+	if !stale {
+		e.YourTurn = turnOf(g.FEN) == e.YourColor && g.Status == chess.StatusActive
+	}
+	return e
 }

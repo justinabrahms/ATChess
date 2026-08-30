@@ -1162,10 +1162,19 @@
                 } else {
                     el.innerHTML = games.map(g => {
                         const enc = encodeURIComponent(btoa(g.id).replace(/\+/g, '-').replace(/\//g, '_'));
-                        const turn = g.yourTurn ? '<strong>your move</strong>'
-                                                : (g.status === 'active' ? 'their move' : g.status);
+                        // A stale row means the live position could not be
+                        // derived, so whose turn it is is UNKNOWN. Guessing
+                        // from the stored record is what made this list say
+                        // "your move" while the game view said "opponent's
+                        // turn" -- the record only advances when its owner
+                        // moves, so it lags by every move the opponent made.
+                        const turn = g.stale
+                            ? 'tap to open'
+                            : (g.yourTurn ? '<strong>your move</strong>'
+                                          : (g.status === 'active' ? 'their move' : escapeHtml(g.status)));
+                        const who = g.opponentHandle || g.opponent || 'unknown';
                         return `<div class="game-item" onclick="openGame('${enc}')">
-                                  <div class="game-opponent">vs ${escapeHtml(g.opponent || 'unknown')}</div>
+                                  <div class="game-opponent">vs ${escapeHtml(who)}</div>
                                   <div class="game-status">${turn} &middot; ${escapeHtml(g.yourColor)}</div>
                                 </div>`;
                     }).join('');
