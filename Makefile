@@ -191,7 +191,7 @@ DEPLOY_DIR ?= /srv/atchess/app/bin
 PROTOCOL_UNIT ?= atchess-protocol
 WEB_UNIT ?= atchess-web
 
-.PHONY: deploy verify
+.PHONY: deploy verify verify-local
 deploy: build
 	@install -d "$(DEPLOY_DIR)"
 	@install -m 0755 bin/atchess-protocol "$(DEPLOY_DIR)/atchess-protocol"
@@ -203,13 +203,24 @@ deploy: build
 
 # A 200 IS NOT PROOF. The flags service taught this rig that a process can
 # restart, come back healthy and come back EMPTY -- which passes a liveness
-# check while every feature reads off. So verify asserts something only a
-# working build can produce: the protocol service validates a real chess
-# position, which exercises the engine rather than the listener.
+# check while every feature reads off.
+#
+# So `verify` runs the deployed smoke test, which probes every endpoint the UI
+# actually calls WITH THE VERB THE UI USES, and exercises handle resolution
+# against a third-party PDS end to end. It lives under test/verify/ rather than
+# test/ on purpose: it needs the network and a live deployment, so it must not
+# run as part of `make test` -- the suite gates a pull request and has to work
+# on a box with nothing deployed.
+ATCHESS_SITE ?= https://atchess.abrah.ms
+
+verify:
+	@ATCHESS_SITE="$(ATCHESS_SITE)" bash test/verify/deployed-smoke.sh
+
+# The local pair, for the fleet's own deploy target rather than the public site.
 PROTOCOL_URL ?= http://localhost:8080
 WEB_URL ?= http://localhost:8081
 
-verify:
+verify-local:
 	@set -e; \
 	 curl -fsS --max-time 5 "$(PROTOCOL_URL)/health" >/dev/null \
 	   || { echo "verify: protocol service is not answering at $(PROTOCOL_URL)"; exit 1; }; \

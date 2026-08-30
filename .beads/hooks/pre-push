@@ -31,3 +31,29 @@ if command -v bd >/dev/null 2>&1; then
   if [ $_bd_exit -ne 0 ]; then exit $_bd_exit; fi
 fi
 # --- END BEADS INTEGRATION v1.2.2 ---
+
+# --- FLEET-SUITE (appended) ---
+# The suite runs here only for a push to the default branch.
+#
+# master requires `ci / test (pull_request)` on every repo in this fleet
+# (pipeline#adr-027), so a feature branch is already gated on the server. This
+# hook ran the same suite as well, and it ran FIRST: minutes before the branch
+# reached gitea, before there was a pull request for anyone to look at, for a
+# verdict CI was about to produce again. A push straight to the default branch
+# has no server-side check in front of it, so that one still pays.
+#
+# The remote ref comes from stdin, which git hands every pre-push hook as
+# `<local ref> <local sha> <remote ref> <remote sha>`. The beads section above
+# does NOT drain it. An empty read means something else consumed it, and that
+# case falls back to RUNNING the suite: the failure this can afford is a slow
+# push, not an ungated default branch.
+if [ -f Makefile ] && grep -qE "^test:" Makefile; then
+  _fs_refs=$(cat)
+  case "$_fs_refs" in
+    ""|*refs/heads/master*)
+      echo "pre-push: make test"
+      make test || { echo "pre-push: suite is red — push refused (--no-verify to override)"; exit 1; } ;;
+    *)
+      echo "pre-push: not the default branch — the suite runs in CI on the pull request" ;;
+  esac
+fi
