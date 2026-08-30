@@ -56,9 +56,10 @@ var (
 	// version enumerated the two key names that existed when it was written,
 	// so a third write path reported "no environment binding" while its
 	// BindEnv sat three lines above the ones it did recognise.
-	bindEnv = regexp.MustCompile(`BindEnv\("([a-z_.]+)",\s*"([A-Z_]+)"`)
-	unitEnv = regexp.MustCompile(`(?m)^Environment="([A-Z_]+)=([^"]+)"`)
-	unitRW  = regexp.MustCompile(`(?m)^ReadWritePaths=(.+)$`)
+	bindEnv     = regexp.MustCompile(`BindEnv\("([a-z_.]+)",\s*"([A-Z_]+)"`)
+	unitEnv     = regexp.MustCompile(`(?m)^Environment="([A-Z_]+)=([^"]+)"`)
+	unitRW      = regexp.MustCompile(`(?m)^ReadWritePaths=(.+)$`)
+	unitWorkDir = regexp.MustCompile(`(?m)^WorkingDirectory=(.+)$`)
 )
 
 func readOrFail(t *testing.T, rel string) string {
@@ -70,25 +71,38 @@ func readOrFail(t *testing.T, rel string) string {
 	return string(b)
 }
 
-// TestUnitGrantsEveryWritePath is the gate.
+// TestUnitGrantsEveryWritePath is the gate: everything the service writes must
+// land somewhere the unit permits it to write.
+//
+// IT RESOLVES RELATIVE PATHS RATHER THAN BANNING THEM. An earlier version
+// demanded every write path be pinned absolutely by an Environment= line,
+// because "a relative default cannot be granted by a unit file". That is not
+// true: a relative path resolves against WorkingDirectory=, which the unit
+// states, so ./data/x under WorkingDirectory=/srv/atchess/app is
+// /srv/atchess/app/data — grantable, and in fact already granted.
+//
+// The cost of getting that wrong was not theoretical. It made every new state
+// path require an Environment= line, which meant editing the unit, which the
+// deploy deliberately cannot install, which meant a human running an install
+// command by hand. Twice in one afternoon, for paths that were already inside
+// a granted directory. A gate that generates toil for no safety gets ignored,
+// and this one was well on its way.
 func TestUnitGrantsEveryWritePath(t *testing.T) {
 	cfg := readOrFail(t, filepath.Join("internal", "config", "config.go"))
 	unit := readOrFail(t, filepath.Join("deploy", "systemd", "atchess-protocol.service"))
 
-	// Which config keys name something we write, and which env var sets each.
 	envFor := map[string]string{}
 	for _, m := range bindEnv.FindAllStringSubmatch(cfg, -1) {
 		envFor[m[1]] = m[2]
 	}
-	var writeKeys []string
+	defaults := map[string]string{}
 	for _, m := range writeDefault.FindAllStringSubmatch(cfg, -1) {
-		writeKeys = append(writeKeys, m[1])
+		defaults[m[1]] = m[2]
 	}
-	if len(writeKeys) == 0 {
+	if len(defaults) == 0 {
 		t.Fatal("found no write-path defaults in config.go — the scrape is broken, so this gate is vacuous")
 	}
 
-	// What the unit pins, and what it permits.
 	pinned := map[string]string{}
 	for _, m := range unitEnv.FindAllStringSubmatch(unit, -1) {
 		pinned[m[1]] = m[2]
@@ -101,30 +115,30 @@ func TestUnitGrantsEveryWritePath(t *testing.T) {
 		t.Fatal("the unit declares no ReadWritePaths; with ProtectSystem=strict nothing could be written at all")
 	}
 
-	for _, key := range writeKeys {
-		env := envFor[key]
-		if env == "" {
-			t.Errorf("%s is a write path with no environment binding, so the unit cannot pin it "+
-				"to an absolute location; add a BindEnv for it", key)
-			continue
+	workdir := ""
+	if m := unitWorkDir.FindStringSubmatch(unit); m != nil {
+		workdir = m[1]
+	}
+	if workdir == "" {
+		t.Fatal("the unit sets no WorkingDirectory, so a relative write path resolves somewhere nobody can predict")
+	}
+
+	for key, def := range defaults {
+		// An explicit Environment= pin wins, when there is one.
+		effective := def
+		if env := envFor[key]; env != "" {
+			if p, ok := pinned[env]; ok {
+				effective = p
+			}
 		}
-		path, ok := pinned[env]
-		if !ok {
-			t.Errorf("the service writes %s but the unit does not set %s.\n"+
-				"Its default is relative, and a relative path cannot be granted by a unit file — "+
-				"ProtectSystem=strict will refuse it and the service will crash-loop on startup. "+
-				"Add: Environment=\"%s=/srv/atchess/data/...\" and grant it in ReadWritePaths.",
-				key, env, env)
-			continue
+		if !strings.HasPrefix(effective, "/") {
+			effective = filepath.Join(workdir, effective)
 		}
-		if !strings.HasPrefix(path, "/") {
-			t.Errorf("%s pins %s to %q, which is relative; it must be absolute", key, env, path)
-			continue
-		}
-		if !anyGrants(granted, path) {
-			t.Errorf("the unit pins %s=%s but ReadWritePaths (%s) does not cover it.\n"+
-				"The service will start, then die the first time it writes there.",
-				env, path, strings.Join(granted, " "))
+		if !anyGrants(granted, effective) {
+			t.Errorf("the service writes %s, which resolves to %s, but ReadWritePaths (%s) does not cover it.\n"+
+				"With ProtectSystem=strict the service will start and then die the first time it writes there.\n"+
+				"Either put it under a granted directory, or grant the one it is in.",
+				key, effective, strings.Join(granted, " "))
 		}
 	}
 }
