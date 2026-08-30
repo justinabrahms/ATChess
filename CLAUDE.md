@@ -89,7 +89,12 @@ scripts/         # Development and setup scripts
 
 3. **Key Implementation Notes**:
    - Chess moves validated using notnil/chess library before AT Protocol storage
-   - Games stored in both players' repositories for redundancy
+   - Games are NOT copied between repositories. The game record lives in the
+     acceptor's repo and each player's moves live in their own; AT Protocol
+     forbids writing to another repo, so there is no redundancy to have. A
+     game's state is DERIVED by replaying both players' moves — never read
+     from the stored `fen`, which only advances when its own repo's owner
+     moves. See docs/data-model.md; three bugs on 2026-08-30 came from this.
    - Direct HTTP client for AT Protocol interactions (no external dependencies)
    - Comprehensive error handling for invalid moves and network failures
    - Interactive web UI with visual chessboard for easy testing

@@ -82,7 +82,9 @@ During an active game, you can:
 
 ### Data Storage
 - All game data stored in AT Protocol repositories
-- Games belong to both players for redundancy
+- A game's record lives in one player's repo (whoever accepted the challenge);
+  each player's moves live in their own. Nothing is duplicated — see
+  ../docs/data-model.md for why, and for what that means when reading a game.
 - Moves are validated server-side before storage
 
 ### API Endpoints

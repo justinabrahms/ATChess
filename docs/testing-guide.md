@@ -139,7 +139,9 @@ go test -v -tags=integration ./test/integration/...
 1. **Create Game**: Player1 creates a game challenging Player2
 2. **Make Moves**: Alternating moves between players
 3. **Validate Moves**: Each move is validated by the chess engine
-4. **Record in AT Protocol**: Moves are stored in both players' repositories
+4. **Record in AT Protocol**: Each move is stored in the MOVER's own repository.
+   Moves are not copied to the opponent; a game's state is the replay of both
+   players' move records (see ../docs/data-model.md).
 
 ### Sample Game Sequence
 

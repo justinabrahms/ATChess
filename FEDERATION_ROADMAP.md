@@ -8,7 +8,8 @@ This document outlines the technical plan to transform ATChess from a direct-API
 
 ### What Works
 - Basic chess game creation and move validation
-- Game state stored in both players' PDS repositories
+- Game record stored in ONE player's PDS repository (the acceptor's), with each
+  player's moves in their own. Not copied between repos — see docs/data-model.md
 - Web UI for playing games
 - Direct HTTP API calls to AT Protocol
 

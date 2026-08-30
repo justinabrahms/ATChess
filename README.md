@@ -4,7 +4,10 @@ A decentralized chess platform built on the AT Protocol. Play chess games that a
 
 ## Features
 
-- **Decentralized Game Storage**: Games stored in players' AT Protocol repositories
+- **Decentralized Game Storage**: A game's record lives in one player's AT Protocol
+  repository and each player's moves live in their own. Nothing is copied between
+  repos — AT Protocol does not permit writing to someone else's — so a game's true
+  state is the replay of both players' moves. See [`docs/data-model.md`](docs/data-model.md).
 - **Real Chess Validation**: Server-side move validation using professional chess engine
 - **Interactive Web Interface**: Visual chessboard with drag-and-drop moves
 - **Federation Ready**: Games work across different AT Protocol servers
