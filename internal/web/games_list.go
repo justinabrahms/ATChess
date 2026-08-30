@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/rs/zerolog/log"
@@ -226,15 +227,38 @@ func (s *Service) ListOutgoingChallengesHandler(w http.ResponseWriter, r *http.R
 		return
 	}
 
-	// Resolve "accepted" by looking for a game with the counterparty, since the
-	// challenge record itself cannot be updated by the person who accepted it.
+	// Resolve "accepted" by finding THIS challenge's game, since the challenge
+	// record cannot be updated by the person who accepted it.
+	//
+	// Matched on proposedGameId, which is the rkey the game takes when the
+	// challenge is accepted. An earlier version took the counterparty's newest
+	// game for every challenge with that counterparty, so all four challenges
+	// against the same opponent pointed at one game and clicking any of them
+	// opened the wrong one — visible immediately once anyone played the same
+	// person twice, which is the normal case.
+	byRepo := map[string][]*chess.Game{}
 	for _, ch := range challenges {
-		games, gerr := client.ListGamesInRepo(ctx, ch.ChallengedDID, did)
-		if gerr != nil || len(games) == 0 {
+		if _, done := byRepo[ch.ChallengedDID]; done {
 			continue
 		}
-		ch.GameURI = games[0].ID
-		ch.Status = "accepted"
+		games, gerr := client.ListGamesInRepo(ctx, ch.ChallengedDID, did)
+		if gerr != nil {
+			log.Debug().Err(gerr).Str("repo", ch.ChallengedDID).Msg("challenges: opponent repo unreadable")
+			games = nil
+		}
+		byRepo[ch.ChallengedDID] = games
+	}
+	for _, ch := range challenges {
+		if ch.ProposedGameID == "" {
+			continue
+		}
+		for _, g := range byRepo[ch.ChallengedDID] {
+			if rkeyOfATURI(g.ID) == ch.ProposedGameID {
+				ch.GameURI = g.ID
+				ch.Status = "accepted"
+				break
+			}
+		}
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -268,4 +292,12 @@ func (s *Service) indexFoundGames(found []*chess.Game) {
 			log.Debug().Err(err).Str("game", g.ID).Msg("games list: could not index game")
 		}
 	}
+}
+
+// rkeyOfATURI returns the record key (final segment) of an at:// URI.
+func rkeyOfATURI(uri string) string {
+	if i := strings.LastIndex(uri, "/"); i >= 0 && i+1 < len(uri) {
+		return uri[i+1:]
+	}
+	return ""
 }

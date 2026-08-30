@@ -379,6 +379,10 @@ type OutgoingChallenge struct {
 	Message       string `json:"message,omitempty"`
 	Status        string `json:"status"`
 	CreatedAt     string `json:"createdAt"`
+	// ProposedGameID is the rkey the game takes if this challenge is accepted.
+	// It is what links a challenge to ITS game; matching on the counterparty
+	// instead is wrong the moment two people play each other twice.
+	ProposedGameID string `json:"proposedGameId,omitempty"`
 	// GameURI is set when a game has been found for this challenge, which is
 	// the only reliable way a challenger learns their challenge was accepted:
 	// the acceptor cannot write into the challenger's repo to update it, so the
@@ -405,22 +409,24 @@ func (c *Client) ListOutgoingChallenges(ctx context.Context, repoDID string) ([]
 	var out []*OutgoingChallenge
 	for _, rec := range records {
 		var v struct {
-			Challenged string `json:"challenged"`
-			Color      string `json:"color"`
-			Message    string `json:"message"`
-			Status     string `json:"status"`
-			CreatedAt  string `json:"createdAt"`
+			Challenged     string `json:"challenged"`
+			Color          string `json:"color"`
+			Message        string `json:"message"`
+			Status         string `json:"status"`
+			CreatedAt      string `json:"createdAt"`
+			ProposedGameID string `json:"proposedGameId"`
 		}
 		if json.Unmarshal(rec.Value, &v) != nil || v.Challenged == "" {
 			continue
 		}
 		out = append(out, &OutgoingChallenge{
-			URI:           rec.URI,
-			ChallengedDID: v.Challenged,
-			Color:         v.Color,
-			Message:       v.Message,
-			Status:        v.Status,
-			CreatedAt:     v.CreatedAt,
+			URI:            rec.URI,
+			ChallengedDID:  v.Challenged,
+			Color:          v.Color,
+			Message:        v.Message,
+			Status:         v.Status,
+			CreatedAt:      v.CreatedAt,
+			ProposedGameID: v.ProposedGameID,
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].CreatedAt > out[j].CreatedAt })
