@@ -41,10 +41,19 @@ import (
 // separately. This weaker check catches the class of bug actually observed, and
 // was written the day it was observed rather than after the refactor it wants.
 
-// uiFetchPath matches the API paths the page fetches, e.g.
+// uiFetchPath matches the API paths the page requests, in either form:
 //
-//	fetch(`${API_BASE}/challenge-notifications/${key}/accept`, ...)
-var uiFetchPath = regexp.MustCompile(`\$\{API_BASE\}(/[A-Za-z0-9\-_/]*)`)
+//	fetch(`${API_BASE}/challenge-notifications/${key}/accept`, ...)   (legacy)
+//	apiFetch(`/challenge-notifications/${key}/accept`, ...)           (current)
+//
+// BOTH ARE MATCHED DELIBERATELY. Introducing apiFetch removed `${API_BASE}`
+// from every call site, so a scrape that only knew the first form found one
+// endpoint instead of nine and this file quietly stopped checking anything.
+// TestParityScrapeIsNotVacuous caught that on the pre-push hook, which is the
+// entire reason it exists — a gate that scrapes source is one refactor away
+// from passing forever.
+var uiFetchPath = regexp.MustCompile(
+	`(?:\$\{API_BASE\}|apiFetch\(\s*` + "`" + `)(/[A-Za-z0-9\-_/]*)`)
 
 // routeRegistration matches a gorilla/mux registration, e.g.
 //
