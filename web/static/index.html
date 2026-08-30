@@ -743,6 +743,47 @@
             }
         }
         
+        // apiFetch — the ONLY way this page should talk to the API.
+        //
+        // WHY IT EXISTS. Every authenticated endpoint requires an X-Session-ID
+        // header (see internal/web/auth_middleware.go). Nine fetch calls were
+        // written by hand and only two remembered it, so creating a game,
+        // making a move, listing challenges, accepting one, declining one and
+        // loading a game all sent no session and were answered 401. Login,
+        // session-check and logout worked, which made the app look signed in
+        // and functional while nothing a player actually does could succeed.
+        //
+        // IT ALSO SURFACES THE SERVER'S ERROR. The old call sites threw
+        // `new Error('Failed to create challenge')` on any non-2xx, discarding
+        // the response body. The server says things like
+        //   Could not create challenge: invalid handle "x.bsky.social  "
+        // and the user saw "Failed to create challenge". Reported 2026-08-30 as
+        // "no real information to go on", which was exactly right.
+        async function apiFetch(path, options = {}) {
+            const sessionId = localStorage.getItem('atchess_session_id');
+            const headers = Object.assign({}, options.headers || {});
+            if (sessionId) {
+                headers['X-Session-ID'] = sessionId;
+            }
+            // Deliberately the raw fetch: this IS the wrapper, and calling
+            // apiFetch here would recurse forever.
+            const response = await window.fetch(`${API_BASE}${path}`, Object.assign({}, options, { headers }));
+
+            if (!response.ok) {
+                // Prefer what the server said. Fall back to the status only
+                // when the body is empty -- never replace a real message with
+                // a generic one.
+                let detail = '';
+                try { detail = (await response.text()).trim(); } catch (e) { /* body already consumed or absent */ }
+                if (response.status === 401) {
+                    localStorage.removeItem('atchess_session_id');
+                    throw new Error(detail || 'Your session has expired. Please sign in again.');
+                }
+                throw new Error(detail || `${response.status} ${response.statusText}`);
+            }
+            return response;
+        }
+
         // Check session with server
         async function checkSessionWithServer() {
             const sessionId = localStorage.getItem('atchess_session_id');
@@ -752,7 +793,7 @@
             }
             
             try {
-                const response = await fetch(`${API_BASE}/auth/session`, {
+                const response = await apiFetch(`/auth/session`, {
                     headers: {
                         'X-Session-ID': sessionId
                     }
@@ -827,7 +868,7 @@
             authMessage.innerHTML = '';
             
             try {
-                const response = await fetch(`${API_BASE}/auth/oauth/login`, {
+                const response = await apiFetch(`/auth/oauth/login`, {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
@@ -868,7 +909,7 @@
             // Call logout endpoint
             if (sessionId) {
                 try {
-                    await fetch(`${API_BASE}/auth/logout`, {
+                    await apiFetch(`/auth/logout`, {
                         method: 'POST',
                         headers: {
                             'X-Session-ID': sessionId
@@ -1030,7 +1071,7 @@
         // Make a move
         async function makeMove(from, to) {
             try {
-                const response = await fetch(`${API_BASE}/moves`, {
+                const response = await apiFetch(`/moves`, {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
@@ -1070,7 +1111,7 @@
             try {
                 // First, resolve the handle to a DID
                 // For now, we'll create a challenge which will resolve the handle
-                const response = await fetch(`${API_BASE}/challenges`, {
+                const response = await apiFetch(`/challenges`, {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
@@ -1082,9 +1123,6 @@
                     })
                 });
                 
-                if (!response.ok) {
-                    throw new Error('Failed to create challenge');
-                }
                 
                 const challenge = await response.json();
                 alert('Challenge sent to ' + opponentHandle);
@@ -1108,10 +1146,7 @@
         // Load challenges
         async function loadChallenges() {
             try {
-                const response = await fetch(`${API_BASE}/challenge-notifications`);
-                if (!response.ok) {
-                    throw new Error('Failed to fetch challenges');
-                }
+                const response = await apiFetch(`/challenge-notifications`);
                 
                 const challenges = await response.json();
                 displayChallenges(challenges);
@@ -1189,7 +1224,7 @@
                 // accepted, and the accept endpoint's own server-side
                 // cleanup (challenge.Store.MarkAccepted) makes a
                 // client-side DELETE unnecessary regardless.
-                const response = await fetch(`${API_BASE}/challenge-notifications/${key}/accept`, {
+                const response = await apiFetch(`/challenge-notifications/${key}/accept`, {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
@@ -1221,12 +1256,9 @@
             try {
                 const key = encodeChallengeKey(challengeUri);
 
-                const response = await fetch(`${API_BASE}/challenge-notifications/${key}`, {
+                const response = await apiFetch(`/challenge-notifications/${key}`, {
                     method: 'DELETE'
                 });
-                if (!response.ok) {
-                    throw new Error('Failed to decline challenge');
-                }
 
                 loadChallenges();
 
@@ -1238,10 +1270,7 @@
         // Load a game
         async function loadGame(encodedGameId) {
             try {
-                const response = await fetch(`${API_BASE}/games/${encodedGameId}`);
-                if (!response.ok) {
-                    throw new Error('Game not found');
-                }
+                const response = await apiFetch(`/games/${encodedGameId}`);
                 
                 const game = await response.json();
                 currentGame = game;

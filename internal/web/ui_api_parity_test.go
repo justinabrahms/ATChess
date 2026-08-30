@@ -167,3 +167,60 @@ func TestParityScrapeIsNotVacuous(t *testing.T) {
 		}
 	}
 }
+
+// EVERY API CALL MUST GO THROUGH apiFetch.
+//
+// Measured 2026-08-30, and the reason this exists. The authenticated endpoints
+// require an X-Session-ID header (auth_middleware.go). Nine fetch calls were
+// written by hand and exactly two remembered it. So /auth/session and
+// /auth/logout worked, and creating a game, making a move, listing challenges,
+// accepting one, declining one and loading a game were all answered 401.
+//
+// The failure mode is the nasty one: the app looked signed in and fully
+// functional -- correct handle in the corner, board rendered, "Ready to play"
+// -- while nothing a player actually does could succeed. And each call site
+// threw its own generic string on a non-2xx, discarding the server's message,
+// so the only symptom was "Failed to create challenge" with no detail.
+//
+// One helper attaches the header and surfaces the server's error. This test is
+// what keeps the tenth call site from being written by hand again.
+func TestUIUsesApiFetchForEveryAPICall(t *testing.T) {
+	root := repoRoot(t)
+	pages, err := filepath.Glob(filepath.Join(root, "web", "static", "*.html"))
+	if err != nil || len(pages) == 0 {
+		t.Fatalf("no pages under web/static (err=%v) — this test would pass vacuously", err)
+	}
+
+	// A raw fetch() whose URL is built from API_BASE, i.e. bypassing apiFetch.
+	direct := regexp.MustCompile(`[^a-zA-Z]fetch\(\s*` + "`" + `\$\{API_BASE\}`)
+
+	var offenders []string
+	sawHelper := false
+	for _, page := range pages {
+		b, rerr := os.ReadFile(page)
+		if rerr != nil {
+			t.Fatalf("reading %s: %v", page, rerr)
+		}
+		src := string(b)
+		if strings.Contains(src, "async function apiFetch") {
+			sawHelper = true
+		}
+		// window.fetch inside the helper itself is the one legitimate raw call.
+		src = strings.ReplaceAll(src, "window.fetch(`${API_BASE}${path}`", "")
+		if direct.MatchString(src) {
+			offenders = append(offenders, filepath.Base(page))
+		}
+	}
+
+	if !sawHelper {
+		t.Error("no apiFetch helper found in web/static — the session header and the " +
+			"server's error message are then each call site's problem to remember, " +
+			"which is how every game action ended up unauthenticated")
+	}
+	if len(offenders) > 0 {
+		t.Errorf("page(s) call the API directly instead of through apiFetch: %s\n\n"+
+			"A direct fetch sends no X-Session-ID, so the endpoint answers 401, and the "+
+			"call site invents its own error message instead of showing the server's.",
+			strings.Join(offenders, ", "))
+	}
+}
